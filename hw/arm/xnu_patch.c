@@ -195,6 +195,53 @@ void patch_kc_unauthenticated_root(u8 *bkc_macho) {
     }
 }
 
+/*
+ * aks-stub: let the kernel boot its container daemons without a SEP.
+ *
+ * AppleSEPKeyStore decides whether to use a SEP endpoint in a "sep-booted
+ * answer" routine (sub_7F2D698 in xnu-12377.100.591.502 vphone600). With no
+ * SEP it still calls getAppleSEPManager at the top of that routine, and the
+ * thread holding the keystore gate hangs there; a stackshot shows ~29
+ * container daemons (backboardd, containermanagerd, tccd, keybagd,
+ * coreauthd, ...) all blocked on that one gate mutex. Force the routine to
+ * return 0 at entry (pacibsp; mov x0, #0; retab) so sep_endpoint() takes its
+ * fast "SEP is not booted" path and releases the gate.
+ *
+ * The routine is identified by its prologue (pacibsp; sub sp, sp, #0xb0); if
+ * it does not match (a different build), nothing is patched.
+ */
+#define SUB_SP_SP_0xB0         (( 0xD102C3FF ))
+#define AKS_SEP_BOOTED_ANSWER  (( 0xfffffe0007f2d698ULL ))
+
+void patch_kc_aks_stub(u8 *bkc_macho) {
+    fse_t *fse = macho_find_fileset_entry(bkc_macho, "com.apple.driver.AppleSEPKeyStore");
+    seg_t *exec;
+    u32 *fn;
+
+    if (!fse) {
+        fprintf(stderr, "aks-stub: couldn't find AppleSEPKeyStore kext\n");
+        return;
+    }
+    exec = macho_find_seg(&bkc_macho[fse->fileoff], "__TEXT_EXEC");
+    if (!exec) {
+        fprintf(stderr, "aks-stub: couldn't find AppleSEPKeyStore __TEXT_EXEC\n");
+        return;
+    }
+    if (AKS_SEP_BOOTED_ANSWER < exec->vmaddr ||
+        AKS_SEP_BOOTED_ANSWER >= exec->vmaddr + exec->vmsize) {
+        fprintf(stderr, "aks-stub: target not in __TEXT_EXEC; not patched\n");
+        return;
+    }
+    fn = (u32 *)&bkc_macho[exec->fileoff + (AKS_SEP_BOOTED_ANSWER - exec->vmaddr)];
+    if (fn[0] != PACIBSP || fn[1] != SUB_SP_SP_0xB0) {
+        fprintf(stderr, "aks-stub: sub_7F2D698 prologue mismatch "
+                "(0x%X 0x%X); not patched\n", fn[0], fn[1]);
+        return;
+    }
+    fn[1] = MOVX(0, 0);
+    fn[2] = RETAB;
+}
+
 bool kc_uses_mte(u8 *bkc_macho) {
     seg_t *kc_exec_seg = macho_find_seg(bkc_macho, "__TEXT_EXEC");
     assert(kc_exec_seg);

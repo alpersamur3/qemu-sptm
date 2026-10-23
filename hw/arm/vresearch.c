@@ -159,6 +159,7 @@ struct VResearchState {
     bool                   unauth_root;
     bool                   pvg;
     bool                   sep;
+    bool                   aks_stub;
     MemoryRegion           fb_ram;
     QemuConsole           *fb_con;
 };
@@ -436,6 +437,16 @@ static void sep_set(Object *obj, bool val, Error **errp)
     VRESEARCH_MACHINE(obj)->sep = val;
 }
 
+static bool aks_stub_get(Object *obj, Error **errp)
+{
+    return VRESEARCH_MACHINE(obj)->aks_stub;
+}
+
+static void aks_stub_set(Object *obj, bool val, Error **errp)
+{
+    VRESEARCH_MACHINE(obj)->aks_stub = val;
+}
+
 static bool fb_update(void *opaque)
 {
     VResearchState *s = opaque;
@@ -658,6 +669,9 @@ static void vresearch_init(MachineState *ms)
     if (s->unauth_root) {
         patch_kc_unauthenticated_root(info->bootkc_f.buf);
     }
+    if (s->aks_stub) {
+        patch_kc_aks_stub(info->bootkc_f.buf);
+    }
     arm_load_xnu(cpu, ms, info);
     if (info->has_mte) {
         setup_mte(cpuobj, ms, info);
@@ -723,6 +737,10 @@ static void vresearch_machine_class_init(ObjectClass *oc, const void *data)
     object_class_property_set_description(oc, "sep",
         "Model the SEP mailbox (/arm-io/sep) so the kernel sees the SEP boot; "
         "default off: an unimplemented device");
+    object_class_property_add_bool(oc, "aks-stub", aks_stub_get, aks_stub_set);
+    object_class_property_set_description(oc, "aks-stub",
+        "Patch AppleSEPKeyStore so it doesn't wait on a SEP: the keystore gate "
+        "stops blocking the container daemons (backboardd etc.). Default off");
     object_class_property_add_bool(oc, "unauth-root", unauth_root_get, unauth_root_set);
     object_class_property_set_description(oc, "unauth-root",
         "Patch the kernel to boot from a root that isn't an authenticated "
