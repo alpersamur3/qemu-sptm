@@ -26,6 +26,7 @@
 #include "qobject/qlist.h"
 #include "hw/arm/boot.h"
 #include "hw/arm/machines-qom.h"
+#include "hw/arm/vresearch_pvg.h"
 #include "hw/core/boards.h"
 #include "hw/core/irq.h"
 #include "hw/core/qdev-properties.h"
@@ -34,6 +35,7 @@
 #include "hw/intc/arm_gicv3_common.h"
 #include "hw/misc/pvpanic.h"
 #include "hw/misc/unimp.h"
+#include "monitor/qdev.h"
 #include "hw/pci/msi.h"
 #include "hw/pci-host/gpex.h"
 #include "hw/virtio/virtio-pci.h"
@@ -135,7 +137,8 @@ static const int irqmap[] = {
  * Boot framebuffer (-M vresearch,fb=WxH): what iBoot hands the kernel in
  * boot_args.Video and /vram, 32 bpp x8r8g8b8, above DRAM and /product/util.
  * XNU draws its console on it until a display driver takes the screen over;
- * none does yet (PVG isn't modelled), so it shows the boot to the end.
+ * none does (pvg=on presents in a console of its own), so it shows the boot
+ * to the end.
  * The kernel maps it as Device memory, where its vectorised memset faults on
  * 16-byte stores that aren't 16-byte aligned, and its console ignores
  * v_rowBytes (rows of v_width * 4 bytes): the width is rounded up to a
@@ -153,6 +156,7 @@ struct VResearchState {
     GMappedFile           *bootkc_m, *dtree_m, *sptm_m, *txm_m, *tc_m, *ramdisk_m;
     char                  *fb;
     bool                   unauth_root;
+    bool                   pvg;
     MemoryRegion           fb_ram;
     QemuConsole           *fb_con;
 };
@@ -410,6 +414,16 @@ static void unauth_root_set(Object *obj, bool val, Error **errp)
     VRESEARCH_MACHINE(obj)->unauth_root = val;
 }
 
+static bool pvg_get(Object *obj, Error **errp)
+{
+    return VRESEARCH_MACHINE(obj)->pvg;
+}
+
+static void pvg_set(Object *obj, bool val, Error **errp)
+{
+    VRESEARCH_MACHINE(obj)->pvg = val;
+}
+
 static bool fb_update(void *opaque)
 {
     VResearchState *s = opaque;
@@ -470,6 +484,29 @@ static void create_fb(VResearchState *s)
     qemu_console_set_surface(s->fb_con, surface);
 }
 
+/*
+ * pvg=on: the PVG GPU and its IOSurface mapper, display only
+ * (vresearch_pvg.c). Its display has the boot framebuffer's size when there
+ * is one; HMP `screendump FILE pvg` shows what the guest presents.
+ */
+static void create_pvg(VResearchState *s)
+{
+    DeviceState *dev = qdev_new(TYPE_VRESEARCH_PVG);
+    SysBusDevice *sbd = SYS_BUS_DEVICE(dev);
+    struct xnu_boot_info *info = &s->bootinfo;
+
+    qdev_set_id(dev, g_strdup("pvg"), &error_fatal);
+    if (info->video_base) {
+        qdev_prop_set_uint32(dev, "width", info->video_width);
+        qdev_prop_set_uint32(dev, "height", info->video_height);
+    }
+    sysbus_realize_and_unref(sbd, &error_fatal);
+    sysbus_mmio_map(sbd, 0, memmap[VR_APV_GFX].base);
+    sysbus_mmio_map(sbd, 1, memmap[VR_APV_IOSFC].base);
+    sysbus_connect_irq(sbd, 0, spi(s, irqmap[VR_APV_GFX]));
+    sysbus_connect_irq(sbd, 1, spi(s, irqmap[VR_APV_IOSFC]));
+}
+
 static void create_devices(VResearchState *s)
 {
     SysBusDevice *sbd;
@@ -496,18 +533,23 @@ static void create_devices(VResearchState *s)
     sysbus_realize_and_unref(sbd, &error_fatal);
 
     /*
-     * Not modelled yet. Reads return 0, so the PVG driver sees no host GPU,
-     * avp,ctrr has no 'ctrr' magic and the kernel skips it, SimpleVirtio's
-     * host interface (fixed at 0x30010000 in the kernel) has no version 1.
+     * Not modelled yet. Reads return 0, so the PVG driver sees no host GPU
+     * (without pvg=on), avp,ctrr has no 'ctrr' magic and the kernel skips it,
+     * SimpleVirtio's host interface (fixed at 0x30010000 in the kernel) has
+     * no version 1.
      */
     create_unimplemented_device("vz-backdoor", memmap[VR_BDOOR].base,
                                 memmap[VR_BDOOR].size);
     create_unimplemented_device("vz-config", memmap[VR_CONFIG].base,
                                 memmap[VR_CONFIG].size);
-    create_unimplemented_device("apv-gfx", memmap[VR_APV_GFX].base,
-                                memmap[VR_APV_GFX].size);
-    create_unimplemented_device("apv-iosfc", memmap[VR_APV_IOSFC].base,
-                                memmap[VR_APV_IOSFC].size);
+    if (s->pvg) {
+        create_pvg(s);
+    } else {
+        create_unimplemented_device("apv-gfx", memmap[VR_APV_GFX].base,
+                                    memmap[VR_APV_GFX].size);
+        create_unimplemented_device("apv-iosfc", memmap[VR_APV_IOSFC].base,
+                                    memmap[VR_APV_IOSFC].size);
+    }
     create_unimplemented_device("avp-rtc", memmap[VR_AVP_RTC].base,
                                 memmap[VR_AVP_RTC].size);
     create_unimplemented_device("sep-mailbox", memmap[VR_SEP].base,
@@ -641,6 +683,10 @@ static void vresearch_machine_class_init(ObjectClass *oc, const void *data)
     object_class_property_add_str(oc, "fb", fb_get, fb_set);
     object_class_property_set_description(oc, "fb",
         "Boot framebuffer WxH (boot_args.Video, /vram), or off (default)");
+    object_class_property_add_bool(oc, "pvg", pvg_get, pvg_set);
+    object_class_property_set_description(oc, "pvg",
+        "Model the paravirtual GPU's display (presents, no GPU work); "
+        "default off: an unimplemented device the guest driver gives up on");
     object_class_property_add_bool(oc, "unauth-root", unauth_root_get, unauth_root_set);
     object_class_property_set_description(oc, "unauth-root",
         "Patch the kernel to boot from a root that isn't an authenticated "
