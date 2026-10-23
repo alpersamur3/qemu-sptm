@@ -27,6 +27,7 @@
 #include "hw/arm/boot.h"
 #include "hw/arm/machines-qom.h"
 #include "hw/arm/vresearch_pvg.h"
+#include "hw/arm/vresearch_sep.h"
 #include "hw/core/boards.h"
 #include "hw/core/irq.h"
 #include "hw/core/qdev-properties.h"
@@ -157,6 +158,7 @@ struct VResearchState {
     char                  *fb;
     bool                   unauth_root;
     bool                   pvg;
+    bool                   sep;
     MemoryRegion           fb_ram;
     QemuConsole           *fb_con;
 };
@@ -424,6 +426,16 @@ static void pvg_set(Object *obj, bool val, Error **errp)
     VRESEARCH_MACHINE(obj)->pvg = val;
 }
 
+static bool sep_get(Object *obj, Error **errp)
+{
+    return VRESEARCH_MACHINE(obj)->sep;
+}
+
+static void sep_set(Object *obj, bool val, Error **errp)
+{
+    VRESEARCH_MACHINE(obj)->sep = val;
+}
+
 static bool fb_update(void *opaque)
 {
     VResearchState *s = opaque;
@@ -507,6 +519,22 @@ static void create_pvg(VResearchState *s)
     sysbus_connect_irq(sbd, 1, spi(s, irqmap[VR_APV_IOSFC]));
 }
 
+/*
+ * sep=on: the SEP mailbox (vresearch_sep.c). Its two interrupts are the
+ * device tree's /arm-io/sep INTIDs 0x35 and 0x34 (SPI = INTID - 32).
+ */
+static void create_sep(VResearchState *s)
+{
+    DeviceState *dev = qdev_new(TYPE_VRESEARCH_SEP);
+    SysBusDevice *sbd = SYS_BUS_DEVICE(dev);
+
+    qdev_set_id(dev, g_strdup("sep"), &error_fatal);
+    sysbus_realize_and_unref(sbd, &error_fatal);
+    sysbus_mmio_map(sbd, 0, memmap[VR_SEP].base);
+    sysbus_connect_irq(sbd, 0, spi(s, 0x35 - GIC_INTERNAL));
+    sysbus_connect_irq(sbd, 1, spi(s, 0x34 - GIC_INTERNAL));
+}
+
 static void create_devices(VResearchState *s)
 {
     SysBusDevice *sbd;
@@ -552,8 +580,12 @@ static void create_devices(VResearchState *s)
     }
     create_unimplemented_device("avp-rtc", memmap[VR_AVP_RTC].base,
                                 memmap[VR_AVP_RTC].size);
-    create_unimplemented_device("sep-mailbox", memmap[VR_SEP].base,
-                                memmap[VR_SEP].size);
+    if (s->sep) {
+        create_sep(s);
+    } else {
+        create_unimplemented_device("sep-mailbox", memmap[VR_SEP].base,
+                                    memmap[VR_SEP].size);
+    }
     create_unimplemented_device("avp-ctrr", memmap[VR_AVP_CTRR].base,
                                 memmap[VR_AVP_CTRR].size);
 
@@ -687,6 +719,10 @@ static void vresearch_machine_class_init(ObjectClass *oc, const void *data)
     object_class_property_set_description(oc, "pvg",
         "Model the paravirtual GPU's display (presents, no GPU work); "
         "default off: an unimplemented device the guest driver gives up on");
+    object_class_property_add_bool(oc, "sep", sep_get, sep_set);
+    object_class_property_set_description(oc, "sep",
+        "Model the SEP mailbox (/arm-io/sep) so the kernel sees the SEP boot; "
+        "default off: an unimplemented device");
     object_class_property_add_bool(oc, "unauth-root", unauth_root_get, unauth_root_set);
     object_class_property_set_description(oc, "unauth-root",
         "Patch the kernel to boot from a root that isn't an authenticated "
