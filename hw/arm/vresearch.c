@@ -152,6 +152,7 @@ struct VResearchState {
     struct xnu_boot_info   bootinfo;
     GMappedFile           *bootkc_m, *dtree_m, *sptm_m, *txm_m, *tc_m, *ramdisk_m;
     char                  *fb;
+    bool                   unauth_root;
     MemoryRegion           fb_ram;
     QemuConsole           *fb_con;
 };
@@ -399,6 +400,16 @@ static void create_util(struct dtree_node *dt_root)
     memory_region_add_subregion(get_system_memory(), reg->base, mr);
 }
 
+static bool unauth_root_get(Object *obj, Error **errp)
+{
+    return VRESEARCH_MACHINE(obj)->unauth_root;
+}
+
+static void unauth_root_set(Object *obj, bool val, Error **errp)
+{
+    VRESEARCH_MACHINE(obj)->unauth_root = val;
+}
+
 static bool fb_update(void *opaque)
 {
     VResearchState *s = opaque;
@@ -570,6 +581,9 @@ static void vresearch_init(MachineState *ms)
     cpu->gt_cntfrq_hz = *freq;
 
     setup_fb(s, dt_root);
+    if (s->unauth_root) {
+        patch_kc_unauthenticated_root(info->bootkc_f.buf);
+    }
     arm_load_xnu(cpu, ms, info);
     if (info->has_mte) {
         setup_mte(cpuobj, ms, info);
@@ -627,6 +641,10 @@ static void vresearch_machine_class_init(ObjectClass *oc, const void *data)
     object_class_property_add_str(oc, "fb", fb_get, fb_set);
     object_class_property_set_description(oc, "fb",
         "Boot framebuffer WxH (boot_args.Video, /vram), or off (default)");
+    object_class_property_add_bool(oc, "unauth-root", unauth_root_get, unauth_root_set);
+    object_class_property_set_description(oc, "unauth-root",
+        "Patch the kernel to boot from a root that isn't an authenticated "
+        "(sealed APFS) volume, e.g. an HFS+ disk");
 }
 
 static const TypeInfo vresearch_machine_info = {

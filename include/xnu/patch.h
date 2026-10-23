@@ -5,3 +5,4 @@
 
 bool kc_uses_mte(uint8_t *macho);
 void patch_kc(uint8_t *macho);
+void patch_kc_unauthenticated_root(uint8_t *macho);

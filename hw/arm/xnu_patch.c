@@ -97,6 +97,104 @@ void patch_kc(u8 *bkc_macho) {
     patch_img4_deadlock(bkc_macho);
 }
 
+#define NOP                    (( 0xD503201F ))
+
+static i64 sext(u64 v, int bits) {
+    return (i64)(v << (64 - bits)) >> (64 - bits);
+}
+
+// Target of a conditional branch (b.cond, cbz/cbnz, tbz/tbnz), or 0
+static u64 cond_branch_target(u32 w, u64 pc) {
+    if ((w & 0xFF000010) == 0x54000000 || (w & 0x7E000000) == 0x34000000) {
+        return pc + 4 * sext((w >> 5) & 0x7FFFF, 19);
+    }
+    if ((w & 0x7E000000) == 0x36000000) {
+        return pc + 4 * sext((w >> 5) & 0x3FFF, 14);
+    }
+    return 0;
+}
+
+/*
+ * NOP the one conditional branch in com.apple.kernel that leads to the panic
+ * whose format string starts with `msg`: find the string, its ADRP+ADD
+ * reference, then the branch into the few instructions that set up the panic
+ * call. Returns false (and leaves the kernel alone) unless exactly one such
+ * branch exists.
+ */
+static bool nop_branch_to_panic(u8 *bkc, const char *msg) {
+    fse_t *fse = macho_find_fileset_entry(bkc, "com.apple.kernel");
+    u8 *kernel;
+    sect_t *cstr, *text;
+    u64 str_va = 0, ref_va = 0, site_off = 0;
+    u32 *words;
+    size_t i, n, found = 0;
+
+    if (!fse) {
+        return false;
+    }
+    kernel = &bkc[fse->fileoff];
+    cstr = macho_find_sect(kernel, "__TEXT", "__cstring");
+    text = macho_find_sect(kernel, "__TEXT_EXEC", "__text");
+    if (!cstr || !text) {
+        return false;
+    }
+    for (i = 0; i < cstr->size; i++) {
+        if (!strncmp((char *)&bkc[cstr->offset + i], msg, strlen(msg)) &&
+            (i == 0 || bkc[cstr->offset + i - 1] == 0)) {
+            str_va = cstr->addr + i;
+            break;
+        }
+    }
+    if (!str_va) {
+        return false;
+    }
+
+    words = (u32 *)&bkc[text->offset];
+    n = text->size / 4;
+    for (i = 0; i + 1 < n && !ref_va; i++) {
+        u32 w = words[i], a = words[i + 1];
+        u64 pc = text->addr + 4 * i;
+        u64 page;
+
+        if ((w & 0x9F000000) != 0x90000000) {
+            continue;
+        }
+        page = (pc & ~0xFFFULL) +
+               (sext(((w >> 29) & 3) | (((w >> 5) & 0x7FFFF) << 2), 21) << 12);
+        if (page == (str_va & ~0xFFFULL) && (a & 0xFFC00000) == 0x91000000 &&
+            ((a >> 5) & 31) == (w & 31) && ((a >> 10) & 0xFFF) == (str_va & 0xFFF)) {
+            ref_va = pc;
+        }
+    }
+    if (!ref_va) {
+        return false;
+    }
+
+    // The panic block starts at most 8 instructions before the reference
+    for (i = 0; i < n; i++) {
+        u64 pc = text->addr + 4 * i;
+        u64 t = cond_branch_target(words[i], pc);
+
+        if (pc + 0x4000 > ref_va && pc < ref_va && t && t >= ref_va - 0x20 && t <= ref_va) {
+            site_off = i;
+            found++;
+        }
+    }
+    if (found != 1) {
+        return false;
+    }
+    words[site_off] = NOP;
+    return true;
+}
+
+void patch_kc_unauthenticated_root(u8 *bkc_macho) {
+    // bsd_init: FSIOC_KERNEL_ROOTAUTH fails on a root that isn't a sealed APFS
+    // volume (an HFS+ disk); continue instead of panicking.
+    if (!nop_branch_to_panic(bkc_macho, "rootvp not authenticated after mounting")) {
+        fprintf(stderr, "warning: rootvp authentication check not found, not patched\n");
+    }
+}
+
 bool kc_uses_mte(u8 *bkc_macho) {
     seg_t *kc_exec_seg = macho_find_seg(bkc_macho, "__TEXT_EXEC");
     assert(kc_exec_seg);
