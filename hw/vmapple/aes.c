@@ -253,7 +253,8 @@ static bool cmd_iv(AESState *s)
 
 static void dump_data(const char *desc, const void *p, size_t len)
 {
-    static const size_t MAX_LEN = 0x1000;
+    /* an enum, not a const variable: GCC rejects initialising the VLA that makes */
+    enum { MAX_LEN = 0x1000 };
     char hex[MAX_LEN * 2 + 1] = "";
 
     if (len > MAX_LEN) {
