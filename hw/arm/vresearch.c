@@ -42,6 +42,7 @@
 #include "system/address-spaces.h"
 #include "system/reset.h"
 #include "system/system.h"
+#include "ui/console.h"
 #include "target/arm/gtimer.h"
 #include "cpu.h"
 #include "xnu/boot/xnuboot.h"
@@ -130,6 +131,18 @@ static const int irqmap[] = {
 #define MSI_BASE_INTID  128
 #define MSI_NUM_SPIS    64
 
+/*
+ * Boot framebuffer (-M vresearch,fb=WxH): what iBoot hands the kernel in
+ * boot_args.Video and /vram, 32 bpp x8r8g8b8, above DRAM and /product/util.
+ * XNU draws its console on it until a display driver takes the screen over;
+ * none does yet (PVG isn't modelled), so it shows the boot to the end.
+ * The kernel maps it as Device memory, where its vectorised memset faults on
+ * 16-byte stores that aren't 16-byte aligned, and its console ignores
+ * v_rowBytes (rows of v_width * 4 bytes): the width is rounded up to a
+ * multiple of 16 pixels.
+ */
+#define VR_FB_BASE      0x1c0000000ULL
+
 struct VResearchState {
     MachineState           parent_obj;
     ARMCPU                *cpu;
@@ -138,6 +151,9 @@ struct VResearchState {
     MemoryRegion           ecam_alias;
     struct xnu_boot_info   bootinfo;
     GMappedFile           *bootkc_m, *dtree_m, *sptm_m, *txm_m, *tc_m, *ramdisk_m;
+    char                  *fb;
+    MemoryRegion           fb_ram;
+    QemuConsole           *fb_con;
 };
 
 #define VRESEARCH_ARG(a) \
@@ -157,6 +173,19 @@ VRESEARCH_ARG(sptm)
 VRESEARCH_ARG(txm)
 VRESEARCH_ARG(tc)
 VRESEARCH_ARG(ramdisk)
+
+static char *fb_get(Object *obj, Error **errp)
+{
+    return g_strdup(VRESEARCH_MACHINE(obj)->fb);
+}
+
+static void fb_set(Object *obj, const char *val, Error **errp)
+{
+    VResearchState *s = VRESEARCH_MACHINE(obj);
+
+    g_free(s->fb);
+    s->fb = g_strdup(val);
+}
 
 /*
  * A private, writable mapping (the loader patches the kernelcache and the
@@ -370,6 +399,66 @@ static void create_util(struct dtree_node *dt_root)
     memory_region_add_subregion(get_system_memory(), reg->base, mr);
 }
 
+static bool fb_update(void *opaque)
+{
+    VResearchState *s = opaque;
+
+    qemu_console_update_full(s->fb_con);
+    return true;
+}
+
+static const GraphicHwOps fb_ops = {
+    .gfx_update = fb_update,
+};
+
+/* Parses fb=WxH into the boot info and points /vram at the framebuffer */
+static void setup_fb(VResearchState *s, struct dtree_node *dt_root)
+{
+    struct xnu_boot_info *info = &s->bootinfo;
+    struct dtree_node *vram = adt_find_node(dt_root, "vram");
+    unsigned w, h;
+    char end;
+
+    if (!s->fb || !strcmp(s->fb, "off")) {
+        return;
+    }
+    if (sscanf(s->fb, "%ux%u%c", &w, &h, &end) != 2 || !w || !h ||
+        w > 4096 || h > 4096) {
+        error_report("vresearch: fb=%s: give WxH (at most 4096x4096) or off", s->fb);
+        exit(1);
+    }
+    info->video_base = VR_FB_BASE;
+    info->video_width = ROUND_UP_POW2(w, 16);
+    info->video_height = h;
+    info->video_stride = info->video_width * 4;
+    if (vram && adt_get_prop_len(vram, "reg") == 2 * sizeof(u64)) {
+        u64 *reg = adt_get_prop_val(vram, "reg");
+
+        reg[0] = VR_FB_BASE;
+        reg[1] = ROUND_UP_POW2((u64)info->video_stride * h, DARWIN_PAGE_SIZE);
+    }
+}
+
+static void create_fb(VResearchState *s)
+{
+    struct xnu_boot_info *info = &s->bootinfo;
+    uint64_t size = ROUND_UP_POW2((u64)info->video_stride * info->video_height,
+                                  DARWIN_PAGE_SIZE);
+    DisplaySurface *surface;
+
+    if (!info->video_base) {
+        return;
+    }
+    memory_region_init_ram(&s->fb_ram, NULL, "vresearch.fb", size, &error_fatal);
+    memory_region_add_subregion(get_system_memory(), info->video_base, &s->fb_ram);
+    s->fb_con = qemu_graphic_console_create(NULL, 0, &fb_ops, s);
+    surface = qemu_create_displaysurface_from(info->video_width, info->video_height,
+                                              PIXMAN_x8r8g8b8,
+                                              info->video_stride,
+                                              memory_region_get_ram_ptr(&s->fb_ram));
+    qemu_console_set_surface(s->fb_con, surface);
+}
+
 static void create_devices(VResearchState *s)
 {
     SysBusDevice *sbd;
@@ -480,6 +569,7 @@ static void vresearch_init(MachineState *ms)
     /* 24 MHz in the vphone600ap / vresearch101ap device trees */
     cpu->gt_cntfrq_hz = *freq;
 
+    setup_fb(s, dt_root);
     arm_load_xnu(cpu, ms, info);
     if (info->has_mte) {
         setup_mte(cpuobj, ms, info);
@@ -493,6 +583,7 @@ static void vresearch_init(MachineState *ms)
 
     create_devices(s);
     create_util(dt_root);
+    create_fb(s);
 
     qemu_register_reset(vresearch_reset, s);
 
@@ -533,6 +624,9 @@ static void vresearch_machine_class_init(ObjectClass *oc, const void *data)
     object_class_property_add_str(oc, "txm", txm_get, txm_set);
     object_class_property_add_str(oc, "tc", tc_get, tc_set);
     object_class_property_add_str(oc, "ramdisk", ramdisk_get, ramdisk_set);
+    object_class_property_add_str(oc, "fb", fb_get, fb_set);
+    object_class_property_set_description(oc, "fb",
+        "Boot framebuffer WxH (boot_args.Video, /vram), or off (default)");
 }
 
 static const TypeInfo vresearch_machine_info = {

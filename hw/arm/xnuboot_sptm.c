@@ -380,6 +380,14 @@ static void arm_load_xnu_sptm(ARMCPU *cpu, MachineState *ms, struct xnu_boot_inf
         args.memSize = info->dram_size;
     }
     args.topOfKernelData = blob_head;
+    if (info->video_base) {
+        args.Video.v_baseAddr = info->video_base;
+        args.Video.v_display = 0;       /* text mode (iBoot's for -v), 1 = graphics */
+        args.Video.v_rowBytes = info->video_stride;
+        args.Video.v_width = info->video_width;
+        args.Video.v_height = info->video_height;
+        args.Video.v_depth = 32 | (1 << kBootVideoDepthScaleShift);
+    }
     args.deviceTreeP = dtree_base_phys - args.physBase + args.virtBase;
     args.deviceTreeLength = info->dtree_f.len;
     g_strlcpy(args.CommandLine, info->args, BOOT_LINE_LENGTH);

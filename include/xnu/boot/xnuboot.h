@@ -46,6 +46,10 @@ struct xnu_boot_info {
     uint64_t dram_base, dram_size;
     bool has_mte;
 
+    // Boot framebuffer for boot_args.Video (32 bpp), none if video_base is 0
+    uint64_t video_base;
+    uint32_t video_width, video_height, video_stride;
+
     // Feedback from the kernel loader back to the darwin machine to boot during reset
     hwaddr  init_pc, init_x0;
 };
