@@ -3,7 +3,6 @@
 #include "hw/arm/machines-qom.h"
 #include "system/address-spaces.h"
 #include "cpu.h"
-#include <sys/mman.h>
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <inttypes.h>

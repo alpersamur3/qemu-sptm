@@ -52,6 +52,7 @@ struct DarwinState {
     DeviceState           *aic;
     struct xnu_boot_info   bootinfo;
     qemu_irq               irqs[DARWIN_MACHINE_NUM_IRQS];
+    GMappedFile           *bootkc_m, *dtree_m, *tc_m, *ramdisk_m, *sptm_m, *txm_m;
 };
 
 MACHINE_CLASS_ARG(bootkc);
@@ -92,19 +93,18 @@ static void do_darwin_reset(void *state) {
     arm_rebuild_hflags(env);
 }
 
-static mmap_file_t check_and_open(const char *path, const char *errmsg) {
-    int fd;
-    struct stat stats;
+// A private, writable mapping (the loader patches the files in place).
+// GMappedFile rather than mmap, so this also builds on Windows.
+static mmap_file_t check_and_open(const char *path, const char *errmsg, GMappedFile **m) {
     void *mapping;
 
     if (!path) goto fail;
 
-    fd = open(path, O_RDONLY | O_BINARY);
-    if (fd < 0) goto fail;
+    *m = g_mapped_file_new(path, TRUE, NULL);
+    if (!*m) goto fail;
 
-    fstat(fd, &stats);
-    mapping = mmap(NULL, stats.st_size, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
-    if (MAP_FAILED == mapping) goto fail;
+    mapping = g_mapped_file_get_contents(*m);
+    if (!mapping) goto fail;
 
     if (is_im4p(mapping)) {
         fprintf(stderr, "error: %s is an im4p, you need to unwrap it (eg. ipsw img4 im4p extract)\n", path);
@@ -113,7 +113,7 @@ static mmap_file_t check_and_open(const char *path, const char *errmsg) {
 
     return (mmap_file_t){
         .buf = mapping,
-        .len = stats.st_size,
+        .len = g_mapped_file_get_length(*m),
     };
 
 fail:
@@ -201,13 +201,13 @@ static void darwin_init(MachineState *ms) {
     struct dtree_node *dt_root;
 
     if (!info->args) info->args = g_default_args;
-    info->bootkc_f = check_and_open(info->bootkc, "error opening XNU kernel");
-    info->dtree_f = check_and_open(info->dtree, "error opening device tree");
-    info->tc_f = check_and_open(info->tc, "error opening trust cache");
-    info->ramdisk_f = check_and_open(info->ramdisk, "error opening ramdisk");
+    info->bootkc_f = check_and_open(info->bootkc, "error opening XNU kernel", &s->bootkc_m);
+    info->dtree_f = check_and_open(info->dtree, "error opening device tree", &s->dtree_m);
+    info->tc_f = check_and_open(info->tc, "error opening trust cache", &s->tc_m);
+    info->ramdisk_f = check_and_open(info->ramdisk, "error opening ramdisk", &s->ramdisk_m);
     if (info->sptm) {
-        info->sptm_f = check_and_open(info->sptm, "error opening SPTM");
-        info->txm_f = check_and_open(info->txm, "error opening TXM");
+        info->sptm_f = check_and_open(info->sptm, "error opening SPTM", &s->sptm_m);
+        info->txm_f = check_and_open(info->txm, "error opening TXM", &s->txm_m);
     }
     dt_root = info->dtree_f.buf;
 
@@ -287,13 +287,13 @@ static void darwin_init(MachineState *ms) {
     qdev_connect_gpio_out(s->aic, 0, qdev_get_gpio_in(cpudev, ARM_CPU_IRQ));
 
     qemu_register_reset(do_darwin_reset, s);
-    munmap(info->bootkc_f.buf, info->bootkc_f.len);
-    munmap(info->dtree_f.buf, info->dtree_f.len);
-    munmap(info->tc_f.buf, info->tc_f.len);
-    munmap(info->ramdisk_f.buf, info->ramdisk_f.len);
+    g_mapped_file_unref(s->bootkc_m);
+    g_mapped_file_unref(s->dtree_m);
+    g_mapped_file_unref(s->tc_m);
+    g_mapped_file_unref(s->ramdisk_m);
     if (info->sptm) {
-        munmap(info->sptm_f.buf, info->sptm_f.len);
-        munmap(info->txm_f.buf, info->txm_f.len);
+        g_mapped_file_unref(s->sptm_m);
+        g_mapped_file_unref(s->txm_m);
     }
 }
 
