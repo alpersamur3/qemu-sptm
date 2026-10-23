@@ -725,3 +725,18 @@ config ARMSSE
     select UNIMP
     select SSE_COUNTER
     select SSE_TIMER
+
+config ARM_VRESEARCH
+    bool
+    default y
+    depends on TCG && AARCH64
+    imply PCI_DEVICES
+    select ARM_GIC
+    select PCI_EXPRESS
+    select PCI_EXPRESS_GENERIC_BRIDGE
+    select PL011 # UART
+    select PL031 # RTC
+    select PL061 # GPIO
+    select PVPANIC_MMIO
+    select UNIMP
+    select VMAPPLE_AES

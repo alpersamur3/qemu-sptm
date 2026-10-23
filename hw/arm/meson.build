@@ -115,6 +115,7 @@ arm_common_ss.add(files('boot.c'))
 hw_common_arch += {'arm': arm_common_ss}
 
 arm_common_ss.add(files('darwin.c', 'xnuboot_sptm.c', 'xnu_patch.c', 'apple_regs.c', 'apple_dtree.c', 'apple_amcc.c', 'macho.c'))
+arm_common_ss.add(when: 'CONFIG_ARM_VRESEARCH', if_true: files('vresearch.c'))
 
 arm_common_ss.add(custom_target('apple_regs_autogen.h',
   output: 'apple_regs_autogen.h',
