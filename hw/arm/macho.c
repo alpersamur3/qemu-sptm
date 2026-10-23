@@ -121,7 +121,9 @@ fse_t *macho_find_fileset_entry(u8 *macho, const char *name) {
     for (size_t i = 0; i < header->ncmds; i++) {
         if (LC_FILESET_ENTRY == cursor->cmd) {
             fse_t *f = (fse_t*)cursor;
-            if (0 == strcmp(name, (char*)(f+1))) return f;
+            // entry_id.offset, not f+1: on LLP64 (Windows) union lc_str also
+            // holds a pointer, so sizeof(fse_t) isn't the file layout's 32
+            if (0 == strcmp(name, (char*)f + f->entry_id.offset)) return f;
         }
         cursor = NEXT(cursor);
     }

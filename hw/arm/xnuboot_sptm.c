@@ -29,8 +29,8 @@
 // BKC actual virt addr = sptm.virtlo + 2 * SPTM_EXPECTED_STRIDE
 #define SPTM_EXPECTED_STRIDE    0x10000000
 
-#define GET_L2_PT_INDEX(a)      (( ((a)) & ( (BIT(36)-1)) ))
-#define STRIP_L2_PT_INDEX(a)    (( ((a)) & (~(BIT(36)-1)) ))
+#define GET_L2_PT_INDEX(a)      (( ((a)) & ( (BIT_ULL(36)-1)) ))
+#define STRIP_L2_PT_INDEX(a)    (( ((a)) & (~(BIT_ULL(36)-1)) ))
 
 static void alloc_ram(Object *cpuobj, hwaddr base, size_t len) {
     MemoryRegion *ram_main = get_system_memory();

@@ -23,7 +23,7 @@ void log_write(const char *, CPUARMState *, const ARMCPRegInfo *, u64 val);
 
 #define APPLE_STATE(env) ((apple_state_t*)env->apple_state)
 
-#define TAG_OFFSET_EL2_LOCK            BIT(63)
+#define TAG_OFFSET_EL2_LOCK            BIT_ULL(63)
 
 #include "apple_regs_autogen.h"
 

@@ -20,7 +20,7 @@
 #define ROUND_DOWN_POW2(x,sz)      ((       ((x))        & (~(((sz)) - 1)) ))
 #define ROUND_UP_POW2(x,sz)        (( (((x)) + (((sz))-1)) & (~(((sz)) - 1)) ))
 #define ROUND_NEXT_PAGE(x)         (( ROUND_UP_POW2( ((x)), ( (( DARWIN_PAGE_SIZE )) )) ))
-#define XNU_STRIP_VMA(x)           (( ((x)) & ((BIT(35)-1)) ))
+#define XNU_STRIP_VMA(x)           (( ((x)) & ((BIT_ULL(35)-1)) ))
 
 typedef uint64_t usize;
 typedef uint64_t u64;

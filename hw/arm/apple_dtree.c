@@ -69,13 +69,14 @@ size_t adt_get_prop_len(struct dtree_node *n, const char *prop_name) {
 }
 
 struct dtree_node *adt_find_node(struct dtree_node *root, const char *path) {
-    char *token, *string, *tofree;
+    char *token;
     struct dtree_node *cur_node, *cur_child;
 
-    tofree = string = strdup(path);
+    // g_strsplit rather than strsep, which MinGW doesn't have
+    char **tokens = g_strsplit(path, kDTPathNameSeparator, -1);
     cur_node = root;
 
-    while (NULL != (token = strsep(&string, kDTPathNameSeparator))) {
+    for (char **t = tokens; NULL != (token = *t); t++) {
         bool found_it = false;
 
         cur_child = first_child(cur_node);
@@ -95,6 +96,6 @@ struct dtree_node *adt_find_node(struct dtree_node *root, const char *path) {
     }
 
 out:
-    free(tofree);
+    g_strfreev(tokens);
     return cur_node;
 }

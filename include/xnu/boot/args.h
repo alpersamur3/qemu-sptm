@@ -19,13 +19,14 @@
  * Video information..
  */
 
+/* unsigned long in XNU, i.e. 64-bit; spelled out so LLP64 hosts (Windows) agree */
 struct Boot_Video {
-	unsigned long   v_baseAddr;     /* Base address of video memory */
-	unsigned long   v_display;      /* Display Code (if Applicable */
-	unsigned long   v_rowBytes;     /* Number of bytes per pixel row */
-	unsigned long   v_width;        /* Width */
-	unsigned long   v_height;       /* Height */
-	unsigned long   v_depth;        /* Pixel Depth and other parameters */
+	uint64_t        v_baseAddr;     /* Base address of video memory */
+	uint64_t        v_display;      /* Display Code (if Applicable */
+	uint64_t        v_rowBytes;     /* Number of bytes per pixel row */
+	uint64_t        v_width;        /* Width */
+	uint64_t        v_height;       /* Height */
+	uint64_t        v_depth;        /* Pixel Depth and other parameters */
 };
 
 #define kBootVideoDepthMask             (0xFF)
@@ -60,6 +61,9 @@ typedef struct xnu_boot_args {
 	uint64_t                bootFlags;              /* Additional flags specified by the bootloader */
 	uint64_t                memSizeActual;          /* Actual size of memory */
 } boot_args;
+
+/* the arm64 XNU layout, whatever the host's long is */
+QEMU_BUILD_BUG_ON(offsetof(boot_args, deviceTreeP) != 96);
 
 #define SOC_DEVICE_TYPE_BUFFER_SIZE     32
 
