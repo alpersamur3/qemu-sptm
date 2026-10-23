@@ -506,6 +506,8 @@ static void vresearch_init(MachineState *ms)
 
 static GlobalProperty vresearch_compat_defaults[] = {
     { TYPE_VIRTIO_PCI, "disable-legacy", "on" },
+    /* no option ROM: nothing would run it, and a Windows build may not ship efi-virtio.rom */
+    { "virtio-net-pci", "romfile", "" },
 };
 
 static void vresearch_machine_class_init(ObjectClass *oc, const void *data)
