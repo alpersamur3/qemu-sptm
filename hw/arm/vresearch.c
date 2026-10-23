@@ -384,6 +384,11 @@ static void create_devices(VResearchState *s)
     sysbus_mmio_map(sbd, 0, memmap[VR_PVPANIC].base);
     sysbus_realize_and_unref(sbd, &error_fatal);
 
+    /*
+     * Needs a crypto backend (nettle, gcrypt or gnutls): QEMU has no built-in
+     * ciphers any more, every AES command then fails, and the kernel waits
+     * for it forever before launchd.
+     */
     sbd = SYS_BUS_DEVICE(qdev_new(TYPE_APPLE_AES));
     sysbus_mmio_map(sbd, 0, memmap[VR_AES_1].base);
     sysbus_mmio_map(sbd, 1, memmap[VR_AES_2].base);
