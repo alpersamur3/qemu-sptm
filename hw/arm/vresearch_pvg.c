@@ -8,9 +8,10 @@
  * draws: the FIFOs are parsed, every command completes at once (GPU work is
  * dropped), and the display handshake (shared state page, mode list, ack)
  * runs as the framework's does. Presents are acknowledged and logged with
- * their IOSurface descriptor; copying the surface into the QEMU console
- * ("pvg") is not done yet, so it stays black. That is enough to see how far
- * a guest gets without the GPU.
+ * their IOSurface descriptor, and display 0's last presented mapper surface
+ * (opcode 8) is copied into the QEMU console ("pvg") when it refreshes.
+ * Backings of task 0 (opcode 7) are not shown yet. That is enough to see how
+ * far a guest gets without the GPU.
  *
  * The guest ABI follows reims-vgpu's description of it (docs/testing.md,
  * section 6, "Guest ABI reference"): pages are 16 KiB, "page" fields are
@@ -93,6 +94,19 @@ OBJECT_DECLARE_SIMPLE_TYPE(VResearchPVGState, VRESEARCH_PVG)
 #define IOSFC_BAD_ARGUMENT  0xe00002c2
 #define IOSFC_UNSUPPORTED   0xe00002c7
 
+/* v2 descriptor base (reims-vgpu iosurface/descriptor.rs) */
+#define IOSFC_FORMAT        0x04
+#define IOSFC_OFFSET        0x08
+#define IOSFC_ALLOC         0x18
+#define IOSFC_WIDTH         0x20
+#define IOSFC_HEIGHT        0x28
+#define IOSFC_BPR           0x30
+#define IOSFC_BPE           0x38
+#define IOSFC_FLAGS         0x41    /* readOnly:1, hostOnly:1 */
+#define IOSFC_HOST_ONLY     0x02
+#define IOSFC_BGRA          0x42475241
+#define IOSFC_RGBA          0x52474241
+
 enum { CMD_OK, CMD_FAULT, CMD_NO_STAMP };
 
 typedef struct PVGFifo {
@@ -149,6 +163,8 @@ struct VResearchPVGState {
     QemuConsole *con;
     uint32_t *frame;
     uint64_t presents;
+    uint64_t shown_id;          /* port 0's mapping ID, 0 for none */
+    uint64_t scanned;           /* presents at the last scanout */
     unsigned log_budget;
     unsigned irq_reads;
 };
@@ -344,18 +360,6 @@ static void display_ack(VResearchPVGState *s, uint32_t port, uint32_t ack)
     st32(page + DSP_STATE, 2);
 }
 
-static bool fb_update(void *opaque)
-{
-    VResearchPVGState *s = opaque;
-
-    qemu_console_update_full(s->con);
-    return true;
-}
-
-static const GraphicHwOps pvg_gfx_ops = {
-    .gfx_update = fb_update,
-};
-
 /*
  * The descriptor of IOSurface mapping `id`: the descriptor table (0x1010)
  * is a page of u32 {valid:1, isTable:1, page:30}, one per page of 16 v2
@@ -400,6 +404,137 @@ static void present_done(VResearchPVGState *s, uint32_t port)
     st64(page + DSP_PRESENT_COUNT, ld64(page + DSP_PRESENT_COUNT) + 1);
     display_raise(s, port, DSP_IRQ_PRESENTED);
 }
+
+/*
+ * The guest pages of a guest-backed v2 surface: word0 of its descriptor is
+ * the page-table root {valid:1, isTable:1, page:30}. A surface of at most one
+ * page of entries uses the root as its only level, a larger one the root's
+ * entries as second-level tables (reims-vgpu iosurface/walk.rs).
+ */
+static uint64_t *surface_pages(uint32_t root, uint64_t npages)
+{
+    uint64_t per = PVG_PAGE / 4, base = (uint64_t)(root >> 2) * PVG_PAGE;
+    uint64_t *pages, i, n = 0;
+
+    if (!(root & 1) || !npages || npages > per * per) {
+        return NULL;
+    }
+    pages = g_new(uint64_t, npages);
+    if (npages <= per) {
+        for (i = 0; i < npages; i++) {
+            uint32_t e = ld32(base + 4 * i);
+
+            if ((e & 3) != 1) {
+                goto bad;
+            }
+            pages[i] = (uint64_t)(e >> 2) * PVG_PAGE;
+        }
+        return pages;
+    }
+    for (i = 0; n < npages; i++) {
+        uint32_t t = ld32(base + 4 * i);
+        uint64_t j, table = (uint64_t)(t >> 2) * PVG_PAGE;
+
+        if ((t & 3) != 3) {
+            goto bad;
+        }
+        for (j = 0; j < per && n < npages; j++, n++) {
+            uint32_t e = ld32(table + 4 * j);
+
+            if ((e & 3) != 1) {
+                goto bad;
+            }
+            pages[n] = (uint64_t)(e >> 2) * PVG_PAGE;
+        }
+    }
+    return pages;
+bad:
+    g_free(pages);
+    return NULL;
+}
+
+/*
+ * Copy the surface port 0 last presented (opcode 8) into the console's
+ * frame, clipped to the display mode. 'BGRA' is the console's x8r8g8b8 as it
+ * is; 'RGBA' swaps red and blue. Other formats ('RGhA', half floats) and
+ * host-only surfaces are logged and left out.
+ */
+static void scanout(VResearchPVGState *s)
+{
+    uint64_t desc = iosfc_desc(s, s->shown_id);
+    uint64_t off, alloc, w, h, bpr, npages, y, *pages;
+    uint32_t fmt;
+    uint8_t d[0x80];
+
+    if (!desc) {
+        return;
+    }
+    rd(desc, d, sizeof(d));
+    fmt = p32(d, IOSFC_FORMAT);
+    off = p64(d, IOSFC_OFFSET);
+    alloc = p64(d, IOSFC_ALLOC);
+    w = MIN(p64(d, IOSFC_WIDTH), s->width);
+    h = MIN(p64(d, IOSFC_HEIGHT), s->height);
+    bpr = p64(d, IOSFC_BPR);
+    if ((fmt != IOSFC_BGRA && fmt != IOSFC_RGBA) || lduw_le_p(d + IOSFC_BPE) != 4 ||
+        (d[IOSFC_FLAGS] & IOSFC_HOST_ONLY) || bpr < 4 * w) {
+        if (s->log_budget) {
+            s->log_budget--;
+            qemu_log_mask(LOG_UNIMP, "pvg: surface %" PRIu64 " not shown: format 0x%08x, "
+                          "%u bytes a pixel, flags 0x%x, row %" PRIu64 "\n", s->shown_id, fmt,
+                          lduw_le_p(d + IOSFC_BPE), d[IOSFC_FLAGS], bpr);
+        }
+        return;
+    }
+    npages = DIV_ROUND_UP(alloc, PVG_PAGE);
+    pages = surface_pages(p32(d, 0), npages);
+    if (!pages) {
+        if (s->log_budget) {
+            s->log_budget--;
+            qemu_log_mask(LOG_UNIMP, "pvg: surface %" PRIu64 ": bad page table\n",
+                          s->shown_id);
+        }
+        return;
+    }
+    for (y = 0; y < h && off + y * bpr + 4 * w <= npages * PVG_PAGE; y++) {
+        uint8_t *dst = (uint8_t *)(s->frame + y * s->width);
+        uint64_t src = off + y * bpr, left = 4 * w;
+
+        while (left) {
+            uint64_t in = src % PVG_PAGE, n = MIN(left, PVG_PAGE - in);
+
+            rd(pages[src / PVG_PAGE] + in, dst, n);
+            dst += n;
+            src += n;
+            left -= n;
+        }
+        if (fmt == IOSFC_RGBA) {
+            uint32_t *px = s->frame + y * s->width;
+            uint64_t x;
+
+            for (x = 0; x < w; x++) {
+                px[x] = (px[x] & 0xff00ff00) | ((px[x] & 0xff) << 16) | ((px[x] >> 16) & 0xff);
+            }
+        }
+    }
+    g_free(pages);
+}
+
+static bool fb_update(void *opaque)
+{
+    VResearchPVGState *s = opaque;
+
+    if (s->shown_id && s->scanned != s->presents) {
+        s->scanned = s->presents;
+        scanout(s);
+    }
+    qemu_console_update_full(s->con);
+    return true;
+}
+
+static const GraphicHwOps pvg_gfx_ops = {
+    .gfx_update = fb_update,
+};
 
 /* --- commands --- */
 
@@ -516,6 +651,9 @@ static int run_command(VResearchPVGState *s, PVGFifo *f, uint16_t op,
         if (p32(p, 0) < PVG_PORTS) {
             present_mapping(s, p32(p, 0), p64(p, 8));
             st64(s->display_page[p32(p, 0)] + DSP_PRESENTED_MAP, p64(p, 8));
+            if (p32(p, 0) == 0) {
+                s->shown_id = p64(p, 8);
+            }
             present_done(s, p32(p, 0));
         }
         return CMD_OK;
@@ -966,6 +1104,7 @@ static void pvg_reset(DeviceState *dev)
     s->ring_base = s->ring_size = s->desc_base = s->desc_enable = 0;
     s->ring_write = s->ring_read = 0;
     memset(s->mapped, 0, sizeof(s->mapped));
+    s->shown_id = s->scanned = 0;
     s->log_budget = 64;
     s->irq_reads = 0;
 }
