@@ -240,6 +240,34 @@ void patch_kc_aks_stub(u8 *bkc_macho) {
     }
     fn[1] = MOVX(0, 0);
     fn[2] = RETAB;
+
+    /*
+     * Second: make the keystore's SEP transact (sub_7F2C794) return success
+     * instead of the error 0xE00002BC when there is no endpoint, so the AKS
+     * requests the daemons issue complete rather than fail. The no-endpoint
+     * error is built at 0xfffffe0007f2d618 with
+     *   movz w27, #0x2bc ; movk w27, #0xe000, lsl #16   (0x5280579b 0x72bc001b)
+     * Turn it into w27 = 0 (movz w27, #0 ; nop). The output buffer is not
+     * filled on this path (no real reply), so read queries return zeros; the
+     * per-selector synthetic values are layered on top of this.
+     */
+    {
+        const u64 err_va = 0xfffffe0007f2d618ULL;
+        u32 *e;
+
+        if (err_va < exec->vmaddr || err_va >= exec->vmaddr + exec->vmsize) {
+            fprintf(stderr, "aks-stub: transact error site out of range\n");
+            return;
+        }
+        e = (u32 *)&bkc_macho[exec->fileoff + (err_va - exec->vmaddr)];
+        if (e[0] != 0x5280579bu || e[1] != 0x72bc001bu) {
+            fprintf(stderr, "aks-stub: transact error load mismatch "
+                    "(0x%X 0x%X); not patched\n", e[0], e[1]);
+            return;
+        }
+        e[0] = 0x5280001bu;     /* movz w27, #0 */
+        e[1] = NOP;
+    }
 }
 
 bool kc_uses_mte(u8 *bkc_macho) {
