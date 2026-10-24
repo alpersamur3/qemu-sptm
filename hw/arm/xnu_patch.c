@@ -432,6 +432,54 @@ void patch_kc_aks_stub(u8 *bkc_macho) {
     }
 }
 
+/*
+ * amfi-lc-off: stop AMFI from enforcing launch constraints, the way iOS 16
+ * had no AMFI at all. On the vphone600 research kernel AMFI is present and
+ * enforces launch constraints: SpringBoard (launch type 0/1) fails its launch
+ * constraint and is killed ("AMFI: Launch Constraint Violation (enforcing)"),
+ * so the UI never comes up. The boot-args are no help: amfi_enforce_launch_
+ * constraints only ever RAISES enforcement (it is applied only when nonzero),
+ * and cs_enforcement_disable panics the kernel on purpose.
+ *
+ * AMFI decides whether constraints are enforced in sub_7DE30A8, which returns
+ * (dword_78806DC != 0):
+ *   bti c; adrp x8,#..DC; ldr w8,[x8,#..DC]; cmp w8,#0; cset w0,ne; ret
+ * The violation reporter computes enforcing = sub_7DE30A8() & ...; a 0 return
+ * means every violation is logged "(not enforcing)" and the process is left
+ * alone. Patch the cset at 0xfffffe0007de30b8 (cset w0, ne = 0x1a9f07e0) to
+ * movz w0, #0 so the routine always returns 0. Validated against that opcode.
+ */
+#define AMFI_LC_ENFORCED_CSET  (( 0xfffffe0007de30b8ULL ))
+
+void patch_kc_amfi_lc_off(u8 *bkc_macho) {
+    fse_t *fse = macho_find_fileset_entry(bkc_macho,
+                     "com.apple.driver.AppleMobileFileIntegrity");
+    seg_t *exec;
+    u32 *p;
+
+    if (!fse) {
+        fprintf(stderr, "amfi-lc-off: couldn't find AppleMobileFileIntegrity kext\n");
+        return;
+    }
+    exec = macho_find_seg(&bkc_macho[fse->fileoff], "__TEXT_EXEC");
+    if (!exec) {
+        fprintf(stderr, "amfi-lc-off: couldn't find AMFI __TEXT_EXEC\n");
+        return;
+    }
+    if (AMFI_LC_ENFORCED_CSET < exec->vmaddr ||
+        AMFI_LC_ENFORCED_CSET >= exec->vmaddr + exec->vmsize) {
+        fprintf(stderr, "amfi-lc-off: target not in __TEXT_EXEC; not patched\n");
+        return;
+    }
+    p = (u32 *)&bkc_macho[exec->fileoff + (AMFI_LC_ENFORCED_CSET - exec->vmaddr)];
+    if (p[0] != 0x1a9f07e0u) {       /* cset w0, ne */
+        fprintf(stderr, "amfi-lc-off: enforcement cset mismatch "
+                "(0x%X); not patched\n", p[0]);
+        return;
+    }
+    p[0] = 0x52800000u;              /* movz w0, #0 */
+}
+
 bool kc_uses_mte(u8 *bkc_macho) {
     seg_t *kc_exec_seg = macho_find_seg(bkc_macho, "__TEXT_EXEC");
     assert(kc_exec_seg);

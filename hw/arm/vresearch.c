@@ -160,6 +160,7 @@ struct VResearchState {
     bool                   pvg;
     bool                   sep;
     bool                   aks_stub;
+    bool                   amfi_lc_off;
     MemoryRegion           fb_ram;
     QemuConsole           *fb_con;
 };
@@ -447,6 +448,16 @@ static void aks_stub_set(Object *obj, bool val, Error **errp)
     VRESEARCH_MACHINE(obj)->aks_stub = val;
 }
 
+static bool amfi_lc_off_get(Object *obj, Error **errp)
+{
+    return VRESEARCH_MACHINE(obj)->amfi_lc_off;
+}
+
+static void amfi_lc_off_set(Object *obj, bool val, Error **errp)
+{
+    VRESEARCH_MACHINE(obj)->amfi_lc_off = val;
+}
+
 static bool fb_update(void *opaque)
 {
     VResearchState *s = opaque;
@@ -672,6 +683,9 @@ static void vresearch_init(MachineState *ms)
     if (s->aks_stub) {
         patch_kc_aks_stub(info->bootkc_f.buf);
     }
+    if (s->amfi_lc_off) {
+        patch_kc_amfi_lc_off(info->bootkc_f.buf);
+    }
     arm_load_xnu(cpu, ms, info);
     if (info->has_mte) {
         setup_mte(cpuobj, ms, info);
@@ -741,6 +755,10 @@ static void vresearch_machine_class_init(ObjectClass *oc, const void *data)
     object_class_property_set_description(oc, "aks-stub",
         "Patch AppleSEPKeyStore so it doesn't wait on a SEP: the keystore gate "
         "stops blocking the container daemons (backboardd etc.). Default off");
+    object_class_property_add_bool(oc, "amfi-lc-off", amfi_lc_off_get, amfi_lc_off_set);
+    object_class_property_set_description(oc, "amfi-lc-off",
+        "Patch AMFI so launch constraints are not enforced (logged only), like "
+        "iOS 16 had no AMFI; lets SpringBoard launch. Default off");
     object_class_property_add_bool(oc, "unauth-root", unauth_root_get, unauth_root_set);
     object_class_property_set_description(oc, "unauth-root",
         "Patch the kernel to boot from a root that isn't an authenticated "
