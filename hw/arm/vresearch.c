@@ -147,9 +147,13 @@ static const int irqmap[] = {
  */
 #define VR_FB_BASE      0x1c0000000ULL
 
+#define VR_MAX_CPUS 8
+
 struct VResearchState {
     MachineState           parent_obj;
-    ARMCPU                *cpu;
+    ARMCPU                *cpu;            /* boot cpu == cpus[0] */
+    ARMCPU                *cpus[VR_MAX_CPUS];
+    unsigned               num_cpu;
     DeviceState           *gic;
     MemoryRegion           msi_frame;
     MemoryRegion           ecam_alias;
@@ -231,36 +235,53 @@ static GMappedFile *map_file(const char *path, const char *what, mmap_file_t *f)
 static void vresearch_reset(void *opaque)
 {
     VResearchState *s = opaque;
-    CPUARMState *env = &s->cpu->env;
+    unsigned i;
 
-    cpu_reset(CPU(s->cpu));
+    for (i = 0; i < s->num_cpu; i++) {
+        CPUARMState *env = &s->cpus[i]->env;
 
-    /* no EL2/EL3, so the reset state is EL1h */
-    assert(1 == arm_highest_el(env));
-    env->xregs[0] = s->bootinfo.init_x0;
-    env->pc = s->bootinfo.init_pc;
+        cpu_reset(CPU(s->cpus[i]));
 
-    /* SPTM needs the FPU enabled */
-    env->cp15.cpacr_el1 |= CPACR_ENABLE_FPU;
-    arm_rebuild_hflags(env);
+        /* no EL2/EL3, so the reset state is EL1h */
+        assert(1 == arm_highest_el(env));
+
+        /* SPTM needs the FPU enabled */
+        env->cp15.cpacr_el1 |= CPACR_ENABLE_FPU;
+
+        /* GXF state (currentg/aspsr_gl) is cleared in arm_cpu_reset_hold(),
+         * which cpu_reset() above already ran -- that also covers PSCI CPU_ON. */
+
+        if (i == 0) {
+            /* only the boot cpu starts at the kernel entry; secondaries wait
+             * powered-off until the kernel PSCI-CPU_ONs them. */
+            env->xregs[0] = s->bootinfo.init_x0;
+            env->pc = s->bootinfo.init_pc;
+        }
+        arm_rebuild_hflags(env);
+    }
 }
 
 static void setup_mte(Object *cpuobj, MachineState *ms, struct xnu_boot_info *info)
 {
-    MemoryRegion *tag_sysmem, *tagram;
+    /* One shared tag address space for all cpus; built on the first call. */
+    static MemoryRegion *tag_sysmem;
 
     if (!object_property_find(cpuobj, "tag-memory")) {
         error_report("vresearch: cpu has no tag-memory property; MTE can't be enabled");
         exit(1);
     }
 
-    tag_sysmem = g_new(MemoryRegion, 1);
-    memory_region_init(tag_sysmem, OBJECT(ms), "tag-memory", UINT64_MAX / 32);
-    object_property_set_link(cpuobj, "tag-memory", OBJECT(tag_sysmem), &error_abort);
+    if (!tag_sysmem) {
+        MemoryRegion *tagram;
 
-    tagram = g_new(MemoryRegion, 1);
-    memory_region_init_ram(tagram, NULL, "mte_tags", info->dram_size / 32, &error_fatal);
-    memory_region_add_subregion(tag_sysmem, info->dram_base / 32, tagram);
+        tag_sysmem = g_new(MemoryRegion, 1);
+        memory_region_init(tag_sysmem, OBJECT(ms), "tag-memory", UINT64_MAX / 32);
+
+        tagram = g_new(MemoryRegion, 1);
+        memory_region_init_ram(tagram, NULL, "mte_tags", info->dram_size / 32, &error_fatal);
+        memory_region_add_subregion(tag_sysmem, info->dram_base / 32, tagram);
+    }
+    object_property_set_link(cpuobj, "tag-memory", OBJECT(tag_sysmem), &error_abort);
 }
 
 static qemu_irq spi(VResearchState *s, int n)
@@ -312,17 +333,17 @@ static const MemoryRegionOps msi_frame_ops = {
 
 static void create_gic(VResearchState *s)
 {
-    DeviceState *cpudev = DEVICE(s->cpu);
     SysBusDevice *gicbusdev;
     QList *redist_region_count;
+    unsigned i;
 
     s->gic = qdev_new(gicv3_class_name());
     qdev_prop_set_uint32(s->gic, "revision", 3);
-    qdev_prop_set_uint32(s->gic, "num-cpu", 1);
+    qdev_prop_set_uint32(s->gic, "num-cpu", s->num_cpu);
     qdev_prop_set_uint32(s->gic, "num-irq", NUM_IRQS + GIC_INTERNAL);
 
     redist_region_count = qlist_new();
-    qlist_append_int(redist_region_count, 1);
+    qlist_append_int(redist_region_count, s->num_cpu);
     qdev_prop_set_array(s->gic, "redist-region-count", redist_region_count);
 
     gicbusdev = SYS_BUS_DEVICE(s->gic);
@@ -338,16 +359,25 @@ static void create_gic(VResearchState *s)
     msi_nonbroken = true;
 
     /*
-     * PPIs are INTID 27 (virtual timer) and 30 (physical timer). vmapple only
-     * wires the former; an EL1 kernel could use either.
+     * Per cpu: wire the generic-timer PPIs (INTID 27 virtual, 30 physical)
+     * into that cpu's redistributor, and the GIC's per-cpu output lines (IRQ
+     * at index i, FIQ at num_cpu + i) to the cpu. No EL2 here, so no
+     * vIRQ/vFIQ/maintenance lines (as in the original single-cpu wiring).
      */
-    qdev_connect_gpio_out(cpudev, GTIMER_VIRT,
-                          qdev_get_gpio_in(s->gic, NUM_IRQS + 27));
-    qdev_connect_gpio_out(cpudev, GTIMER_PHYS,
-                          qdev_get_gpio_in(s->gic, NUM_IRQS + 30));
+    for (i = 0; i < s->num_cpu; i++) {
+        DeviceState *cpudev = DEVICE(s->cpus[i]);
+        unsigned ppibase = NUM_IRQS + i * GIC_INTERNAL;
 
-    sysbus_connect_irq(gicbusdev, 0, qdev_get_gpio_in(cpudev, ARM_CPU_IRQ));
-    sysbus_connect_irq(gicbusdev, 1, qdev_get_gpio_in(cpudev, ARM_CPU_FIQ));
+        qdev_connect_gpio_out(cpudev, GTIMER_VIRT,
+                              qdev_get_gpio_in(s->gic, ppibase + 27));
+        qdev_connect_gpio_out(cpudev, GTIMER_PHYS,
+                              qdev_get_gpio_in(s->gic, ppibase + 30));
+
+        sysbus_connect_irq(gicbusdev, i,
+                           qdev_get_gpio_in(cpudev, ARM_CPU_IRQ));
+        sysbus_connect_irq(gicbusdev, s->num_cpu + i,
+                           qdev_get_gpio_in(cpudev, ARM_CPU_FIQ));
+    }
 }
 
 static void create_pcie(VResearchState *s)
@@ -630,6 +660,7 @@ static void vresearch_init(MachineState *ms)
     u32 *freq;
     Object *cpuobj;
     ARMCPU *cpu;
+    unsigned n;
 
     if (!info->args) {
         info->args = g_strdup(default_args);
@@ -660,29 +691,7 @@ static void vresearch_init(MachineState *ms)
     info->dram_size = *dram_size;
     info->has_mte = kc_uses_mte(info->bootkc_f.buf);
 
-    cpuobj = object_new(ms->cpu_type);
-    cpu = ARM_CPU(cpuobj);
-    s->cpu = cpu;
-
-    /* No EL2/EL3: the kernel and SPTM run at EL1 / GL1, as in a VZ guest */
-    if (object_property_find(cpuobj, "has_el3")) {
-        object_property_set_bool(cpuobj, "has_el3", false, &error_fatal);
-    }
-    if (object_property_find(cpuobj, "has_el2")) {
-        object_property_set_bool(cpuobj, "has_el2", false, &error_fatal);
-    }
-    object_property_set_int(cpuobj, "psci-conduit", QEMU_PSCI_CONDUIT_HVC,
-                            &error_fatal);
-    object_property_set_int(cpuobj, "mp-affinity", 0, &error_fatal);
-
-    /* As in darwin.c: CBAR and PMU MSRs collide with Apple's */
-    unset_feature(&cpu->env, ARM_FEATURE_CBAR);
-    unset_feature(&cpu->env, ARM_FEATURE_CBAR_RO);
-    unset_feature(&cpu->env, ARM_FEATURE_PMU);
-
-    /* 24 MHz in the vphone600ap / vresearch101ap device trees */
-    cpu->gt_cntfrq_hz = *freq;
-
+    /* Machine-wide, once: the framebuffer and the kernelcache patches. */
     setup_fb(s, dt_root);
     if (s->unauth_root) {
         patch_kc_unauthenticated_root(info->bootkc_f.buf);
@@ -693,16 +702,63 @@ static void vresearch_init(MachineState *ms)
     if (s->amfi_lc_off) {
         patch_kc_amfi_lc_off(info->bootkc_f.buf);
     }
-    arm_load_xnu(cpu, ms, info);
-    if (info->has_mte) {
-        setup_mte(cpuobj, ms, info);
+
+    s->num_cpu = ms->smp.cpus;
+    if (s->num_cpu > VR_MAX_CPUS) {
+        error_report("vresearch: at most %d cpus", VR_MAX_CPUS);
+        exit(1);
     }
-    apple_regs_init(cpu, NULL, dt_root, info);
+    for (n = 0; n < s->num_cpu; n++) {
+        cpuobj = object_new(ms->cpu_type);
+        cpu = ARM_CPU(cpuobj);
+        s->cpus[n] = cpu;
+        if (n == 0) {
+            s->cpu = cpu;
+        }
 
-    /* As in darwin.c, for kernels that check SME's max vector length */
-    cpu->sme_vq.supported = 0x0b;
+        /* No EL2/EL3: the kernel and SPTM run at EL1 / GL1, as in a VZ guest */
+        if (object_property_find(cpuobj, "has_el3")) {
+            object_property_set_bool(cpuobj, "has_el3", false, &error_fatal);
+        }
+        if (object_property_find(cpuobj, "has_el2")) {
+            object_property_set_bool(cpuobj, "has_el2", false, &error_fatal);
+        }
+        object_property_set_int(cpuobj, "psci-conduit", QEMU_PSCI_CONDUIT_HVC,
+                                &error_fatal);
+        /* vphone600ap cpuN has reg=N and no cluster node, so Aff0 = index */
+        object_property_set_int(cpuobj, "mp-affinity", n, &error_fatal);
+        /* secondaries wait powered-off for the kernel's PSCI CPU_ON */
+        if (n > 0) {
+            object_property_set_bool(cpuobj, "start-powered-off", true,
+                                     &error_fatal);
+        }
 
-    qdev_realize(DEVICE(cpuobj), NULL, &error_fatal);
+        /* As in darwin.c: CBAR and PMU MSRs collide with Apple's */
+        unset_feature(&cpu->env, ARM_FEATURE_CBAR);
+        unset_feature(&cpu->env, ARM_FEATURE_CBAR_RO);
+        unset_feature(&cpu->env, ARM_FEATURE_PMU);
+
+        /* 24 MHz in the vphone600ap / vresearch101ap device trees */
+        cpu->gt_cntfrq_hz = *freq;
+
+        /* As in darwin.c, for kernels that check SME's max vector length */
+        cpu->sme_vq.supported = 0x0b;
+
+        /* The boot cpu loads the kernelcache, device tree and boot args. */
+        if (n == 0) {
+            arm_load_xnu(cpu, ms, info);
+        }
+        if (info->has_mte) {
+            setup_mte(cpuobj, ms, info);
+        }
+        /*
+         * Per-cpu GXF / CTRR state: apple_state is malloc'd per env, and the
+         * CTRR / CTXR region bounds are identical on every core.
+         */
+        apple_regs_init(cpu, NULL, dt_root, info);
+
+        qdev_realize(DEVICE(cpuobj), NULL, &error_fatal);
+    }
 
     create_devices(s);
     create_util(dt_root);
@@ -730,7 +786,7 @@ static void vresearch_machine_class_init(ObjectClass *oc, const void *data)
 
     mc->desc = "Apple VResearch1 research VM (vphone600ap, vresearch101ap)";
     mc->init = vresearch_init;
-    mc->max_cpus = 1;
+    mc->max_cpus = VR_MAX_CPUS;
     mc->default_cpu_type = ARM_CPU_TYPE_NAME("max");
     mc->block_default_type = IF_VIRTIO;
     mc->no_cdrom = 1;
