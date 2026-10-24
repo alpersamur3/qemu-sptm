@@ -675,6 +675,23 @@ static void arm_cpu_reset_hold(Object *obj, ResetType type)
     }
 #endif
 
+    /*
+     * Apple SPTM/GXF fixup. These fields live after end_reset_fields, so the
+     * field-clearing reset above leaves them intact, and this path also runs
+     * on PSCI CPU_ON (arm_set_cpu_on_async_work -> cpu_reset), unlike a machine
+     * reset hook. A secondary core the kernel powers on therefore starts with
+     * the FPU enabled -- SPTM's entry uses SIMD before it sets VBAR, so an FP
+     * trap here would fault forever and the cpu would never check in -- and at
+     * the normal exception level rather than the guarded level. (FPEN=3 is the
+     * CPACR_ENABLE_FPU the vresearch/darwin machines set for the boot cpu.)
+     */
+    if (env->apple_state) {
+        env->cp15.cpacr_el1 = FIELD_DP64(env->cp15.cpacr_el1,
+                                         CPACR_EL1, FPEN, 3);
+        env->currentg = 0;
+        memset(env->aspsr_gl, 0, sizeof(env->aspsr_gl));
+    }
+
     if (tcg_enabled()) {
         hw_breakpoint_update_all(cpu);
         hw_watchpoint_update_all(cpu);
