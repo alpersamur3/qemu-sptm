@@ -520,19 +520,26 @@ static void create_fb(VResearchState *s)
 
 /*
  * pvg=on: the PVG GPU and its IOSurface mapper, display only
- * (vresearch_pvg.c). Its display has the boot framebuffer's size when there
- * is one; HMP `screendump FILE pvg` shows what the guest presents.
+ * (vresearch_pvg.c). Its display takes the fb=WxH size when given, but the
+ * TRUE width, not the boot framebuffer's 16-pixel-rounded one: FrontBoard's
+ * FBSDisplayMode validity check traps (SpringBoard SIGTRAP in
+ * FBSystemShellInitialize) on a width that isn't consistent with the display
+ * scale -- 1184 (1179 rounded up) fails, 1179 passes. With no fb= the PVG
+ * property defaults (1179x2556) stand. HMP `screendump FILE pvg` shows the
+ * presented frame.
  */
 static void create_pvg(VResearchState *s)
 {
     DeviceState *dev = qdev_new(TYPE_VRESEARCH_PVG);
     SysBusDevice *sbd = SYS_BUS_DEVICE(dev);
-    struct xnu_boot_info *info = &s->bootinfo;
+    unsigned w, h;
+    char end;
 
     qdev_set_id(dev, g_strdup("pvg"), &error_fatal);
-    if (info->video_base) {
-        qdev_prop_set_uint32(dev, "width", info->video_width);
-        qdev_prop_set_uint32(dev, "height", info->video_height);
+    if (s->fb && strcmp(s->fb, "off") &&
+        sscanf(s->fb, "%ux%u%c", &w, &h, &end) == 2 && w && h) {
+        qdev_prop_set_uint32(dev, "width", w);
+        qdev_prop_set_uint32(dev, "height", h);
     }
     sysbus_realize_and_unref(sbd, &error_fatal);
     sysbus_mmio_map(sbd, 0, memmap[VR_APV_GFX].base);
