@@ -350,6 +350,56 @@ void patch_kc_aks_stub(u8 *bkc_macho) {
     }
 
     /*
+     * Fourth-b: selector 14 (get system bag). keybagd's MKB_INIT (MobileKeyBag)
+     * asks AppleKeyStore for the system bag at boot; with no SEP the handler
+     * fails, MKB_INIT falls back to /private/var/keybags/systembag.kb, which is
+     * absent, and dies ("No system keybag found on filesystem ... FATAL KEYBAG
+     * ERROR"). usermanagerd then cannot build the personal-persona session bag
+     * (ACMTRM _currentDeviceStateFromKeybag -> 0xe00002d8), so containermanagerd
+     * blocks in -[MCMUserIdentityCache _refreshFromUserManagementIfNecessary]
+     * and every process launched as the mobile user (backboardd) hangs forever
+     * in exec waiting on that container-label upcall; the UI never comes up.
+     *
+     * iOS 16's SweetKeyStore answered sel 14 with system handle 0 ("answering
+     * with a handle is the path a userspace reboot takes, so no bag file is
+     * needed"). Do the same: the sel 14 handler at 0xfffffe0007f34950
+     * (dispatcher sub_7F33034, jump-table index sel-1) has the same scalar-out
+     * shape as sel 7, so write handle 0 to *scalarOutput, set
+     * scalarOutputCount = 1, return 0, and branch to the shared retab epilogue.
+     * Head validated (bti j; ldr w8, [x19, #0x28]); on mismatch nothing is
+     * patched. There are 27 words before the next jump-table landing pad at
+     * 0xfffffe0007f349bc, so the 8-word rewrite stays inside this handler.
+     */
+    {
+        const u64 sel14_va = 0xfffffe0007f34950ULL;
+        const u64 epi_va   = 0xfffffe0007f3a940ULL;
+        u32 *h;
+        u64 bsite;
+        i64 off;
+
+        if (sel14_va < exec->vmaddr || sel14_va >= exec->vmaddr + exec->vmsize ||
+            epi_va   < exec->vmaddr || epi_va   >= exec->vmaddr + exec->vmsize) {
+            fprintf(stderr, "aks-stub: sel 14 handler out of range\n");
+            return;
+        }
+        h = (u32 *)&bkc_macho[exec->fileoff + (sel14_va - exec->vmaddr)];
+        if (h[0] != BTI_J || h[1] != 0xb9402a68u) {
+            fprintf(stderr, "aks-stub: sel 14 handler head mismatch "
+                    "(0x%X 0x%X); not patched\n", h[0], h[1]);
+            return;
+        }
+        h[1] = 0xf9402669u;             /* ldr  x9, [x19, #0x48]  (scalarOutput) */
+        h[2] = 0x52800008u;             /* movz w8, #0  (system bag handle 0) */
+        h[3] = 0xf9000128u;             /* str  x8, [x9]          (*scalarOutput = 0) */
+        h[4] = 0x52800028u;             /* movz w8, #1 */
+        h[5] = 0xb9005268u;             /* str  w8, [x19, #0x50]  (scalarOutputCount = 1) */
+        h[6] = 0x52800018u;             /* movz w24, #0           (KERN_SUCCESS) */
+        bsite = sel14_va + 4 * 7;       /* VA of h[7] */
+        off = (i64)(epi_va - bsite) >> 2;
+        h[7] = 0x14000000u | ((u32)off & 0x03FFFFFFu);  /* b epilogue */
+    }
+
+    /*
      * Fourth: selectors 17 and 35 (get device state / extended device state)
      * return a small DER SET as struct output, not a scalar. With no SEP they
      * fail (sep_endpoint() failed, ret 0xE00002D8) and the daemons retry
