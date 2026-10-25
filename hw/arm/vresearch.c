@@ -167,6 +167,7 @@ struct VResearchState {
     bool                   aks_stub;
     bool                   aks_crypt;
     bool                   amfi_lc_off;
+    bool                   acm_stub;
     MemoryRegion           fb_ram;
     QemuConsole           *fb_con;
 };
@@ -500,6 +501,16 @@ static void amfi_lc_off_set(Object *obj, bool val, Error **errp)
     VRESEARCH_MACHINE(obj)->amfi_lc_off = val;
 }
 
+static bool acm_stub_get(Object *obj, Error **errp)
+{
+    return VRESEARCH_MACHINE(obj)->acm_stub;
+}
+
+static void acm_stub_set(Object *obj, bool val, Error **errp)
+{
+    VRESEARCH_MACHINE(obj)->acm_stub = val;
+}
+
 static bool fb_update(void *opaque)
 {
     VResearchState *s = opaque;
@@ -718,6 +729,9 @@ static void vresearch_init(MachineState *ms)
     if (s->amfi_lc_off) {
         patch_kc_amfi_lc_off(info->bootkc_f.buf);
     }
+    if (s->acm_stub) {
+        patch_kc_acm_stub(info->bootkc_f.buf);
+    }
 
     s->num_cpu = ms->smp.cpus;
     if (s->num_cpu > VR_MAX_CPUS) {
@@ -843,6 +857,12 @@ static void vresearch_machine_class_init(ObjectClass *oc, const void *data)
     object_class_property_set_description(oc, "amfi-lc-off",
         "Patch AMFI so launch constraints are not enforced (logged only), like "
         "iOS 16 had no AMFI; lets SpringBoard launch. Default off");
+    object_class_property_add_bool(oc, "acm-stub", acm_stub_get, acm_stub_set);
+    object_class_property_set_description(oc, "acm-stub",
+        "Patch AppleSEPCredentialManager so its SEP-endpoint wait returns "
+        "'unavailable' (0xE00002C2) instead of blocking forever without a SEP, "
+        "so SpringBoard's main thread stops hanging and draws the lock screen. "
+        "Fabricates no credential/unlock; the device stays locked. Default off");
     object_class_property_add_bool(oc, "unauth-root", unauth_root_get, unauth_root_set);
     object_class_property_set_description(oc, "unauth-root",
         "Patch the kernel to boot from a root that isn't an authenticated "

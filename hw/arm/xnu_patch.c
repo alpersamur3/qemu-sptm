@@ -650,6 +650,88 @@ void patch_kc_amfi_lc_off(u8 *bkc_macho) {
     p[0] = 0x52800000u;              /* movz w0, #0 */
 }
 
+/*
+ * acm-stub: let SpringBoard run on a SEP-less machine, without faking any
+ * credential or unlock result.
+ *
+ * AppleSEPCredentialManager has two "send a command and wait for the SEP
+ * endpoint outside the ACM command gate" wrappers (sub_7F12C6C and
+ * sub_7F12D54 in xnu-12377.* vphone600). Each logs
+ * "waitForSEPEndpointOutsideACMCommandGate: waiting cmd=%d" and then calls the
+ * endpoint object, which blocks forever when there is no SEP. SpringBoard's
+ * main thread issues an ACM command early in FBSystemShellInitialize and hangs
+ * there (a stackshot shows it ~865 s deep in these frames), so the lock screen
+ * is never drawn.
+ *
+ * Each wrapper already returns a "no endpoint" error, 0xE00002C2, on its
+ * x4==NULL path. Make both return that same error right after the prologue,
+ * instead of calling the blocking endpoint method, so the command fails fast
+ * and SpringBoard's run loop keeps going. This fabricates nothing: the device
+ * stays locked and SEP-less, and ACM queries simply report "unavailable" - the
+ * honest answer for a machine with no SEP. Same absent-hardware model as
+ * aks-stub.
+ *
+ * Both are identified by their prologue (pacibsp; sub sp, sp, #0x70) and the
+ * cbz x4 at the patch site; if either does not match (a different build),
+ * nothing is patched.
+ */
+#define SUB_SP_SP_0x70      (( 0xD101C3FFu ))
+#define MOVZ_W0_0x2C2       (( 0x52805840u ))   /* movz w0, #0x2c2            */
+#define MOVK_W0_E000_LSL16  (( 0x72BC0000u ))   /* movk w0, #0xe000, lsl #16  */
+#define ACM_SEND_A          (( 0xfffffe0007f12c6cULL ))
+#define ACM_SEND_A_EPI      (( 0xfffffe0007f12d00ULL ))
+#define ACM_SEND_B          (( 0xfffffe0007f12d54ULL ))
+#define ACM_SEND_B_EPI      (( 0xfffffe0007f12e40ULL ))
+
+void patch_kc_acm_stub(u8 *bkc_macho) {
+    fse_t *fse = macho_find_fileset_entry(bkc_macho,
+                     "com.apple.driver.AppleSEPCredentialManager");
+    seg_t *exec;
+    struct { u64 fn; u64 epi; u32 site_idx; u32 site_word; const char *tag; } w[2] = {
+        { ACM_SEND_A, ACM_SEND_A_EPI, 6, 0xb4000484u, "A" },
+        { ACM_SEND_B, ACM_SEND_B_EPI, 7, 0xb40004a4u, "B" },
+    };
+    int i;
+
+    if (!fse) {
+        fprintf(stderr, "acm-stub: couldn't find AppleSEPCredentialManager kext\n");
+        return;
+    }
+    exec = macho_find_seg(&bkc_macho[fse->fileoff], "__TEXT_EXEC");
+    if (!exec) {
+        fprintf(stderr, "acm-stub: couldn't find ACM __TEXT_EXEC\n");
+        return;
+    }
+
+    /* Verify both wrappers before writing either, so a build mismatch is a
+     * no-op rather than a half-applied patch. */
+    for (i = 0; i < 2; i++) {
+        u32 *fn;
+        if (w[i].fn < exec->vmaddr ||
+            w[i].epi >= exec->vmaddr + exec->vmsize) {
+            fprintf(stderr, "acm-stub: wrapper %s out of __TEXT_EXEC; not patched\n",
+                    w[i].tag);
+            return;
+        }
+        fn = (u32 *)&bkc_macho[exec->fileoff + (w[i].fn - exec->vmaddr)];
+        if (fn[0] != PACIBSP || fn[1] != SUB_SP_SP_0x70 ||
+            fn[w[i].site_idx] != w[i].site_word) {
+            fprintf(stderr, "acm-stub: wrapper %s prologue/site mismatch "
+                    "(0x%X 0x%X 0x%X); not patched\n",
+                    w[i].tag, fn[0], fn[1], fn[w[i].site_idx]);
+            return;
+        }
+    }
+
+    for (i = 0; i < 2; i++) {
+        u32 *fn = (u32 *)&bkc_macho[exec->fileoff + (w[i].fn - exec->vmaddr)];
+        u64 site_va = w[i].fn + 4ULL * w[i].site_idx;
+        fn[w[i].site_idx + 0] = MOVZ_W0_0x2C2;
+        fn[w[i].site_idx + 1] = MOVK_W0_E000_LSL16;
+        fn[w[i].site_idx + 2] = b_imm(site_va + 8, w[i].epi);
+    }
+}
+
 bool kc_uses_mte(u8 *bkc_macho) {
     seg_t *kc_exec_seg = macho_find_seg(bkc_macho, "__TEXT_EXEC");
     assert(kc_exec_seg);
