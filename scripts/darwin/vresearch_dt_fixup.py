@@ -147,7 +147,8 @@ def resolve_placeholders(n):
         resolve_placeholders(c)
 
 
-def fixup(root, dram_base, dram_size, ncpus, keep_sep, nvram):
+def fixup(root, dram_base, dram_size, ncpus, keep_sep, nvram,
+          display_scale=None, no_effaceable_storage=False, timeout_scale=None):
     chosen = root.child('chosen')
     arm_io = root.child('arm-io')
 
@@ -198,6 +199,34 @@ def fixup(root, dram_base, dram_size, ncpus, keep_sep, nvram):
     # serial console on uart0 (already so in the vphone600ap tree)
     root.child('defaults').set('serial-device', arm_io.child('uart0').props['AAPL,phandle'][1])
 
+    # Optional research-VM tweaks. The defaults leave the tree unchanged, so
+    # existing callers are unaffected; the root26 (HFS+ / SMP) boot sets all
+    # three.
+    if display_scale is not None:
+        # The raw ADT leaves /chosen/display-scale = 0 (iBoot / the VZ host
+        # normally fills it). With 0, FrontBoard's FBSDisplayMode computes a
+        # pixels/0 = inf x inf point size and SIGTRAPs; 3 gives 393x852 pt for
+        # a 1179x2556 panel (as on iPhone 16 Pro).
+        chosen.set('display-scale', u32(display_scale))
+    if no_effaceable_storage:
+        # keybagd then reads /private/var/keybags/systembag.kb as a flat plist
+        # instead of waiting on effaceable storage / the SEP.
+        root.child('defaults').set('no-effaceable-storage', u32(1))
+    if timeout_scale is not None:
+        # /chosen/machine-timeouts/global-scale: widen the kernel's
+        # ticket-spinlock and boot timeouts so SMP doesn't panic on a slow
+        # (TCG) host.
+        def _phandles(n):
+            if 'AAPL,phandle' in n.props:
+                yield int.from_bytes(n.props['AAPL,phandle'][1][:4], 'little')
+            for c in n.children:
+                yield from _phandles(c)
+        mt = Node()
+        mt.set('name', 'machine-timeouts')
+        mt.set('AAPL,phandle', u32(max(_phandles(root)) + 1))
+        mt.set('global-scale', u32(timeout_scale))
+        chosen.children.append(mt)
+
 
 def main():
     p = argparse.ArgumentParser(prog='vresearch_dt_fixup')
@@ -209,13 +238,20 @@ def main():
     p.add_argument('--keep-sep', action='store_true', help='keep /arm-io/sep')
     p.add_argument('--nvram', type=argparse.FileType('rb'),
                    help='NVRAM image (default: an empty one)')
+    p.add_argument('--display-scale', type=int, default=None,
+                   help='set /chosen/display-scale (ADT default 0 => FBSDisplayMode SIGTRAP)')
+    p.add_argument('--no-effaceable-storage', action='store_true',
+                   help='set /defaults/no-effaceable-storage=1 (flat-plist keybag)')
+    p.add_argument('--timeout-scale', type=int, default=None,
+                   help='set /chosen/machine-timeouts/global-scale (SMP on a slow host)')
     args = p.parse_args()
 
     root, _ = parse(args.dtree.read())
     if root.child('arm-io').props['compatible'][1].split(b'\0')[0] != b'arm-io,vmapple1':
         raise SystemExit('not a VResearch1 device tree (arm-io isn\'t arm-io,vmapple1)')
     nvram = args.nvram.read() if args.nvram else empty_nvram()
-    fixup(root, args.dram_base, args.dram_size, args.cpus, args.keep_sep, nvram)
+    fixup(root, args.dram_base, args.dram_size, args.cpus, args.keep_sep, nvram,
+          args.display_scale, args.no_effaceable_storage, args.timeout_scale)
     args.out.write(encode(root))
 
 
