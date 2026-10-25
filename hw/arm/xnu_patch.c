@@ -483,6 +483,126 @@ void patch_kc_aks_stub(u8 *bkc_macho) {
 }
 
 /*
+ * aks-crypt: route the keystore's wrap/unwrap through an HVC so QEMU can do
+ * real, reversible AES over a machine-local key (vresearch_akscrypt.c), instead
+ * of the aks-stub's blind success which would hand out garbage keys.
+ *
+ * Without a SEP the class-key wrap (IOConnectCallMethod sel 10) and unwrap
+ * (sel 11) return kIOReturnNotReady, so usermanagerd can't build the mobile
+ * persona's session bag and the UI never comes up ("No persona found",
+ * "ks_crypt: e00002d8"). The user-client dispatcher (sub_7F33034) routes sel 10
+ * to the handler at 0xfffffe0007f34858 and sel 11 to 0xfffffe0007f34ae8
+ * (xnu-12377.100.591.502, vphone600). Both handlers map the struct-input
+ * descriptor via getters, leaving the plaintext/wrapped pointer in a register
+ * and its length in x0, then build their output into the stack buffer at
+ * sp+0xd0 with the length at [x29-0x88] and, on a 0 return, copy that out to
+ * the client (the common copyout at 0xfffffe000934977c). We overwrite the span
+ * from just after the input is in hand up to and including the success branch,
+ * with: marshal (in, inlen, out=sp+0xd0, cap=*[x29-0x88], class, keybag) into
+ * the HVC registers, hvc #0, store the returned length to [x29-0x88], and
+ * branch to the handler's own copyout. x19 (the args) and x29 are preserved, so
+ * the copyout runs unchanged. Validated against anchor words; a different build
+ * is left alone.
+ *
+ * sel 10 (wrap)   write span 0xfffffe0007f34914 .. 0xf34940, branch to 0xf38ffc
+ * sel 11 (unwrap) write span 0xfffffe0007f34b90 .. 0xf34bbc, branch to 0xf34bec
+ */
+#define AKC_SEL10_VA   (( 0xfffffe0007f34914ULL ))   /* add x8, sp, #0xcc  */
+#define AKC_SEL10_BL   (( 0xfffffe0007f34938ULL ))   /* bl sub_7F2BCB8     */
+#define AKC_SEL10_COPY (( 0xfffffe0007f38ffcULL ))   /* success copyout    */
+#define AKC_SEL11_VA   (( 0xfffffe0007f34b90ULL ))   /* movi v0.2d, #0     */
+#define AKC_SEL11_BL   (( 0xfffffe0007f34be0ULL ))   /* bl sub_7F2BEA0     */
+#define AKC_SEL11_COPY (( 0xfffffe0007f34becULL ))   /* success copyout    */
+
+static u32 b_imm(u64 from, u64 to) {
+    return 0x14000000u | ((u32)(((i64)(to - from)) >> 2) & 0x03FFFFFFu);
+}
+
+void patch_kc_aks_crypt(u8 *bkc_macho) {
+    fse_t *fse = macho_find_fileset_entry(bkc_macho,
+                     "com.apple.driver.AppleSEPKeyStore");
+    seg_t *exec;
+    u32 *p10, *p11;
+    u64 b10, b11;
+
+    if (!fse) {
+        fprintf(stderr, "aks-crypt: couldn't find AppleSEPKeyStore kext\n");
+        return;
+    }
+    exec = macho_find_seg(&bkc_macho[fse->fileoff], "__TEXT_EXEC");
+    if (!exec) {
+        fprintf(stderr, "aks-crypt: couldn't find AppleSEPKeyStore __TEXT_EXEC\n");
+        return;
+    }
+    if (AKC_SEL10_VA < exec->vmaddr ||
+        AKC_SEL10_COPY >= exec->vmaddr + exec->vmsize ||
+        AKC_SEL11_VA < exec->vmaddr ||
+        AKC_SEL11_BL  >= exec->vmaddr + exec->vmsize) {
+        fprintf(stderr, "aks-crypt: targets out of range; not patched\n");
+        return;
+    }
+    p10 = (u32 *)&bkc_macho[exec->fileoff + (AKC_SEL10_VA - exec->vmaddr)];
+    p11 = (u32 *)&bkc_macho[exec->fileoff + (AKC_SEL11_VA - exec->vmaddr)];
+
+    /* Anchor-validate both handlers: write-span head and the bl we replace. */
+    if (p10[0] != 0x910333e8u ||
+        p10[(AKC_SEL10_BL - AKC_SEL10_VA) / 4] != 0x97ffdce0u) {
+        fprintf(stderr, "aks-crypt: sel 10 handler mismatch "
+                "(0x%X 0x%X); not patched\n",
+                p10[0], p10[(AKC_SEL10_BL - AKC_SEL10_VA) / 4]);
+        return;
+    }
+    if (p11[0] != 0x6f00e400u ||
+        p11[(AKC_SEL11_BL - AKC_SEL11_VA) / 4] != 0x97ffdcb0u) {
+        fprintf(stderr, "aks-crypt: sel 11 handler mismatch "
+                "(0x%X 0x%X); not patched\n",
+                p11[0], p11[(AKC_SEL11_BL - AKC_SEL11_VA) / 4]);
+        return;
+    }
+
+    /*
+     * sel 10 (wrap). Registers in hand at 0xf34914: x22 = plaintext ptr,
+     * x0 = plaintext len, x25 = key class, x26 = keybag handle. HVC id
+     * 0xC1000010. The 12th word (at 0xf34940) replaces the original
+     * "cbz w0, copyout" with an unconditional branch to copyout; QEMU
+     * guarantees a valid (possibly 0) length, so no error test is needed.
+     */
+    p10[0]  = 0xAA1603E1u;  /* mov  x1, x22            (in)        */
+    p10[1]  = 0xAA0003E2u;  /* mov  x2, x0             (in len)    */
+    p10[2]  = 0x910343E3u;  /* add  x3, sp, #0xd0      (out)       */
+    p10[3]  = 0xD10223A9u;  /* sub  x9, x29, #0x88     (&outlen)   */
+    p10[4]  = 0xB9400124u;  /* ldr  w4, [x9]           (out cap)   */
+    p10[5]  = 0xAA1903E5u;  /* mov  x5, x25            (class)     */
+    p10[6]  = 0xAA1A03E6u;  /* mov  x6, x26            (keybag)    */
+    p10[7]  = 0xD2800200u;  /* movz x0, #0x10                      */
+    p10[8]  = 0xF2B82000u;  /* movk x0, #0xc100, lsl #16  (fn)     */
+    p10[9]  = 0xD4000002u;  /* hvc  #0                             */
+    p10[10] = 0xB9000120u;  /* str  w0, [x9]           (*outlen)   */
+    b10 = AKC_SEL10_VA + 4 * 11;
+    p10[11] = b_imm(b10, AKC_SEL10_COPY);              /* b copyout */
+
+    /*
+     * sel 11 (unwrap). Registers in hand at 0xf34b90: x23 = wrapped ptr,
+     * x0 = wrapped len, x26 = key class (scalarInput[1]), x27 = keybag
+     * (scalarInput[0]). HVC id 0xC1000011. The 12th word (0xf34bbc)
+     * branches to the success copyout; the original error test is dropped.
+     */
+    p11[0]  = 0xAA1703E1u;  /* mov  x1, x23            (in)        */
+    p11[1]  = 0xAA0003E2u;  /* mov  x2, x0             (in len)    */
+    p11[2]  = 0x910343E3u;  /* add  x3, sp, #0xd0      (out)       */
+    p11[3]  = 0xD10223A9u;  /* sub  x9, x29, #0x88     (&outlen)   */
+    p11[4]  = 0xB9400124u;  /* ldr  w4, [x9]           (out cap)   */
+    p11[5]  = 0xAA1A03E5u;  /* mov  x5, x26            (class)     */
+    p11[6]  = 0xAA1B03E6u;  /* mov  x6, x27            (keybag)    */
+    p11[7]  = 0xD2800220u;  /* movz x0, #0x11                      */
+    p11[8]  = 0xF2B82000u;  /* movk x0, #0xc100, lsl #16  (fn)     */
+    p11[9]  = 0xD4000002u;  /* hvc  #0                             */
+    p11[10] = 0xB9000120u;  /* str  w0, [x9]           (*outlen)   */
+    b11 = AKC_SEL11_VA + 4 * 11;
+    p11[11] = b_imm(b11, AKC_SEL11_COPY);              /* b copyout */
+}
+
+/*
  * amfi-lc-off: stop AMFI from enforcing launch constraints, the way iOS 16
  * had no AMFI at all. On the vphone600 research kernel AMFI is present and
  * enforces launch constraints: SpringBoard (launch type 0/1) fails its launch

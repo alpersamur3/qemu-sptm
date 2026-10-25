@@ -28,6 +28,7 @@
 #include "hw/arm/machines-qom.h"
 #include "hw/arm/vresearch_pvg.h"
 #include "hw/arm/vresearch_sep.h"
+#include "hw/arm/vresearch_akscrypt.h"
 #include "hw/core/boards.h"
 #include "hw/core/irq.h"
 #include "hw/core/qdev-properties.h"
@@ -164,6 +165,7 @@ struct VResearchState {
     bool                   pvg;
     bool                   sep;
     bool                   aks_stub;
+    bool                   aks_crypt;
     bool                   amfi_lc_off;
     MemoryRegion           fb_ram;
     QemuConsole           *fb_con;
@@ -478,6 +480,16 @@ static void aks_stub_set(Object *obj, bool val, Error **errp)
     VRESEARCH_MACHINE(obj)->aks_stub = val;
 }
 
+static bool aks_crypt_get(Object *obj, Error **errp)
+{
+    return VRESEARCH_MACHINE(obj)->aks_crypt;
+}
+
+static void aks_crypt_set(Object *obj, bool val, Error **errp)
+{
+    VRESEARCH_MACHINE(obj)->aks_crypt = val;
+}
+
 static bool amfi_lc_off_get(Object *obj, Error **errp)
 {
     return VRESEARCH_MACHINE(obj)->amfi_lc_off;
@@ -699,6 +711,10 @@ static void vresearch_init(MachineState *ms)
     if (s->aks_stub) {
         patch_kc_aks_stub(info->bootkc_f.buf);
     }
+    if (s->aks_crypt) {
+        patch_kc_aks_crypt(info->bootkc_f.buf);
+        vresearch_akscrypt_enable();
+    }
     if (s->amfi_lc_off) {
         patch_kc_amfi_lc_off(info->bootkc_f.buf);
     }
@@ -818,6 +834,11 @@ static void vresearch_machine_class_init(ObjectClass *oc, const void *data)
     object_class_property_set_description(oc, "aks-stub",
         "Patch AppleSEPKeyStore so it doesn't wait on a SEP: the keystore gate "
         "stops blocking the container daemons (backboardd etc.). Default off");
+    object_class_property_add_bool(oc, "aks-crypt", aks_crypt_get, aks_crypt_set);
+    object_class_property_set_description(oc, "aks-crypt",
+        "Route the keystore's class-key wrap/unwrap (sel 10/11) through an HVC "
+        "to real reversible AES over a machine-local key, so the mobile persona "
+        "can be built without a SEP. Emulator-only, no SEP isolation. Default off");
     object_class_property_add_bool(oc, "amfi-lc-off", amfi_lc_off_get, amfi_lc_off_set);
     object_class_property_set_description(oc, "amfi-lc-off",
         "Patch AMFI so launch constraints are not enforced (logged only), like "

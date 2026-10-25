@@ -26,6 +26,13 @@
 #include "arm-powerctl.h"
 #include "target/arm/multiprocessing.h"
 #include "target/arm/trace.h"
+#include "hw/arm/vresearch_akscrypt.h"
+
+/*
+ * aks-crypt HVC hook (vresearch machine). NULL unless the machine enabled it;
+ * defined here so target/arm carries no link-time dependency on the machine.
+ */
+bool (*arm_akscrypt_hvc_hook)(CPUState *cs);
 
 bool arm_is_psci_call(ARMCPU *cpu, int excp_type)
 {
@@ -82,6 +89,15 @@ void arm_handle_psci_call(ARMCPU *cpu)
     }
     trace_arm_psci_call(param[0], param[1], param[2], param[3],
                         arm_cpu_mp_affinity(cpu));
+
+    /*
+     * aks-crypt: the patched keystore issues an HVC with a private function id
+     * in x0. If the hook claims it (result already written to x0), we are done;
+     * otherwise fall through to normal PSCI handling.
+     */
+    if (arm_akscrypt_hvc_hook && arm_akscrypt_hvc_hook(CPU(cpu))) {
+        return;
+    }
 
     if ((param[0] & QEMU_PSCI_0_2_64BIT) && !is_a64(env)) {
         ret = QEMU_PSCI_RET_NOT_SUPPORTED;
