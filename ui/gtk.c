@@ -714,20 +714,26 @@ static void gd_mouse_mode_change(Notifier *notify, void *data)
 
 /** GTK Events **/
 
+/*
+ * window-close=off: closing the window asks the guest to power down (as
+ * system_powerdown does: on the virt machine its power key is pressed), so
+ * it can sync and unmount its disks and then turn itself off. Closing the
+ * window again quits right away.
+ */
 static gboolean gd_window_close(GtkWidget *widget, GdkEvent *event,
                                 void *opaque)
 {
     GtkDisplayState *s = opaque;
-    bool allow_close = true;
+    static bool powerdown_requested;
 
-    if (s->opts->has_window_close && !s->opts->window_close) {
-        allow_close = false;
+    if (s->opts->has_window_close && !s->opts->window_close &&
+        !powerdown_requested) {
+        powerdown_requested = true;
+        qemu_system_powerdown_request();
+        return TRUE;
     }
 
-    if (allow_close) {
-        qmp_quit(NULL);
-    }
-
+    qmp_quit(NULL);
     return TRUE;
 }
 
