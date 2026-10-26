@@ -23,8 +23,12 @@
  *   display (0x1014) or stamp (0x1018) mask, which clears the event in the
  *   library, so a level-triggered SPI never loses it; the IOSurface line is
  *   pulsed per command from a bottom half.
- * - Frames are not shown yet: new_frame is counted and logged, and the
- *   console keeps a black surface so screendump works.
+ * - Frames are read back on a thread of their own: new_frame only sets an
+ *   event, and the frame thread encodes the display's current frame into a
+ *   frame target, waits for it and reads its pixels into the console's
+ *   surface, so neither the library's display thread nor a vCPU ever waits
+ *   on the GPU (the guest's next present waits for a frame in flight). New
+ *   frames coalesce: an encode takes whatever the guest presented last.
  * - The library device is never released: its teardown waits for FIFO work
  *   that never completes once the vCPUs stop. Migration is blocked.
  *
@@ -39,6 +43,7 @@
 #include "qemu/module.h"
 #include "qemu/notify.h"
 #include "qemu/rcu.h"
+#include "qemu/thread.h"
 #include "hw/core/irq.h"
 #include "hw/core/qdev-properties.h"
 #include "hw/core/resettable.h"
@@ -87,9 +92,16 @@ struct VResearchPVGReimsState {
     uint32_t mode_w, mode_h, mode_fmt;
     uint64_t frames;
 
-    /* the console: a black frame until the frame path exists */
+    /* the console: the frame thread's last read-back, black until then */
     QemuConsole *con;
     uint32_t *frame;
+
+    /* the frame path: new_frame sets the event, the thread reads back */
+    QemuEvent frame_event;
+    QemuThread frame_thread;
+    RvgFrameTarget *target;
+    uint64_t shown;
+    unsigned frame_errors;      /* the frame thread's own; logged up to 16 */
 
     unsigned irq_reads;
     unsigned log_budget;
@@ -176,11 +188,82 @@ static void display_new_frame(void *ctx)
     VResearchPVGReimsState *s = ctx;
     uint64_t n = qatomic_fetch_inc(&s->frames) + 1;
 
-    /* the frame path (encode, read back, console) is the next milestone */
     if (n <= 8 || n % 256 == 0) {
-        fprintf(stderr, "vresearch-pvg-reims: new frame %" PRIu64 " (not shown)\n", n);
+        fprintf(stderr, "vresearch-pvg-reims: new frame %" PRIu64 "\n", n);
         fflush(stderr);
     }
+    /* the frame thread reads it back; no waiting here */
+    qemu_event_set(&s->frame_event);
+}
+
+/* --- the frame path (its own thread; no BQL, no library callback) --- */
+
+/*
+ * One read-back: encode the display's current frame into the target, wait
+ * for the GPU, copy the target into the console's surface. An encode that
+ * Metal refuses is skipped; a committed frame is always released after its
+ * wait, so none stays in flight to hold the guest's presents up.
+ */
+static void frame_error(VResearchPVGReimsState *s, const char *what, RvgStatus st)
+{
+    if (s->frame_errors < 16) {
+        s->frame_errors++;
+        fprintf(stderr, "vresearch-pvg-reims: frame %s: %s (%u)\n", what,
+                rvg_status_message(st), st);
+        fflush(stderr);
+    }
+}
+
+static void frame_read_back(VResearchPVGReimsState *s)
+{
+    size_t stride = (size_t)s->width * 4;
+    RvgFrame *frame = NULL;
+    RvgStatus st;
+    uint64_t n;
+
+    st = rvg_display_encode_frame(s->display, s->target, NULL, &frame);
+    if (st != RVG_OK || !frame) {
+        frame_error(s, "encode refused", st);
+        return;
+    }
+    st = rvg_frame_commit(frame);
+    if (st == RVG_OK) {
+        st = rvg_frame_wait(frame);
+    }
+    rvg_frame_release(frame);
+    if (st != RVG_OK) {
+        frame_error(s, "failed on the GPU", st);
+        return;
+    }
+    st = rvg_frame_target_read_pixels(s->target, s->frame, stride,
+                                      stride * s->height);
+    if (st != RVG_OK) {
+        frame_error(s, "read-back refused", st);
+        return;
+    }
+    n = qatomic_fetch_inc(&s->shown) + 1;
+    if (n <= 8 || n % 256 == 0) {
+        fprintf(stderr, "vresearch-pvg-reims: frame %" PRIu64 " shown\n", n);
+        fflush(stderr);
+    }
+}
+
+/*
+ * Waits for new_frame and reads each frame back. A new_frame that arrives
+ * while one is read back leaves the event set, so the next encode takes the
+ * guest's latest frame. Runs for the machine's life, like the library
+ * device, which is never released.
+ */
+static void *frame_thread_fn(void *opaque)
+{
+    VResearchPVGReimsState *s = opaque;
+
+    for (;;) {
+        qemu_event_wait(&s->frame_event);
+        qemu_event_reset(&s->frame_event);
+        frame_read_back(s);
+    }
+    return NULL;
 }
 
 /* --- the console --- */
@@ -411,6 +494,13 @@ static void pvg_reims_machine_done(Notifier *notifier, void *data)
         .window = NULL,
     };
     RvgDisplayMode mode = { s->width, s->height, 0, 60.0 };
+    /* BGRA8, unconverted: the bytes of the console's x8r8g8b8 surface */
+    RvgFrameTargetConfig tcfg = {
+        .struct_size = sizeof(tcfg),
+        .width = s->width,
+        .height = s->height,
+        .format = RVG_PIXEL_FORMAT_BGRA8_UNORM,
+    };
     RvgStatus st;
 
     build_memory_map(&b);
@@ -445,6 +535,17 @@ static void pvg_reims_machine_done(Notifier *notifier, void *data)
         exit(1);
     }
     rvg_display_set_modes(s->display, &mode, 1);
+
+    /* the console's frames: a target of the console's size and layout */
+    st = rvg_frame_target_create(s->dev, &tcfg, &s->target);
+    if (st != RVG_OK || !s->target) {
+        warn_report("vresearch-pvg-reims: rvg_frame_target_create failed: %s (%u); "
+                    "the guest's frames are not shown", rvg_status_message(st), st);
+        s->target = NULL;
+    } else {
+        qemu_thread_create(&s->frame_thread, "pvg-reims-frames", frame_thread_fn,
+                           s, QEMU_THREAD_DETACHED);
+    }
 
     info_report("vresearch-pvg-reims: GPU device, IOSurface device (features 0x%"
                 PRIx64 ") and display %ux%u created over %u RAM range(s)%s",
@@ -505,6 +606,8 @@ static void pvg_reims_realize(DeviceState *dev, Error **errp)
     rvg_log_set_handler(reims_log, s, RVG_LOG_INFO);
 
     s->frame = g_new0(uint32_t, (size_t)s->width * s->height);
+    /* before the library exists: its display thread may call new_frame early */
+    qemu_event_init(&s->frame_event, false);
     s->con = qemu_graphic_console_create(dev, 0, &pvg_reims_gfx_ops, s);
     surface = qemu_create_displaysurface_from(s->width, s->height, PIXMAN_x8r8g8b8,
                                               s->width * 4, (uint8_t *)s->frame);
