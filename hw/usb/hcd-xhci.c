@@ -2642,6 +2642,9 @@ static void xhci_port_update(XHCIPort *port, int is_detach)
 
     assert(port);
     port->portsc = PORTSC_PP;
+    if (port->xhci->nonremovable & (1u << port->uport->index)) {
+        port->portsc |= PORTSC_DR;
+    }
     if (!is_detach && xhci_port_have_device(port)) {
         port->portsc |= PORTSC_CCS;
         switch (port->uport->dev->speed) {
@@ -3656,6 +3659,7 @@ static const Property xhci_properties[] = {
                     XHCI_FLAG_ENABLE_STREAMS, true),
     DEFINE_PROP_UINT32("p2",    XHCIState, numports_2, 4),
     DEFINE_PROP_UINT32("p3",    XHCIState, numports_3, 4),
+    DEFINE_PROP_UINT32("nonremovable", XHCIState, nonremovable, 0),
     DEFINE_PROP_LINK("host",    XHCIState, hostOpaque, TYPE_DEVICE,
                      DeviceState *),
 };

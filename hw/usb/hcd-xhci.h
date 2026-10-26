@@ -187,6 +187,7 @@ typedef struct XHCIState {
     /* properties */
     uint32_t numports_2;
     uint32_t numports_3;
+    uint32_t nonremovable;  /* bit N: devices on USB port N+1 report PORTSC.DR */
     uint32_t numintrs;
     uint32_t numslots;
     uint32_t flags;
