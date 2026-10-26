@@ -126,7 +126,19 @@ struct GtkDisplayState {
     GtkWidget *show_menubar_item;
 
     GtkWidget *vbox;
+    GtkWidget *hbox;
     GtkWidget *notebook;
+
+    /* sidebar=on: phone buttons next to the guest display */
+    GtkWidget *sidebar;
+    GtkWidget *sidebar_status;
+    GtkWidget *sidebar_power;
+    char *shots_dir;
+    char *ipa_dir;
+    GHashTable *ipas_pending;   /* .ipa name -> time copied (s) */
+    guint ipas_poll;
+    bool powerdown_requested;
+
     int button_mask;
     gboolean last_set;
     int last_x;

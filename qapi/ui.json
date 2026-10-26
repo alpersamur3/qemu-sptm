@@ -1344,6 +1344,10 @@
 # @scale: Set preferred scale of the display.  Defaults to 1.0.
 #     (Since 10.1)
 #
+# @sidebar: Show a bar of phone buttons next to the guest display:
+#     Home, Lock, Volume (sent as F1-F4), Screenshot, Install .ipa
+#     and Shut down.  Defaults to "off".  (Since 11.1)
+#
 # Since: 2.12
 ##
 { 'struct'  : 'DisplayGTK',
@@ -1353,7 +1357,8 @@
                 '*show-tabs'         : 'bool',
                 '*show-menubar'      : 'bool',
                 '*keep-aspect-ratio' : 'bool',
-                '*scale'             : 'number'  } }
+                '*scale'             : 'number',
+                '*sidebar'           : 'bool'  } }
 
 ##
 # @DisplayEGLHeadless:
