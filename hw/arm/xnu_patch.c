@@ -737,6 +737,107 @@ void patch_kc_acm_stub(u8 *bkc_macho) {
     }
 }
 
+/*
+ * hfs-dp-stub: report data protection class D on HFS+ volumes mounted without
+ * content protection, and accept class changes on them as no-ops.
+ *
+ * Our root and Data volumes are plain HFS+ (no MNT_CPROTECT, no per-file
+ * keys). There, hfs_vnop_getattr reports va_dataprotect_class 0 ("no class"),
+ * and cp_vnode_getclass / cp_vnode_setclass return ENOTSUP. iOS 26 code that
+ * expects a protection class then fails: PosterBoard rejects its data store
+ * because NSURLFileProtectionKey reads nil instead of
+ * NSURLFileProtectionNone (no wallpaper), and installcoordinationd aborts in
+ * -[IXGlobalConfiguration createDirectories] when F_SETPROTECTIONCLASS fails
+ * (no system app installs). An unencrypted volume is class D in practice, so
+ * say so: getattr and cp_vnode_getclass return 4 when the file has no cprotect
+ * entry, cp_vnode_setclass returns 0 without storing anything. Volumes that do
+ * have content protection take their old paths unchanged.
+ *
+ * Sites in com.apple.filesystems.hfs.kext (xnu-12377.100.591.502 vphone600):
+ *   getattr: cbz x8 (no c_cpentry) at 0xfffffe00083ed09c now goes to a stub
+ *            that sets w8 = 4 and rejoins at the str to va_dataprotect_class
+ *   cp_vnode_getclass: movz w21, #ENOTSUP at 0xfffffe0008405498 becomes a
+ *            branch to a stub that stores 4 to *class and returns 0
+ *   cp_vnode_setclass: movz w22, #ENOTSUP at 0xfffffe00084055bc -> movz w22, #0
+ * The stubs go over cp_vnode_getclass's "uninitialized cnode" panic call
+ * setup (0xfffffe0008405540..54), reached only on a protected volume with a
+ * cnode missing its cprotect entry, which would have panicked anyway. Every
+ * word is checked first; a different build is left alone.
+ */
+#define HFS_GETATTR_CBZ     (( 0xfffffe00083ed09cULL ))
+#define HFS_GETATTR_STR     (( 0xfffffe00083ed0a8ULL ))
+#define HFS_GETCLASS_ENOTSUP (( 0xfffffe0008405498ULL ))
+#define HFS_GETCLASS_RET    (( 0xfffffe0008405524ULL ))
+#define HFS_SETCLASS_ENOTSUP (( 0xfffffe00084055bcULL ))
+#define HFS_CAVE            (( 0xfffffe000840553cULL ))
+
+static u32 cbz_x_imm(int rt, u64 from, u64 to) {
+    return 0xB4000000u | (((u32)(((i64)(to - from)) >> 2) & 0x7FFFFu) << 5) | rt;
+}
+
+void patch_kc_hfs_dp_stub(u8 *bkc_macho) {
+    static const struct { u64 va; u32 word; } expect[] = {
+        { HFS_GETATTR_CBZ - 4,      0xF940A668u },  /* ldr x8, [x19, #0x148]  */
+        { HFS_GETATTR_CBZ,          0xB4000068u },  /* cbz x8, +0xc           */
+        { HFS_GETATTR_CBZ + 4,      0xB9400508u },  /* ldr w8, [x8, #4]       */
+        { HFS_GETATTR_CBZ + 8,      0x12001108u },  /* and w8, w8, #0x1f      */
+        { HFS_GETATTR_STR,          0xB9013B88u },  /* str w8, [x28, #0x138]  */
+        { HFS_GETCLASS_ENOTSUP,     0x528005B5u },  /* movz w21, #0x2d        */
+        { HFS_GETCLASS_ENOTSUP + 4, 0x14000022u },  /* b ret                  */
+        { HFS_GETCLASS_RET,         0xAA1503E0u },  /* mov x0, x21            */
+        { HFS_SETCLASS_ENOTSUP,     0x528005B6u },  /* movz w22, #0x2d        */
+        { HFS_CAVE,                 0x528045A8u },  /* movz w8, #0x22d        */
+        { HFS_CAVE + 0x04,          0xF0FF7869u },  /* adrp x9, ...           */
+        { HFS_CAVE + 0x08,          0x91138D29u },  /* add x9, x9, ...        */
+        { HFS_CAVE + 0x0c,          0xA900A3E9u },  /* stp x9, x8, [sp, #8]   */
+        { HFS_CAVE + 0x10,          0xF90003F4u },  /* str x20, [sp]          */
+        { HFS_CAVE + 0x14,          0xF0FF7860u },  /* adrp x0, ...           */
+        { HFS_CAVE + 0x18,          0x9114C800u },  /* add x0, x0, ...        */
+    };
+    const u64 getclass_stub = HFS_CAVE + 0x04, getattr_stub = HFS_CAVE + 0x14;
+    fse_t *fse = macho_find_fileset_entry(bkc_macho, "com.apple.filesystems.hfs.kext");
+    seg_t *exec;
+    size_t i;
+
+#define HFS_WORD(va) ((u32 *)&bkc_macho[exec->fileoff + ((va) - exec->vmaddr)])
+    if (!fse) {
+        fprintf(stderr, "hfs-dp-stub: couldn't find the HFS kext\n");
+        return;
+    }
+    exec = macho_find_seg(&bkc_macho[fse->fileoff], "__TEXT_EXEC");
+    if (!exec) {
+        fprintf(stderr, "hfs-dp-stub: couldn't find HFS __TEXT_EXEC\n");
+        return;
+    }
+    for (i = 0; i < sizeof(expect) / sizeof(expect[0]); i++) {
+        if (expect[i].va < exec->vmaddr || expect[i].va >= exec->vmaddr + exec->vmsize) {
+            fprintf(stderr, "hfs-dp-stub: 0x%llx out of __TEXT_EXEC; not patched\n",
+                    (unsigned long long)expect[i].va);
+            return;
+        }
+        if (*HFS_WORD(expect[i].va) != expect[i].word) {
+            fprintf(stderr, "hfs-dp-stub: 0x%llx is 0x%X, expected 0x%X; not patched\n",
+                    (unsigned long long)expect[i].va, *HFS_WORD(expect[i].va),
+                    expect[i].word);
+            return;
+        }
+    }
+
+    /* cp_vnode_getclass stub: *class = 4; return 0 */
+    *HFS_WORD(getclass_stub + 0x0) = 0x52800088u;                   /* movz w8, #4      */
+    *HFS_WORD(getclass_stub + 0x4) = 0xB9000268u;                   /* str w8, [x19]    */
+    *HFS_WORD(getclass_stub + 0x8) = 0x52800015u;                   /* movz w21, #0     */
+    *HFS_WORD(getclass_stub + 0xc) = b_imm(getclass_stub + 0xc, HFS_GETCLASS_RET);
+    /* getattr stub: w8 = 4, then store it as va_dataprotect_class */
+    *HFS_WORD(getattr_stub + 0x0) = 0x52800088u;                    /* movz w8, #4      */
+    *HFS_WORD(getattr_stub + 0x4) = b_imm(getattr_stub + 0x4, HFS_GETATTR_STR);
+
+    *HFS_WORD(HFS_GETATTR_CBZ) = cbz_x_imm(8, HFS_GETATTR_CBZ, getattr_stub);
+    *HFS_WORD(HFS_GETCLASS_ENOTSUP) = b_imm(HFS_GETCLASS_ENOTSUP, getclass_stub);
+    *HFS_WORD(HFS_SETCLASS_ENOTSUP) = 0x52800016u;                  /* movz w22, #0     */
+#undef HFS_WORD
+}
+
 bool kc_uses_mte(u8 *bkc_macho) {
     seg_t *kc_exec_seg = macho_find_seg(bkc_macho, "__TEXT_EXEC");
     assert(kc_exec_seg);

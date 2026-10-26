@@ -175,6 +175,7 @@ struct VResearchState {
     bool                   aks_crypt;
     bool                   amfi_lc_off;
     bool                   acm_stub;
+    bool                   hfs_dp_stub;
     MemoryRegion           fb_ram;
     QemuConsole           *fb_con;
 };
@@ -537,6 +538,16 @@ static void acm_stub_set(Object *obj, bool val, Error **errp)
     VRESEARCH_MACHINE(obj)->acm_stub = val;
 }
 
+static bool hfs_dp_stub_get(Object *obj, Error **errp)
+{
+    return VRESEARCH_MACHINE(obj)->hfs_dp_stub;
+}
+
+static void hfs_dp_stub_set(Object *obj, bool val, Error **errp)
+{
+    VRESEARCH_MACHINE(obj)->hfs_dp_stub = val;
+}
+
 static bool fb_update(void *opaque)
 {
     VResearchState *s = opaque;
@@ -768,6 +779,9 @@ static void vresearch_init(MachineState *ms)
     if (s->acm_stub) {
         patch_kc_acm_stub(info->bootkc_f.buf);
     }
+    if (s->hfs_dp_stub) {
+        patch_kc_hfs_dp_stub(info->bootkc_f.buf);
+    }
 
     s->num_cpu = ms->smp.cpus;
     if (s->num_cpu > VR_MAX_CPUS) {
@@ -894,6 +908,12 @@ static void vresearch_machine_class_init(ObjectClass *oc, const void *data)
     object_class_property_set_description(oc, "amfi-lc-off",
         "Patch AMFI so launch constraints are not enforced (logged only), like "
         "iOS 16 had no AMFI; lets SpringBoard launch. Default off");
+    object_class_property_add_bool(oc, "hfs-dp-stub", hfs_dp_stub_get, hfs_dp_stub_set);
+    object_class_property_set_description(oc, "hfs-dp-stub",
+        "Patch the HFS kext so files on volumes without content protection "
+        "report data protection class D (none) and class changes succeed as "
+        "no-ops, instead of 0 / ENOTSUP. PosterBoard (wallpaper) and "
+        "installcoordinationd (system app installs) need a class. Default off");
     object_class_property_add_bool(oc, "acm-stub", acm_stub_get, acm_stub_set);
     object_class_property_set_description(oc, "acm-stub",
         "Patch AppleSEPCredentialManager so its SEP-endpoint wait returns "
