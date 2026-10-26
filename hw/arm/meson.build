@@ -116,6 +116,7 @@ hw_common_arch += {'arm': arm_common_ss}
 
 arm_common_ss.add(files('darwin.c', 'xnuboot_sptm.c', 'xnu_patch.c', 'apple_regs.c', 'apple_dtree.c', 'apple_amcc.c', 'macho.c'))
 arm_common_ss.add(when: 'CONFIG_ARM_VRESEARCH', if_true: files('vresearch.c', 'vresearch_pvg.c', 'vresearch_sep.c', 'vresearch_akscrypt.c'))
+arm_common_ss.add(when: ['CONFIG_ARM_VRESEARCH', reims_vgpu], if_true: files('vresearch_pvg_reims.c'))
 
 arm_common_ss.add(custom_target('apple_regs_autogen.h',
   output: 'apple_regs_autogen.h',

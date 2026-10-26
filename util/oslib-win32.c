@@ -44,6 +44,129 @@ static int get_allocation_granularity(void)
     return system_info.dwAllocationGranularity;
 }
 
+/*
+ * Guest RAM is a view of a pagefile-backed section (CreateFileMappingW +
+ * MapViewOfFile3), placed at or above 4 GiB, rather than plain VirtualAlloc
+ * memory: a section can be mapped a second time (an alias of a run of guest
+ * pages, which the reims-vgpu GPU library builds for the guest's root page,
+ * its FIFO rings and its surfaces), and the library refuses host addresses
+ * below 4 GiB. A SEC_COMMIT section of the same size takes the same commit
+ * charge as the MEM_COMMIT allocation did. qemu_win_ram_section() finds the
+ * section behind a host pointer. Without MapViewOfFile3 (Windows 10 before
+ * 1803) the plain VirtualAlloc allocation stands.
+ */
+typedef PVOID (WINAPI *MapViewOfFile3Fn)(HANDLE, HANDLE, PVOID, ULONG64, SIZE_T,
+                                          ULONG, ULONG, MEM_EXTENDED_PARAMETER *,
+                                          ULONG);
+
+#define WIN_RAM_LOWEST_ADDRESS 0x100000000ULL
+
+typedef struct WinRamSection {
+    void *base;
+    size_t size;
+    HANDLE section;
+} WinRamSection;
+
+static SRWLOCK win_ram_lock = SRWLOCK_INIT;
+static WinRamSection *win_ram_sections;
+static size_t win_ram_count;
+static size_t win_ram_capacity;
+
+/* Resolved once; kernelbase.dll exports it from Windows 10 1803. */
+static MapViewOfFile3Fn win_ram_map_view3(void)
+{
+    static MapViewOfFile3Fn fn;
+    static bool resolved;
+
+    if (!resolved) {
+        HMODULE kernelbase = GetModuleHandleA("kernelbase.dll");
+
+        if (kernelbase) {
+            fn = (MapViewOfFile3Fn)(void *)GetProcAddress(kernelbase,
+                                                          "MapViewOfFile3");
+        }
+        resolved = true;
+    }
+    return fn;
+}
+
+/* Called with win_ram_lock held exclusively. */
+static void *win_ram_section_alloc(size_t size)
+{
+    MapViewOfFile3Fn map_view3 = win_ram_map_view3();
+    MEM_ADDRESS_REQUIREMENTS req = { 0 };
+    MEM_EXTENDED_PARAMETER ep = { 0 };
+    HANDLE section;
+    void *view;
+
+    if (!map_view3) {
+        return NULL;
+    }
+    section = CreateFileMappingW(INVALID_HANDLE_VALUE, NULL,
+                                 PAGE_READWRITE | SEC_COMMIT,
+                                 (DWORD)((uint64_t)size >> 32),
+                                 (DWORD)(size & 0xffffffffu), NULL);
+    if (!section) {
+        return NULL;
+    }
+    req.LowestStartingAddress = (PVOID)(uintptr_t)WIN_RAM_LOWEST_ADDRESS;
+    ep.Type = MemExtendedParameterAddressRequirements;
+    ep.Pointer = &req;
+    view = map_view3(section, GetCurrentProcess(), NULL, 0, size, 0,
+                     PAGE_READWRITE, &ep, 1);
+    if (!view) {
+        CloseHandle(section);
+        return NULL;
+    }
+    if (win_ram_count == win_ram_capacity) {
+        win_ram_capacity = win_ram_capacity ? 2 * win_ram_capacity : 16;
+        win_ram_sections = g_renew(WinRamSection, win_ram_sections,
+                                   win_ram_capacity);
+    }
+    win_ram_sections[win_ram_count++] = (WinRamSection) {
+        .base = view, .size = size, .section = section,
+    };
+    return view;
+}
+
+/* Called with win_ram_lock held exclusively; true if ptr was a section view. */
+static bool win_ram_section_free(void *ptr)
+{
+    size_t i;
+
+    for (i = 0; i < win_ram_count; i++) {
+        if (win_ram_sections[i].base == ptr) {
+            UnmapViewOfFile(ptr);
+            CloseHandle(win_ram_sections[i].section);
+            win_ram_sections[i] = win_ram_sections[--win_ram_count];
+            return true;
+        }
+    }
+    return false;
+}
+
+HANDLE qemu_win_ram_section(void *host_ptr, uint64_t *offset_out)
+{
+    HANDLE section = NULL;
+    size_t i;
+
+    AcquireSRWLockShared(&win_ram_lock);
+    for (i = 0; i < win_ram_count; i++) {
+        const WinRamSection *r = &win_ram_sections[i];
+
+        if ((uintptr_t)host_ptr >= (uintptr_t)r->base &&
+            (uintptr_t)host_ptr < (uintptr_t)r->base + r->size) {
+            section = r->section;
+            if (offset_out) {
+                *offset_out = (uintptr_t)host_ptr - (uintptr_t)r->base;
+            }
+            break;
+        }
+    }
+    ReleaseSRWLockShared(&win_ram_lock);
+    return section;
+}
+
 void *qemu_anon_ram_alloc(size_t size, uint64_t *align, bool shared,
                           bool noreserve)
 {
@@ -58,10 +181,16 @@ void *qemu_anon_ram_alloc(size_t size, uint64_t *align, bool shared,
         return NULL;
     }
 
-    ptr = VirtualAlloc(NULL, size, MEM_COMMIT, PAGE_READWRITE);
+    AcquireSRWLockExclusive(&win_ram_lock);
+    ptr = win_ram_section_alloc(size);
+    ReleaseSRWLockExclusive(&win_ram_lock);
+    if (!ptr) {
+        ptr = VirtualAlloc(NULL, size, MEM_COMMIT, PAGE_READWRITE);
+    }
     trace_qemu_anon_ram_alloc(size, ptr);
 
     if (ptr && align) {
+        /* a view, like a VirtualAlloc, starts on an allocation granule */
         *align = MAX(get_allocation_granularity(), getpagesize());
     }
     return ptr;
@@ -69,9 +198,16 @@ void *qemu_anon_ram_alloc(size_t size, uint64_t *align, bool shared,
 
 void qemu_anon_ram_free(void *ptr, size_t size)
 {
+    bool freed = false;
+
     trace_qemu_anon_ram_free(ptr, size);
     if (ptr) {
-        VirtualFree(ptr, 0, MEM_RELEASE);
+        AcquireSRWLockExclusive(&win_ram_lock);
+        freed = win_ram_section_free(ptr);
+        ReleaseSRWLockExclusive(&win_ram_lock);
+        if (!freed) {
+            VirtualFree(ptr, 0, MEM_RELEASE);
+        }
     }
 }
 

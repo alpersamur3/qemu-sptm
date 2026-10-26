@@ -866,6 +866,11 @@ elif host_os == 'openbsd'
   endif
 endif
 
+# reims-vgpu: the paravirtualized GPU library (rvg_* C API, a static archive
+# with its pkg-config file) behind the vresearch machine's pvg=reims
+reims_vgpu = dependency('reims-vgpu', method: 'pkg-config', static: true,
+                        required: get_option('reims_vgpu'))
+
 ###############################################
 # Host-specific configuration of accelerators #
 ###############################################
@@ -2485,6 +2490,7 @@ if seccomp.found()
   config_host_data.set('CONFIG_SECCOMP_SYSRAWRC', seccomp_has_sysrawrc)
 endif
 config_host_data.set('CONFIG_PIXMAN', pixman.found())
+config_host_data.set('CONFIG_REIMS_VGPU', reims_vgpu.found())
 config_host_data.set('CONFIG_PASST', enable_passt)
 config_host_data.set('CONFIG_SLIRP', slirp.found())
 config_host_data.set('CONFIG_SNAPPY', snappy.found())
@@ -5010,6 +5016,7 @@ endif
 if host_os == 'darwin'
   summary_info += {'ParavirtualizedGraphics support': pvg}
 endif
+summary_info += {'reims-vgpu GPU (vresearch pvg=reims)': reims_vgpu}
 summary_info += {'valgrind':          valgrind}
 summary(summary_info, bool_yn: true, section: 'Dependencies')
 

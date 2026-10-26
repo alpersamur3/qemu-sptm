@@ -206,6 +206,8 @@ option('lzo', type : 'feature', value : 'auto',
        description: 'lzo compression support')
 option('pvg', type: 'feature', value: 'auto',
        description: 'macOS paravirtualized graphics support')
+option('reims_vgpu', type: 'feature', value: 'disabled',
+       description: 'reims-vgpu GPU for the vresearch machine (pvg=reims)')
 option('rbd', type : 'feature', value : 'auto',
        description: 'Ceph block device driver')
 option('opengl', type : 'feature', value : 'auto',

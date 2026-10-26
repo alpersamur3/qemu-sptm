@@ -150,6 +150,13 @@ static const int irqmap[] = {
 
 #define VR_MAX_CPUS 8
 
+/* -M vresearch,pvg=off|on|reims */
+typedef enum VResearchPVGMode {
+    VR_PVG_OFF,     /* an unimplemented device the guest driver gives up on */
+    VR_PVG_ON,      /* the display-only model, vresearch_pvg.c */
+    VR_PVG_REIMS,   /* the reims-vgpu library, vresearch_pvg_reims.c */
+} VResearchPVGMode;
+
 struct VResearchState {
     MachineState           parent_obj;
     ARMCPU                *cpu;            /* boot cpu == cpus[0] */
@@ -162,7 +169,7 @@ struct VResearchState {
     GMappedFile           *bootkc_m, *dtree_m, *sptm_m, *txm_m, *tc_m, *ramdisk_m;
     char                  *fb;
     bool                   unauth_root;
-    bool                   pvg;
+    VResearchPVGMode       pvg;
     bool                   sep;
     bool                   aks_stub;
     bool                   aks_crypt;
@@ -451,14 +458,33 @@ static void unauth_root_set(Object *obj, bool val, Error **errp)
     VRESEARCH_MACHINE(obj)->unauth_root = val;
 }
 
-static bool pvg_get(Object *obj, Error **errp)
+static const char *const pvg_mode_names[] = {
+    [VR_PVG_OFF] = "off",
+    [VR_PVG_ON] = "on",
+    [VR_PVG_REIMS] = "reims",
+};
+
+static char *pvg_get(Object *obj, Error **errp)
 {
-    return VRESEARCH_MACHINE(obj)->pvg;
+    return g_strdup(pvg_mode_names[VRESEARCH_MACHINE(obj)->pvg]);
 }
 
-static void pvg_set(Object *obj, bool val, Error **errp)
+/* The property was a bool: its spellings of on and off still work. */
+static void pvg_set(Object *obj, const char *val, Error **errp)
 {
-    VRESEARCH_MACHINE(obj)->pvg = val;
+    VResearchState *s = VRESEARCH_MACHINE(obj);
+
+    if (!strcmp(val, "off") || !strcmp(val, "no") || !strcmp(val, "false") ||
+        !strcmp(val, "0")) {
+        s->pvg = VR_PVG_OFF;
+    } else if (!strcmp(val, "on") || !strcmp(val, "yes") || !strcmp(val, "true") ||
+               !strcmp(val, "1")) {
+        s->pvg = VR_PVG_ON;
+    } else if (!strcmp(val, "reims")) {
+        s->pvg = VR_PVG_REIMS;
+    } else {
+        error_setg(errp, "pvg=%s: expected off, on or reims", val);
+    }
 }
 
 static bool sep_get(Object *obj, Error **errp)
@@ -573,21 +599,31 @@ static void create_fb(VResearchState *s)
 
 /*
  * pvg=on: the PVG GPU and its IOSurface mapper, display only
- * (vresearch_pvg.c). Its display takes the fb=WxH size when given, but the
- * TRUE width, not the boot framebuffer's 16-pixel-rounded one: FrontBoard's
- * FBSDisplayMode validity check traps (SpringBoard SIGTRAP in
- * FBSystemShellInitialize) on a width that isn't consistent with the display
- * scale -- 1184 (1179 rounded up) fails, 1179 passes. With no fb= the PVG
- * property defaults (1179x2556) stand. HMP `screendump FILE pvg` shows the
- * presented frame.
+ * (vresearch_pvg.c); pvg=reims: the same two regions and interrupts over the
+ * reims-vgpu library (vresearch_pvg_reims.c, when built with it). Its
+ * display takes the fb=WxH size when given, but the TRUE width, not the boot
+ * framebuffer's 16-pixel-rounded one: FrontBoard's FBSDisplayMode validity
+ * check traps (SpringBoard SIGTRAP in FBSystemShellInitialize) on a width
+ * that isn't consistent with the display scale -- 1184 (1179 rounded up)
+ * fails, 1179 passes. With no fb= the PVG property defaults (1179x2556)
+ * stand. HMP `screendump FILE pvg` shows the presented frame.
  */
 static void create_pvg(VResearchState *s)
 {
-    DeviceState *dev = qdev_new(TYPE_VRESEARCH_PVG);
-    SysBusDevice *sbd = SYS_BUS_DEVICE(dev);
+    const char *type = s->pvg == VR_PVG_REIMS ? TYPE_VRESEARCH_PVG_REIMS
+                                              : TYPE_VRESEARCH_PVG;
+    DeviceState *dev;
+    SysBusDevice *sbd;
     unsigned w, h;
     char end;
 
+    if (!object_class_by_name(type)) {
+        error_report("vresearch: pvg=reims needs a QEMU built with the reims-vgpu "
+                     "library (configure --enable-reims-vgpu)");
+        exit(1);
+    }
+    dev = qdev_new(type);
+    sbd = SYS_BUS_DEVICE(dev);
     qdev_set_id(dev, g_strdup("pvg"), &error_fatal);
     if (s->fb && strcmp(s->fb, "off") &&
         sscanf(s->fb, "%ux%u%c", &w, &h, &end) == 2 && w && h) {
@@ -652,7 +688,7 @@ static void create_devices(VResearchState *s)
                                 memmap[VR_BDOOR].size);
     create_unimplemented_device("vz-config", memmap[VR_CONFIG].base,
                                 memmap[VR_CONFIG].size);
-    if (s->pvg) {
+    if (s->pvg != VR_PVG_OFF) {
         create_pvg(s);
     } else {
         create_unimplemented_device("apv-gfx", memmap[VR_APV_GFX].base,
@@ -836,9 +872,10 @@ static void vresearch_machine_class_init(ObjectClass *oc, const void *data)
     object_class_property_add_str(oc, "fb", fb_get, fb_set);
     object_class_property_set_description(oc, "fb",
         "Boot framebuffer WxH (boot_args.Video, /vram), or off (default)");
-    object_class_property_add_bool(oc, "pvg", pvg_get, pvg_set);
+    object_class_property_add_str(oc, "pvg", pvg_get, pvg_set);
     object_class_property_set_description(oc, "pvg",
-        "Model the paravirtual GPU's display (presents, no GPU work); "
+        "The paravirtual GPU: on models its display (presents, no GPU work), "
+        "reims runs its FIFOs on the host GPU through the reims-vgpu library; "
         "default off: an unimplemented device the guest driver gives up on");
     object_class_property_add_bool(oc, "sep", sep_get, sep_set);
     object_class_property_set_description(oc, "sep",
