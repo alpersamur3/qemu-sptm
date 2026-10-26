@@ -31,6 +31,7 @@
 #include "qapi/error.h"
 #include "qemu/module.h"
 #include "qemu/timer.h"
+#include "qemu/bswap.h"
 #include "hw/input/hid.h"
 #include "hw/usb/hid.h"
 #include "hw/core/qdev-properties.h"
@@ -43,8 +44,15 @@ struct USBHIDState {
     uint32_t usb_version;
     char *display;
     uint32_t head;
-    bool is_touchscreen;  /* usb-touchscreen: digitizer descriptor + report byte0 fixup */
+    bool is_touchscreen;  /* usb-touchscreen: digitizer descriptor + report rewrite */
+    uint32_t ts_variant;  /* usb-touchscreen: TS_VARIANT_* bits */
+    uint8_t ts_desc[96];  /* usb-touchscreen: report descriptor built for ts_variant */
+    int ts_desc_len;
 };
+
+/* usb-touchscreen report layout variants (the "variant" property, a bitmask) */
+#define TS_VARIANT_UNTOUCH  0x1  /* add Untouch: IOHIDEventDriver dispatches a collection */
+#define TS_VARIANT_CONTACT  0x2  /* add Contact Identifier and Contact Count */
 
 #define TYPE_USB_HID "usb-hid"
 OBJECT_DECLARE_SIMPLE_TYPE(USBHIDState, USB_HID)
@@ -211,6 +219,20 @@ static const USBDescIface desc_iface_tablet2 = {
     },
 };
 
+/*
+ * HID class descriptor of usb-touchscreen. The report descriptor length
+ * (bytes 7-8) depends on the variant and is filled in at realize.
+ */
+static uint8_t touchscreen_hid_class_desc[] = {
+    0x09,          /*  u8  bLength */
+    USB_DT_HID,    /*  u8  bDescriptorType */
+    0x01, 0x00,    /*  u16 HID_class */
+    0x00,          /*  u8  country_code */
+    0x01,          /*  u8  num_descriptors */
+    USB_DT_REPORT, /*  u8  type: Report */
+    55, 0,         /*  u16 len (digitizer report descriptor) */
+};
+
 static const USBDescIface desc_iface_touchscreen = {
     .bInterfaceNumber              = 0,
     .bNumEndpoints                 = 1,
@@ -220,15 +242,7 @@ static const USBDescIface desc_iface_touchscreen = {
     .descs = (USBDescOther[]) {
         {
             /* HID descriptor */
-            .data = (uint8_t[]) {
-                0x09,          /*  u8  bLength */
-                USB_DT_HID,    /*  u8  bDescriptorType */
-                0x01, 0x00,    /*  u16 HID_class */
-                0x00,          /*  u8  country_code */
-                0x01,          /*  u8  num_descriptors */
-                USB_DT_REPORT, /*  u8  type: Report */
-                55, 0,         /*  u16 len (digitizer report descriptor) */
-            },
+            .data = touchscreen_hid_class_desc,
         },
     },
     .eps = (USBDescEndpoint[]) {
@@ -250,15 +264,7 @@ static const USBDescIface desc_iface_touchscreen2 = {
     .descs = (USBDescOther[]) {
         {
             /* HID descriptor */
-            .data = (uint8_t[]) {
-                0x09,          /*  u8  bLength */
-                USB_DT_HID,    /*  u8  bDescriptorType */
-                0x01, 0x00,    /*  u16 HID_class */
-                0x00,          /*  u8  country_code */
-                0x01,          /*  u8  num_descriptors */
-                USB_DT_REPORT, /*  u8  type: Report */
-                55, 0,         /*  u16 len (digitizer report descriptor) */
-            },
+            .data = touchscreen_hid_class_desc,
         },
     },
     .eps = (USBDescEndpoint[]) {
@@ -660,45 +666,105 @@ static const uint8_t qemu_tablet_hid_report_descriptor[] = {
 };
 
 /*
- * Touchscreen (single-finger digitizer). Same 6-byte on-wire report as the
- * tablet ([buttons][Xlo][Xhi][Ylo][Yhi][wheel]), but described as a Digitizer
- * Touch Screen so iOS 26's AppleUserHIDDrivers dext routes it through the
- * standard digitizer parser. Application usage TouchScreen (0x0D:0x04) is what
- * makes IOHIDEventService set DisplayIntegrated; Touch Valid (0x47) is required
- * or the transducer is downgraded from Finger to Hand and ignored.
- * usb_hid_handle_data rewrites report byte 0 to 0x07 (Tip|InRange|TouchValid)
- * while a touch is down, 0x00 otherwise.
+ * Touchscreen (single-finger digitizer), described as a Digitizer Touch Screen
+ * so iOS 26's AppleUserHIDDrivers dext routes it through the standard
+ * digitizer parser. Application usage TouchScreen (0x0D:0x04) is what makes
+ * IOHIDEventService set DisplayIntegrated; Touch Valid (0x47) must stay 1,
+ * on release too, or IOHIDEventDriver turns the transducer from Finger into
+ * Hand. The base report is the tablet's 6 bytes with byte 0 rewritten:
+ *   [Tip|InRange|TouchValid][Xlo][Xhi][Ylo][Yhi][pad]
+ * TS_VARIANT_UNTOUCH adds an Untouch bit (always 0) after Touch Valid; its
+ * presence makes IOHIDEventDriver dispatch a collection event with the finger
+ * as its child. TS_VARIANT_CONTACT adds a Contact Identifier byte (0) after
+ * the flags and replaces the pad byte with a Contact Count (1).
  */
-static const uint8_t qemu_touchscreen_hid_report_descriptor[] = {
-    0x05, 0x0d,         /* Usage Page (Digitizer) */
-    0x09, 0x04,         /* Usage (Touch Screen) */
-    0xa1, 0x01,         /* Collection (Application) */
-    0x09, 0x22,         /*   Usage (Finger) */
-    0xa1, 0x02,         /*   Collection (Logical) */
-    0x09, 0x42,         /*     Usage (Tip Switch) */
-    0x09, 0x32,         /*     Usage (In Range) */
-    0x09, 0x47,         /*     Usage (Touch Valid) */
-    0x15, 0x00,         /*     Logical Minimum (0) */
-    0x25, 0x01,         /*     Logical Maximum (1) */
-    0x75, 0x01,         /*     Report Size (1) */
-    0x95, 0x03,         /*     Report Count (3) */
-    0x81, 0x02,         /*     Input (Data, Variable, Absolute) */
-    0x95, 0x05,         /*     Report Count (5) */
-    0x81, 0x03,         /*     Input (Constant) -- 5-bit padding */
-    0x05, 0x01,         /*     Usage Page (Generic Desktop) */
-    0x09, 0x30,         /*     Usage (X) */
-    0x09, 0x31,         /*     Usage (Y) */
-    0x15, 0x00,         /*     Logical Minimum (0) */
-    0x26, 0xff, 0x7f,   /*     Logical Maximum (0x7fff) */
-    0x75, 0x10,         /*     Report Size (16) */
-    0x95, 0x02,         /*     Report Count (2) */
-    0x81, 0x02,         /*     Input (Data, Variable, Absolute) */
-    0x75, 0x08,         /*     Report Size (8) */
-    0x95, 0x01,         /*     Report Count (1) */
-    0x81, 0x03,         /*     Input (Constant) -- 1-byte padding (wheel) */
-    0xc0,               /*   End Collection */
-    0xc0,               /* End Collection */
-};
+static int usb_touchscreen_build_desc(uint8_t *d, uint32_t variant)
+{
+    bool untouch = variant & TS_VARIANT_UNTOUCH;
+    bool contact = variant & TS_VARIANT_CONTACT;
+    int n = 0;
+
+#define B(...) do { \
+        const uint8_t b_[] = { __VA_ARGS__ }; \
+        memcpy(d + n, b_, sizeof(b_)); \
+        n += sizeof(b_); \
+    } while (0)
+    B(0x05, 0x0d);              /* Usage Page (Digitizer) */
+    B(0x09, 0x04);              /* Usage (Touch Screen) */
+    B(0xa1, 0x01);              /* Collection (Application) */
+    B(0x09, 0x22);              /*   Usage (Finger) */
+    B(0xa1, 0x02);              /*   Collection (Logical) */
+    B(0x09, 0x42);              /*     Usage (Tip Switch) */
+    B(0x09, 0x32);              /*     Usage (In Range) */
+    B(0x09, 0x47);              /*     Usage (Touch Valid) */
+    if (untouch) {
+        B(0x09, 0x34);          /*     Usage (Untouch) */
+    }
+    B(0x15, 0x00);              /*     Logical Minimum (0) */
+    B(0x25, 0x01);              /*     Logical Maximum (1) */
+    B(0x75, 0x01);              /*     Report Size (1) */
+    B(0x95, untouch ? 4 : 3);   /*     Report Count */
+    B(0x81, 0x02);              /*     Input (Data, Variable, Absolute) */
+    B(0x95, untouch ? 4 : 5);   /*     Report Count */
+    B(0x81, 0x03);              /*     Input (Constant) -- padding to 8 bits */
+    if (contact) {
+        B(0x09, 0x51);          /*     Usage (Contact Identifier) */
+        B(0x25, 0x7f);          /*     Logical Maximum (127) */
+        B(0x75, 0x08);          /*     Report Size (8) */
+        B(0x95, 0x01);          /*     Report Count (1) */
+        B(0x81, 0x02);          /*     Input (Data, Variable, Absolute) */
+    }
+    B(0x05, 0x01);              /*     Usage Page (Generic Desktop) */
+    B(0x09, 0x30);              /*     Usage (X) */
+    B(0x09, 0x31);              /*     Usage (Y) */
+    B(0x15, 0x00);              /*     Logical Minimum (0) */
+    B(0x26, 0xff, 0x7f);        /*     Logical Maximum (0x7fff) */
+    B(0x75, 0x10);              /*     Report Size (16) */
+    B(0x95, 0x02);              /*     Report Count (2) */
+    B(0x81, 0x02);              /*     Input (Data, Variable, Absolute) */
+    if (!contact) {
+        B(0x75, 0x08);          /*     Report Size (8) */
+        B(0x95, 0x01);          /*     Report Count (1) */
+        B(0x81, 0x03);          /*     Input (Constant) -- pad (wheel byte) */
+    }
+    B(0xc0);                    /*   End Collection */
+    if (contact) {
+        B(0x05, 0x0d);          /*   Usage Page (Digitizer) */
+        B(0x09, 0x54);          /*   Usage (Contact Count) */
+        B(0x25, 0x7f);          /*   Logical Maximum (127) */
+        B(0x75, 0x08);          /*   Report Size (8) */
+        B(0x95, 0x01);          /*   Report Count (1) */
+        B(0x81, 0x02);          /*   Input (Data, Variable, Absolute) */
+    }
+    B(0xc0);                    /* End Collection */
+#undef B
+    return n;
+}
+
+/* Rewrite a 6-byte tablet report in place into the touchscreen's layout. */
+static int usb_touchscreen_report(USBHIDState *us, uint8_t *buf, int len,
+                                  int size)
+{
+    uint8_t flags;
+
+    if (len < 6) {
+        return len;
+    }
+    flags = (buf[0] & 0x01) ? 0x07 : 0x04;  /* Tip|InRange|Valid, or Valid */
+    if (!(us->ts_variant & TS_VARIANT_CONTACT)) {
+        buf[0] = flags;
+        buf[5] = 0;
+        return 6;
+    }
+    if (size < 7) {
+        return len;
+    }
+    memmove(buf + 2, buf + 1, 4);
+    buf[0] = flags;
+    buf[1] = 0;                             /* Contact Identifier */
+    buf[6] = 1;                             /* Contact Count */
+    return 7;
+}
 
 static const uint8_t qemu_keyboard_hid_report_descriptor[] = {
     0x05, 0x01,		/* Usage Page (Generic Desktop) */
@@ -772,10 +838,8 @@ static void usb_hid_handle_control(USBDevice *dev, USBPacket *p,
                 p->actual_length = sizeof(qemu_mouse_hid_report_descriptor);
             } else if (hs->kind == HID_TABLET) {
                 if (us->is_touchscreen) {
-                    memcpy(data, qemu_touchscreen_hid_report_descriptor,
-                           sizeof(qemu_touchscreen_hid_report_descriptor));
-                    p->actual_length =
-                        sizeof(qemu_touchscreen_hid_report_descriptor);
+                    memcpy(data, us->ts_desc, us->ts_desc_len);
+                    p->actual_length = us->ts_desc_len;
                 } else {
                     memcpy(data, qemu_tablet_hid_report_descriptor,
                            sizeof(qemu_tablet_hid_report_descriptor));
@@ -794,8 +858,10 @@ static void usb_hid_handle_control(USBDevice *dev, USBPacket *p,
     case HID_GET_REPORT:
         if (hs->kind == HID_MOUSE || hs->kind == HID_TABLET) {
             p->actual_length = hid_pointer_poll(hs, data, length);
-            if (us->is_touchscreen && p->actual_length >= 1) {
-                data[0] = (data[0] & 0x01) ? 0x07 : 0x00;
+            if (us->is_touchscreen) {
+                p->actual_length = usb_touchscreen_report(us, data,
+                                                          p->actual_length,
+                                                          length);
             }
         } else if (hs->kind == HID_KEYBOARD) {
             p->actual_length = hid_keyboard_poll(hs, data, length);
@@ -843,7 +909,7 @@ static void usb_hid_handle_data(USBDevice *dev, USBPacket *p)
 {
     USBHIDState *us = USB_HID(dev);
     HIDState *hs = &us->hid;
-    g_autofree uint8_t *buf = g_malloc(p->iov.size);
+    g_autofree uint8_t *buf = g_malloc(MAX(p->iov.size, 8));
     int len = 0;
 
     switch (p->pid) {
@@ -862,8 +928,8 @@ static void usb_hid_handle_data(USBDevice *dev, USBPacket *p)
             } else if (hs->kind == HID_KEYBOARD) {
                 len = hid_keyboard_poll(hs, buf, p->iov.size);
             }
-            if (us->is_touchscreen && len >= 1) {
-                buf[0] = (buf[0] & 0x01) ? 0x07 : 0x00;
+            if (us->is_touchscreen) {
+                len = usb_touchscreen_report(us, buf, len, p->iov.size);
             }
             usb_packet_copy(p, buf, len);
         } else {
@@ -926,6 +992,8 @@ static void usb_touchscreen_realize(USBDevice *dev, Error **errp)
     USBHIDState *us = USB_HID(dev);
 
     us->is_touchscreen = true;
+    us->ts_desc_len = usb_touchscreen_build_desc(us->ts_desc, us->ts_variant);
+    stw_le_p(&touchscreen_hid_class_desc[7], us->ts_desc_len);
     usb_hid_initfn(dev, HID_TABLET, &desc_touchscreen, &desc_touchscreen2, errp);
 }
 
@@ -1015,6 +1083,13 @@ static const TypeInfo usb_tablet_info = {
     .class_init    = usb_tablet_class_initfn,
 };
 
+static const Property usb_touchscreen_properties[] = {
+        DEFINE_PROP_UINT32("usb_version", USBHIDState, usb_version, 2),
+        DEFINE_PROP_STRING("display", USBHIDState, display),
+        DEFINE_PROP_UINT32("head", USBHIDState, head, 0),
+        DEFINE_PROP_UINT32("variant", USBHIDState, ts_variant, 0),
+};
+
 static void usb_touchscreen_class_initfn(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
@@ -1023,7 +1098,7 @@ static void usb_touchscreen_class_initfn(ObjectClass *klass, const void *data)
     uc->realize        = usb_touchscreen_realize;
     uc->product_desc   = "QEMU USB Touchscreen";
     dc->vmsd = &vmstate_usb_ptr;
-    device_class_set_props(dc, usb_tablet_properties);
+    device_class_set_props(dc, usb_touchscreen_properties);
     set_bit(DEVICE_CATEGORY_INPUT, dc->categories);
 }
 
