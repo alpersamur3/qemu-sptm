@@ -43,6 +43,7 @@ struct USBHIDState {
     uint32_t usb_version;
     char *display;
     uint32_t head;
+    bool is_touchscreen;  /* usb-touchscreen: digitizer descriptor + report byte0 fixup */
 };
 
 #define TYPE_USB_HID "usb-hid"
@@ -60,6 +61,12 @@ enum {
     STR_SERIAL_MOUSE,
     STR_SERIAL_TABLET,
     STR_SERIAL_KEYBOARD,
+    STR_PRODUCT_TOUCHSCREEN,
+    STR_CONFIG_TOUCHSCREEN,
+    STR_SERIAL_TOUCHSCREEN,
+    STR_PRODUCT_CONSUMER,
+    STR_CONFIG_CONSUMER,
+    STR_SERIAL_CONSUMER,
 };
 
 static const USBDescStrings desc_strings = {
@@ -74,6 +81,12 @@ static const USBDescStrings desc_strings = {
     [STR_SERIAL_MOUSE]     = "89126",
     [STR_SERIAL_TABLET]    = "28754",
     [STR_SERIAL_KEYBOARD]  = "68284",
+    [STR_PRODUCT_TOUCHSCREEN] = "QEMU USB Touchscreen",
+    [STR_CONFIG_TOUCHSCREEN]  = "HID Touchscreen",
+    [STR_SERIAL_TOUCHSCREEN]  = "38512",
+    [STR_PRODUCT_CONSUMER]    = "QEMU USB Consumer Control",
+    [STR_CONFIG_CONSUMER]     = "HID Consumer",
+    [STR_SERIAL_CONSUMER]     = "51937",
 };
 
 static const USBDescIface desc_iface_mouse = {
@@ -185,6 +198,66 @@ static const USBDescIface desc_iface_tablet2 = {
                 0x01,          /*  u8  num_descriptors */
                 USB_DT_REPORT, /*  u8  type: Report */
                 74, 0,         /*  u16 len */
+            },
+        },
+    },
+    .eps = (USBDescEndpoint[]) {
+        {
+            .bEndpointAddress      = USB_DIR_IN | 0x01,
+            .bmAttributes          = USB_ENDPOINT_XFER_INT,
+            .wMaxPacketSize        = 8,
+            .bInterval             = 4, /* 2 ^ (4-1) * 125 usecs = 1 ms */
+        },
+    },
+};
+
+static const USBDescIface desc_iface_touchscreen = {
+    .bInterfaceNumber              = 0,
+    .bNumEndpoints                 = 1,
+    .bInterfaceClass               = USB_CLASS_HID,
+    .bInterfaceProtocol            = 0x00,
+    .ndesc                         = 1,
+    .descs = (USBDescOther[]) {
+        {
+            /* HID descriptor */
+            .data = (uint8_t[]) {
+                0x09,          /*  u8  bLength */
+                USB_DT_HID,    /*  u8  bDescriptorType */
+                0x01, 0x00,    /*  u16 HID_class */
+                0x00,          /*  u8  country_code */
+                0x01,          /*  u8  num_descriptors */
+                USB_DT_REPORT, /*  u8  type: Report */
+                55, 0,         /*  u16 len (digitizer report descriptor) */
+            },
+        },
+    },
+    .eps = (USBDescEndpoint[]) {
+        {
+            .bEndpointAddress      = USB_DIR_IN | 0x01,
+            .bmAttributes          = USB_ENDPOINT_XFER_INT,
+            .wMaxPacketSize        = 8,
+            .bInterval             = 0x0a,
+        },
+    },
+};
+
+static const USBDescIface desc_iface_touchscreen2 = {
+    .bInterfaceNumber              = 0,
+    .bNumEndpoints                 = 1,
+    .bInterfaceClass               = USB_CLASS_HID,
+    .bInterfaceProtocol            = 0x00,
+    .ndesc                         = 1,
+    .descs = (USBDescOther[]) {
+        {
+            /* HID descriptor */
+            .data = (uint8_t[]) {
+                0x09,          /*  u8  bLength */
+                USB_DT_HID,    /*  u8  bDescriptorType */
+                0x01, 0x00,    /*  u16 HID_class */
+                0x00,          /*  u8  country_code */
+                0x01,          /*  u8  num_descriptors */
+                USB_DT_REPORT, /*  u8  type: Report */
+                55, 0,         /*  u16 len (digitizer report descriptor) */
             },
         },
     },
@@ -328,6 +401,40 @@ static const USBDescDevice desc_device_tablet2 = {
     },
 };
 
+static const USBDescDevice desc_device_touchscreen = {
+    .bcdUSB                        = 0x0100,
+    .bMaxPacketSize0               = 8,
+    .bNumConfigurations            = 1,
+    .confs = (USBDescConfig[]) {
+        {
+            .bNumInterfaces        = 1,
+            .bConfigurationValue   = 1,
+            .iConfiguration        = STR_CONFIG_TOUCHSCREEN,
+            .bmAttributes          = USB_CFG_ATT_ONE | USB_CFG_ATT_WAKEUP,
+            .bMaxPower             = 50,
+            .nif = 1,
+            .ifs = &desc_iface_touchscreen,
+        },
+    },
+};
+
+static const USBDescDevice desc_device_touchscreen2 = {
+    .bcdUSB                        = 0x0200,
+    .bMaxPacketSize0               = 64,
+    .bNumConfigurations            = 1,
+    .confs = (USBDescConfig[]) {
+        {
+            .bNumInterfaces        = 1,
+            .bConfigurationValue   = 1,
+            .iConfiguration        = STR_CONFIG_TOUCHSCREEN,
+            .bmAttributes          = USB_CFG_ATT_ONE | USB_CFG_ATT_WAKEUP,
+            .bMaxPower             = 50,
+            .nif = 1,
+            .ifs = &desc_iface_touchscreen2,
+        },
+    },
+};
+
 static const USBDescDevice desc_device_keyboard = {
     .bcdUSB                        = 0x0100,
     .bMaxPacketSize0               = 8,
@@ -420,6 +527,35 @@ static const USBDesc desc_tablet2 = {
     },
     .full = &desc_device_tablet,
     .high = &desc_device_tablet2,
+    .str  = desc_strings,
+    .msos = &desc_msos_suspend,
+};
+
+static const USBDesc desc_touchscreen = {
+    .id = {
+        .idVendor          = 0x0627,
+        .idProduct         = 0x0001,
+        .bcdDevice         = 0,
+        .iManufacturer     = STR_MANUFACTURER,
+        .iProduct          = STR_PRODUCT_TOUCHSCREEN,
+        .iSerialNumber     = STR_SERIAL_TOUCHSCREEN,
+    },
+    .full = &desc_device_touchscreen,
+    .str  = desc_strings,
+    .msos = &desc_msos_suspend,
+};
+
+static const USBDesc desc_touchscreen2 = {
+    .id = {
+        .idVendor          = 0x0627,
+        .idProduct         = 0x0001,
+        .bcdDevice         = 0,
+        .iManufacturer     = STR_MANUFACTURER,
+        .iProduct          = STR_PRODUCT_TOUCHSCREEN,
+        .iSerialNumber     = STR_SERIAL_TOUCHSCREEN,
+    },
+    .full = &desc_device_touchscreen,
+    .high = &desc_device_touchscreen2,
     .str  = desc_strings,
     .msos = &desc_msos_suspend,
 };
@@ -523,6 +659,47 @@ static const uint8_t qemu_tablet_hid_report_descriptor[] = {
     0xc0,		/* End Collection */
 };
 
+/*
+ * Touchscreen (single-finger digitizer). Same 6-byte on-wire report as the
+ * tablet ([buttons][Xlo][Xhi][Ylo][Yhi][wheel]), but described as a Digitizer
+ * Touch Screen so iOS 26's AppleUserHIDDrivers dext routes it through the
+ * standard digitizer parser. Application usage TouchScreen (0x0D:0x04) is what
+ * makes IOHIDEventService set DisplayIntegrated; Touch Valid (0x47) is required
+ * or the transducer is downgraded from Finger to Hand and ignored.
+ * usb_hid_handle_data rewrites report byte 0 to 0x07 (Tip|InRange|TouchValid)
+ * while a touch is down, 0x00 otherwise.
+ */
+static const uint8_t qemu_touchscreen_hid_report_descriptor[] = {
+    0x05, 0x0d,         /* Usage Page (Digitizer) */
+    0x09, 0x04,         /* Usage (Touch Screen) */
+    0xa1, 0x01,         /* Collection (Application) */
+    0x09, 0x22,         /*   Usage (Finger) */
+    0xa1, 0x02,         /*   Collection (Logical) */
+    0x09, 0x42,         /*     Usage (Tip Switch) */
+    0x09, 0x32,         /*     Usage (In Range) */
+    0x09, 0x47,         /*     Usage (Touch Valid) */
+    0x15, 0x00,         /*     Logical Minimum (0) */
+    0x25, 0x01,         /*     Logical Maximum (1) */
+    0x75, 0x01,         /*     Report Size (1) */
+    0x95, 0x03,         /*     Report Count (3) */
+    0x81, 0x02,         /*     Input (Data, Variable, Absolute) */
+    0x95, 0x05,         /*     Report Count (5) */
+    0x81, 0x03,         /*     Input (Constant) -- 5-bit padding */
+    0x05, 0x01,         /*     Usage Page (Generic Desktop) */
+    0x09, 0x30,         /*     Usage (X) */
+    0x09, 0x31,         /*     Usage (Y) */
+    0x15, 0x00,         /*     Logical Minimum (0) */
+    0x26, 0xff, 0x7f,   /*     Logical Maximum (0x7fff) */
+    0x75, 0x10,         /*     Report Size (16) */
+    0x95, 0x02,         /*     Report Count (2) */
+    0x81, 0x02,         /*     Input (Data, Variable, Absolute) */
+    0x75, 0x08,         /*     Report Size (8) */
+    0x95, 0x01,         /*     Report Count (1) */
+    0x81, 0x03,         /*     Input (Constant) -- 1-byte padding (wheel) */
+    0xc0,               /*   End Collection */
+    0xc0,               /* End Collection */
+};
+
 static const uint8_t qemu_keyboard_hid_report_descriptor[] = {
     0x05, 0x01,		/* Usage Page (Generic Desktop) */
     0x09, 0x06,		/* Usage (Keyboard) */
@@ -594,9 +771,16 @@ static void usb_hid_handle_control(USBDevice *dev, USBPacket *p,
                        sizeof(qemu_mouse_hid_report_descriptor));
                 p->actual_length = sizeof(qemu_mouse_hid_report_descriptor);
             } else if (hs->kind == HID_TABLET) {
-                memcpy(data, qemu_tablet_hid_report_descriptor,
-                       sizeof(qemu_tablet_hid_report_descriptor));
-                p->actual_length = sizeof(qemu_tablet_hid_report_descriptor);
+                if (us->is_touchscreen) {
+                    memcpy(data, qemu_touchscreen_hid_report_descriptor,
+                           sizeof(qemu_touchscreen_hid_report_descriptor));
+                    p->actual_length =
+                        sizeof(qemu_touchscreen_hid_report_descriptor);
+                } else {
+                    memcpy(data, qemu_tablet_hid_report_descriptor,
+                           sizeof(qemu_tablet_hid_report_descriptor));
+                    p->actual_length = sizeof(qemu_tablet_hid_report_descriptor);
+                }
             } else if (hs->kind == HID_KEYBOARD) {
                 memcpy(data, qemu_keyboard_hid_report_descriptor,
                        sizeof(qemu_keyboard_hid_report_descriptor));
@@ -610,6 +794,9 @@ static void usb_hid_handle_control(USBDevice *dev, USBPacket *p,
     case HID_GET_REPORT:
         if (hs->kind == HID_MOUSE || hs->kind == HID_TABLET) {
             p->actual_length = hid_pointer_poll(hs, data, length);
+            if (us->is_touchscreen && p->actual_length >= 1) {
+                data[0] = (data[0] & 0x01) ? 0x07 : 0x00;
+            }
         } else if (hs->kind == HID_KEYBOARD) {
             p->actual_length = hid_keyboard_poll(hs, data, length);
         }
@@ -675,6 +862,9 @@ static void usb_hid_handle_data(USBDevice *dev, USBPacket *p)
             } else if (hs->kind == HID_KEYBOARD) {
                 len = hid_keyboard_poll(hs, buf, p->iov.size);
             }
+            if (us->is_touchscreen && len >= 1) {
+                buf[0] = (buf[0] & 0x01) ? 0x07 : 0x00;
+            }
             usb_packet_copy(p, buf, len);
         } else {
             goto fail;
@@ -729,6 +919,14 @@ static void usb_tablet_realize(USBDevice *dev, Error **errp)
 {
 
     usb_hid_initfn(dev, HID_TABLET, &desc_tablet, &desc_tablet2, errp);
+}
+
+static void usb_touchscreen_realize(USBDevice *dev, Error **errp)
+{
+    USBHIDState *us = USB_HID(dev);
+
+    us->is_touchscreen = true;
+    usb_hid_initfn(dev, HID_TABLET, &desc_touchscreen, &desc_touchscreen2, errp);
 }
 
 static void usb_mouse_realize(USBDevice *dev, Error **errp)
@@ -817,6 +1015,24 @@ static const TypeInfo usb_tablet_info = {
     .class_init    = usb_tablet_class_initfn,
 };
 
+static void usb_touchscreen_class_initfn(ObjectClass *klass, const void *data)
+{
+    DeviceClass *dc = DEVICE_CLASS(klass);
+    USBDeviceClass *uc = USB_DEVICE_CLASS(klass);
+
+    uc->realize        = usb_touchscreen_realize;
+    uc->product_desc   = "QEMU USB Touchscreen";
+    dc->vmsd = &vmstate_usb_ptr;
+    device_class_set_props(dc, usb_tablet_properties);
+    set_bit(DEVICE_CATEGORY_INPUT, dc->categories);
+}
+
+static const TypeInfo usb_touchscreen_info = {
+    .name          = "usb-touchscreen",
+    .parent        = TYPE_USB_HID,
+    .class_init    = usb_touchscreen_class_initfn,
+};
+
 static const Property usb_mouse_properties[] = {
         DEFINE_PROP_UINT32("usb_version", USBHIDState, usb_version, 2),
 };
@@ -862,11 +1078,285 @@ static const TypeInfo usb_keyboard_info = {
     .class_init    = usb_keyboard_class_initfn,
 };
 
+/* ======================================================================= *
+ * usb-consumer: a Consumer Control HID device (Home / Power / Volume).
+ * The vphone600 lock screen ("Press home to open") unlocks on a Consumer
+ * Home (0x0C:0x40) press; no touch gesture dismisses it. Trigger a press from
+ * the monitor:  qom-set /machine/peripheral/<id> press home   (also power,
+ * volup, voldown). The button auto-releases after hold-ms (default 100).
+ * ======================================================================= */
+
+struct USBConsumerState {
+    USBDevice dev;
+    USBEndpoint *intr;
+    uint32_t usb_version;
+    uint32_t hold_ms;
+    uint8_t report;        /* current button bitmap */
+    bool changed;
+    QEMUTimer *timer;
+};
+
+#define TYPE_USB_CONSUMER "usb-consumer"
+OBJECT_DECLARE_SIMPLE_TYPE(USBConsumerState, USB_CONSUMER)
+
+static const uint8_t qemu_consumer_hid_report_descriptor[] = {
+    0x05, 0x0c,         /* Usage Page (Consumer) */
+    0x09, 0x01,         /* Usage (Consumer Control) */
+    0xa1, 0x01,         /* Collection (Application) */
+    0x15, 0x00,         /*   Logical Minimum (0) */
+    0x25, 0x01,         /*   Logical Maximum (1) */
+    0x75, 0x01,         /*   Report Size (1) */
+    0x95, 0x04,         /*   Report Count (4) */
+    0x09, 0x40,         /*   Usage (Menu / Home) */
+    0x09, 0x30,         /*   Usage (Power) */
+    0x09, 0xe9,         /*   Usage (Volume Increment) */
+    0x09, 0xea,         /*   Usage (Volume Decrement) */
+    0x81, 0x02,         /*   Input (Data, Variable, Absolute) */
+    0x95, 0x04,         /*   Report Count (4) */
+    0x81, 0x03,         /*   Input (Constant) -- 4-bit padding */
+    0xc0,               /* End Collection */
+};
+
+static const USBDescIface desc_iface_consumer = {
+    .bInterfaceNumber              = 0,
+    .bNumEndpoints                 = 1,
+    .bInterfaceClass               = USB_CLASS_HID,
+    .bInterfaceProtocol            = 0x00,
+    .ndesc                         = 1,
+    .descs = (USBDescOther[]) {
+        {
+            .data = (uint8_t[]) {
+                0x09,          /*  u8  bLength */
+                USB_DT_HID,    /*  u8  bDescriptorType */
+                0x01, 0x00,    /*  u16 HID_class */
+                0x00,          /*  u8  country_code */
+                0x01,          /*  u8  num_descriptors */
+                USB_DT_REPORT, /*  u8  type: Report */
+                29, 0,         /*  u16 len (consumer report descriptor) */
+            },
+        },
+    },
+    .eps = (USBDescEndpoint[]) {
+        {
+            .bEndpointAddress      = USB_DIR_IN | 0x01,
+            .bmAttributes          = USB_ENDPOINT_XFER_INT,
+            .wMaxPacketSize        = 8,
+            .bInterval             = 0x0a,
+        },
+    },
+};
+
+static const USBDescDevice desc_device_consumer = {
+    .bcdUSB                        = 0x0100,
+    .bMaxPacketSize0               = 8,
+    .bNumConfigurations            = 1,
+    .confs = (USBDescConfig[]) {
+        {
+            .bNumInterfaces        = 1,
+            .bConfigurationValue   = 1,
+            .iConfiguration        = STR_CONFIG_CONSUMER,
+            .bmAttributes          = USB_CFG_ATT_ONE | USB_CFG_ATT_WAKEUP,
+            .bMaxPower             = 50,
+            .nif = 1,
+            .ifs = &desc_iface_consumer,
+        },
+    },
+};
+
+static const USBDescDevice desc_device_consumer2 = {
+    .bcdUSB                        = 0x0200,
+    .bMaxPacketSize0               = 64,
+    .bNumConfigurations            = 1,
+    .confs = (USBDescConfig[]) {
+        {
+            .bNumInterfaces        = 1,
+            .bConfigurationValue   = 1,
+            .iConfiguration        = STR_CONFIG_CONSUMER,
+            .bmAttributes          = USB_CFG_ATT_ONE | USB_CFG_ATT_WAKEUP,
+            .bMaxPower             = 50,
+            .nif = 1,
+            .ifs = &desc_iface_consumer,
+        },
+    },
+};
+
+static const USBDesc desc_consumer = {
+    .id = {
+        .idVendor          = 0x0627,
+        .idProduct         = 0x0001,
+        .bcdDevice         = 0,
+        .iManufacturer     = STR_MANUFACTURER,
+        .iProduct          = STR_PRODUCT_CONSUMER,
+        .iSerialNumber     = STR_SERIAL_CONSUMER,
+    },
+    .full = &desc_device_consumer,
+    .high = &desc_device_consumer2,
+    .str  = desc_strings,
+    .msos = &desc_msos_suspend,
+};
+
+static void usb_consumer_release(void *opaque)
+{
+    USBConsumerState *us = opaque;
+
+    if (us->report != 0) {
+        us->report = 0;
+        us->changed = true;
+        usb_wakeup(us->intr, 0);
+    }
+}
+
+static void usb_consumer_handle_reset(USBDevice *dev)
+{
+    USBConsumerState *us = USB_CONSUMER(dev);
+
+    us->report = 0;
+    us->changed = false;
+}
+
+static void usb_consumer_handle_control(USBDevice *dev, USBPacket *p,
+               int request, int value, int index, int length, uint8_t *data)
+{
+    USBConsumerState *us = USB_CONSUMER(dev);
+    int ret;
+
+    ret = usb_desc_handle_control(dev, p, request, value, index, length, data);
+    if (ret >= 0) {
+        return;
+    }
+
+    switch (request) {
+    case InterfaceRequest | USB_REQ_GET_DESCRIPTOR:
+        if ((value >> 8) == 0x22) {
+            memcpy(data, qemu_consumer_hid_report_descriptor,
+                   sizeof(qemu_consumer_hid_report_descriptor));
+            p->actual_length = sizeof(qemu_consumer_hid_report_descriptor);
+        } else {
+            goto fail;
+        }
+        break;
+    case HID_GET_REPORT:
+        data[0] = us->report;
+        p->actual_length = 1;
+        break;
+    case HID_GET_IDLE:
+        data[0] = 0;
+        p->actual_length = 1;
+        break;
+    case HID_SET_IDLE:
+        break;
+    default:
+    fail:
+        p->status = USB_RET_STALL;
+        break;
+    }
+}
+
+static void usb_consumer_handle_data(USBDevice *dev, USBPacket *p)
+{
+    USBConsumerState *us = USB_CONSUMER(dev);
+    uint8_t buf[1];
+
+    if (p->pid == USB_TOKEN_IN && p->ep->nr == 1) {
+        if (!us->changed) {
+            p->status = USB_RET_NAK;
+            return;
+        }
+        us->changed = false;
+        buf[0] = us->report;
+        usb_packet_copy(p, buf, 1);
+    } else {
+        p->status = USB_RET_STALL;
+    }
+}
+
+static void usb_consumer_set_press(Object *obj, const char *value, Error **errp)
+{
+    USBConsumerState *us = USB_CONSUMER(obj);
+    uint8_t bit;
+
+    if (!strcmp(value, "home") || !strcmp(value, "menu")) {
+        bit = 0x01;
+    } else if (!strcmp(value, "power")) {
+        bit = 0x02;
+    } else if (!strcmp(value, "volup")) {
+        bit = 0x04;
+    } else if (!strcmp(value, "voldown")) {
+        bit = 0x08;
+    } else {
+        error_setg(errp, "usb-consumer: unknown button '%s' "
+                   "(home|power|volup|voldown)", value);
+        return;
+    }
+    us->report |= bit;
+    us->changed = true;
+    usb_wakeup(us->intr, 0);
+    timer_mod(us->timer, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + us->hold_ms);
+}
+
+static char *usb_consumer_get_press(Object *obj, Error **errp)
+{
+    return g_strdup("");
+}
+
+static void usb_consumer_realize(USBDevice *dev, Error **errp)
+{
+    USBConsumerState *us = USB_CONSUMER(dev);
+
+    dev->usb_desc = &desc_consumer;
+    usb_desc_create_serial(dev);
+    usb_desc_init(dev);
+    us->intr = usb_ep_get(dev, USB_TOKEN_IN, 1);
+    us->report = 0;
+    us->changed = false;
+    us->timer = timer_new_ms(QEMU_CLOCK_VIRTUAL, usb_consumer_release, us);
+
+    object_property_add_str(OBJECT(dev), "press",
+                            usb_consumer_get_press, usb_consumer_set_press);
+}
+
+static void usb_consumer_unrealize(USBDevice *dev)
+{
+    USBConsumerState *us = USB_CONSUMER(dev);
+
+    timer_free(us->timer);
+}
+
+static const Property usb_consumer_properties[] = {
+    DEFINE_PROP_UINT32("usb_version", USBConsumerState, usb_version, 2),
+    DEFINE_PROP_UINT32("hold-ms", USBConsumerState, hold_ms, 100),
+};
+
+static void usb_consumer_class_initfn(ObjectClass *klass, const void *data)
+{
+    DeviceClass *dc = DEVICE_CLASS(klass);
+    USBDeviceClass *uc = USB_DEVICE_CLASS(klass);
+
+    uc->realize        = usb_consumer_realize;
+    uc->unrealize      = usb_consumer_unrealize;
+    uc->product_desc   = "QEMU USB Consumer Control";
+    uc->handle_reset   = usb_consumer_handle_reset;
+    uc->handle_control = usb_consumer_handle_control;
+    uc->handle_data    = usb_consumer_handle_data;
+    uc->handle_attach  = usb_desc_attach;
+    device_class_set_props(dc, usb_consumer_properties);
+    set_bit(DEVICE_CATEGORY_INPUT, dc->categories);
+}
+
+static const TypeInfo usb_consumer_info = {
+    .name          = TYPE_USB_CONSUMER,
+    .parent        = TYPE_USB_DEVICE,
+    .instance_size = sizeof(USBConsumerState),
+    .class_init    = usb_consumer_class_initfn,
+};
+
 static void usb_hid_register_types(void)
 {
     type_register_static(&usb_hid_type_info);
     type_register_static(&usb_tablet_info);
     usb_legacy_register("usb-tablet", "tablet", NULL);
+    type_register_static(&usb_touchscreen_info);
+    type_register_static(&usb_consumer_info);
     type_register_static(&usb_mouse_info);
     usb_legacy_register("usb-mouse", "mouse", NULL);
     type_register_static(&usb_keyboard_info);
