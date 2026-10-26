@@ -1348,6 +1348,11 @@
 #     Home, Lock, Volume (sent as F1-F4), Screenshot, Install .ipa
 #     and Shut down.  Defaults to "off".  (Since 11.1)
 #
+# @quick-boot: Closing the window saves the machine as the internal
+#     snapshot "asoft-quick" and quits; once a machine started with
+#     -loadvm asoft-quick runs, that snapshot is deleted, so a state
+#     is never resumed twice.  Defaults to "off".  (Since 11.1)
+#
 # Since: 2.12
 ##
 { 'struct'  : 'DisplayGTK',
@@ -1358,7 +1363,8 @@
                 '*show-menubar'      : 'bool',
                 '*keep-aspect-ratio' : 'bool',
                 '*scale'             : 'number',
-                '*sidebar'           : 'bool'  } }
+                '*sidebar'           : 'bool',
+                '*quick-boot'        : 'bool'  } }
 
 ##
 # @DisplayEGLHeadless:

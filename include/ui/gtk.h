@@ -141,6 +141,29 @@ struct GtkDisplayState {
     bool guest_display_off;
     bool guest_display_was_off;
     bool guest_display_armed;   /* on again after the off while booting */
+
+    /* quick boot and saved states (0009) */
+    bool quick_boot;            /* closing the window saves the state */
+    bool quick_cleared;
+    bool snapshot_busy;         /* a state is being saved or restored */
+    GtkWidget *sidebar_pause;
+    /* a cover over the guest display while it is paused or being saved */
+    GtkWidget *busy;
+    GtkWidget *busy_spinner;
+    GtkWidget *busy_title;
+    GtkWidget *busy_text;
+
+    /* touch gestures the side bar makes: app switcher, wheel as swipes */
+    GQueue *gesture;            /* of GdGestureStep */
+    guint gesture_timer;
+    bool gesture_down;          /* the gesture's finger touches */
+    bool mouse_down;            /* the real button: no gesture then */
+    double wheel_pending;       /* wheel steps not yet swiped, + = down */
+
+    /* text pasted from the PC, typed one character at a time */
+    char *paste;
+    size_t paste_pos;
+    guint paste_timer;
     char *shots_dir;
     char *ipa_dir;
     GHashTable *ipas_pending;   /* .ipa name -> time copied (s) */
