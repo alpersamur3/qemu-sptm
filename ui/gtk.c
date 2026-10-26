@@ -60,6 +60,7 @@
 #include "system/runstate.h"
 #include "system/system.h"
 #include "migration/snapshot.h"
+#include "migration/migration.h"
 #include "block/snapshot.h"
 #include "block/graph-lock.h"
 #include "keymaps.h"
@@ -401,6 +402,37 @@ void gd_update_windowsize(VirtualConsole *vc)
     } else if (vc->type == GD_VC_GFX && !s->full_screen) {
         gd_fit_window(vc);
     }
+}
+
+/*
+ * Zoom-to-fit, once the window is up: a guest display whose size is set before
+ * the window exists and never changes (pvg=reims) gets no resize to fit on.
+ */
+static gboolean gd_fit_window_idle(void *opaque)
+{
+    GtkDisplayState *s = opaque;
+    VirtualConsole *vc = gd_vc_find_current(s);
+    int i;
+
+    if (!vc || vc->type != GD_VC_GFX || !s->free_scale || s->full_screen) {
+        return G_SOURCE_REMOVE;
+    }
+    /*
+     * The other graphic consoles' pages (vresearch's boot framebuffer) still
+     * ask for their full size from before zoom-to-fit was on, and the window
+     * cannot get smaller than its largest page: renew their size requests,
+     * the current console's last, as its hints are the window's.
+     */
+    for (i = 0; i < s->vcs->len; i++) {
+        VirtualConsole *v = g_ptr_array_index(s->vcs, i);
+
+        if (v != vc && v->type == GD_VC_GFX && !v->window) {
+            gd_update_geometry_hints(v);
+        }
+    }
+    gd_update_geometry_hints(vc);
+    gd_fit_window(vc);
+    return G_SOURCE_REMOVE;
 }
 
 static void gd_update_full_redraw(VirtualConsole *vc)
@@ -823,9 +855,52 @@ static void gd_powerdown(GtkDisplayState *s)
                    "about 10 s.");
 }
 
-/* Press and release a key, as QMP send-key does. */
+/*
+ * A guest whose machine has a usb-consumer (the iOS 26 research VM) takes the
+ * phone's buttons from it as Consumer usages: F1 Home, F2 the side button
+ * (Power), F3/F4 Volume down/up. The device releases the button itself.
+ */
+static const struct {
+    unsigned int key;
+    const char *button;
+} gd_consumer_buttons[] = {
+    { KEY_F1, "home" },
+    { KEY_F2, "power" },
+    { KEY_F3, "voldown" },
+    { KEY_F4, "volup" },
+};
+
+static int gd_consumer_button(unsigned int key)
+{
+    int i;
+
+    for (i = 0; i < ARRAY_SIZE(gd_consumer_buttons); i++) {
+        if (gd_consumer_buttons[i].key == key) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static Object *gd_consumer(void)
+{
+    return object_resolve_path_type("", "usb-consumer", NULL);
+}
+
+/* Press and release a key, as QMP send-key does, or the usb-consumer button. */
 static void gd_sidebar_press(unsigned int key)
 {
+    Object *consumer = gd_consumer();
+    int button = gd_consumer_button(key);
+    Error *err = NULL;
+
+    if (consumer && button >= 0) {
+        if (!object_property_set_str(consumer, "press",
+                                     gd_consumer_buttons[button].button, &err)) {
+            error_report_err(err);
+        }
+        return;
+    }
     qemu_input_event_send_key_linux(NULL, key, true);
     qemu_input_event_send_key_delay(SIDEBAR_KEY_HOLD_MS);
     qemu_input_event_send_key_linux(NULL, key, false);
@@ -1813,8 +1888,9 @@ static void gd_create_sidebar(GtkDisplayState *s)
 {
     const char *shots = g_getenv("ASOFT_SHOTS_DIR");
     const char *pictures = g_get_user_special_dir(G_USER_DIRECTORY_PICTURES);
-    GtkWidget *group, *install, *header, *names, *brand, *subtitle;
+    GtkWidget *group, *install, *header, *names, *brand, *subtitle, *save, *states;
     GtkCssProvider *css = gtk_css_provider_new();
+    Error *blocked = NULL;
     g_autoptr(GdkPixbuf) logo = gd_asoft_logo(38);
 
     s->shots_dir = shots ? g_strdup(shots)
@@ -1845,7 +1921,7 @@ static void gd_create_sidebar(GtkDisplayState *s)
     names = gtk_box_new(GTK_ORIENTATION_VERTICAL, 1);
     gtk_widget_set_valign(names, GTK_ALIGN_CENTER);
     brand = gtk_label_new("ASoftware");
-    subtitle = gtk_label_new("iOS 16.7.16 · iPhone X");
+    subtitle = gtk_label_new(g_getenv("ASOFT_SUBTITLE") ?: "iOS 16.7.16 · iPhone X");
     gtk_label_set_xalign(GTK_LABEL(brand), 0);
     gtk_label_set_xalign(GTK_LABEL(subtitle), 0);
     gtk_style_context_add_class(gtk_widget_get_style_context(brand), "brand");
@@ -1898,12 +1974,20 @@ static void gd_create_sidebar(GtkDisplayState *s)
     s->sidebar_pause = gd_sidebar_button(s, group, "Pause", NULL,
                                          "Stop the guest where it is, or go on",
                                          G_CALLBACK(gd_sidebar_pause), 0);
-    gd_sidebar_button(s, group, "Save state", NULL,
-                      "Save the whole machine as it is now",
-                      G_CALLBACK(gd_sidebar_save_state), 0);
-    gd_sidebar_button(s, group, "Saved states…", NULL,
-                      "Go back to a saved state, or delete one",
-                      G_CALLBACK(gd_sidebar_states), 0);
+    save = gd_sidebar_button(s, group, "Save state", NULL,
+                             "Save the whole machine as it is now",
+                             G_CALLBACK(gd_sidebar_save_state), 0);
+    states = gd_sidebar_button(s, group, "Saved states…", NULL,
+                               "Go back to a saved state, or delete one",
+                               G_CALLBACK(gd_sidebar_states), 0);
+    if (migration_is_blocked(&blocked)) {
+        /* a device that cannot be saved (pvg=reims: the host GPU's state) */
+        gtk_widget_set_sensitive(save, FALSE);
+        gtk_widget_set_sensitive(states, FALSE);
+        gtk_widget_set_tooltip_text(save, error_get_pretty(blocked));
+        gtk_widget_set_tooltip_text(states, error_get_pretty(blocked));
+        error_free(blocked);
+    }
 
     group = gd_sidebar_group(s, "POWER");
     s->sidebar_power = gd_sidebar_button(s, group, "Shut down", NULL,
@@ -2626,7 +2710,7 @@ static gboolean gd_text_key_down(GtkWidget *widget,
 static gboolean gd_key_event(GtkWidget *widget, GdkEventKey *key, void *opaque)
 {
     VirtualConsole *vc = opaque;
-    int keycode;
+    int keycode, button;
     unsigned int lnx;
 
 #ifdef G_OS_WIN32
@@ -2680,6 +2764,19 @@ static gboolean gd_key_event(GtkWidget *widget, GdkEventKey *key, void *opaque)
 
     trace_gd_key_event(vc->label, keycode, lnx,
                        (key->type == GDK_KEY_PRESS) ? "down" : "up");
+
+    /* F1-F4 are the phone's buttons on a guest with a usb-consumer: one press each */
+    button = gd_consumer_button(lnx);
+    if (button >= 0 && gd_consumer()) {
+        if (key->type == GDK_KEY_PRESS &&
+            !(vc->s->consumer_keys_down & BIT(button))) {
+            vc->s->consumer_keys_down |= BIT(button);
+            gd_sidebar_press(lnx);
+        } else if (key->type == GDK_KEY_RELEASE) {
+            vc->s->consumer_keys_down &= ~BIT(button);
+        }
+        return TRUE;
+    }
 
     qkbd_state_key_event(vc->gfx.kbd, lnx, key->type == GDK_KEY_PRESS);
 
@@ -4148,6 +4245,7 @@ static void gtk_display_init(DisplayState *ds, DisplayOptions *opts)
 
     vc = gd_vc_find_current(s);
     gtk_widget_set_sensitive(s->view_menu, vc != NULL);
+    g_idle_add(gd_fit_window_idle, s);
 #ifdef CONFIG_VTE
     gtk_widget_set_sensitive(s->copy_item,
                              vc && vc->type == GD_VC_VTE);

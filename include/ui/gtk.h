@@ -133,6 +133,7 @@ struct GtkDisplayState {
     GtkWidget *sidebar;
     GtkWidget *sidebar_status;
     GtkWidget *sidebar_lock;
+    unsigned int consumer_keys_down;  /* F1-F4 held, as usb-consumer buttons */
     GtkWidget *sidebar_power;
     /* the guest's display power, from its keyboard's Scroll Lock LED */
     GtkWidget *overlay;         /* the notebook, and screen_off over it */

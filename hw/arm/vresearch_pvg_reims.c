@@ -95,6 +95,7 @@ struct VResearchPVGReimsState {
     /* the console: the frame thread's last read-back, black until then */
     QemuConsole *con;
     uint32_t *frame;
+    uint64_t drawn;             /* the shown count at the UI's last redraw */
 
     /* the frame path: new_frame sets the event, the thread reads back */
     QemuEvent frame_event;
@@ -272,11 +273,20 @@ static void *frame_thread_fn(void *opaque)
 
 /* --- the console --- */
 
+/*
+ * The UI's refresh: redraw only after the frame thread read a new frame back.
+ * A full update of the 1179x2556 surface on every refresh would copy 12 MB
+ * each time with the BQL held, which the vCPUs wait for.
+ */
 static bool fb_update(void *opaque)
 {
     VResearchPVGReimsState *s = opaque;
+    uint64_t shown = qatomic_read(&s->shown);
 
-    qemu_console_update_full(s->con);
+    if (shown != s->drawn) {
+        s->drawn = shown;
+        qemu_console_update_full(s->con);
+    }
     return true;
 }
 
