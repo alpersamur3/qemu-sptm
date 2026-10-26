@@ -403,10 +403,21 @@ void patch_kc_aks_stub(u8 *bkc_macho) {
      * Fourth: selectors 17 and 35 (get device state / extended device state)
      * return a small DER SET as struct output, not a scalar. With no SEP they
      * fail (sep_endpoint() failed, ret 0xE00002D8) and the daemons retry
-     * forever. Answer with the same synthetic DER iOS 16's SweetKeyStore gave:
-     *   SET { "ss":4, "sls":0, "sb":0, "sfa":0, "sgs":0, "sas":0,
-     *         "sgpe":0, "srcd":0 }   (ss=4 => unlocked since boot)
-     * encoded as 0x31 len, then per key 0x0c len <name> 0x02 0x01 <value>.
+     * forever. iOS 26's _decode_extended_state (der_dict_iterate) parses a DER
+     *   SET OF SEQUENCE { UTF8String key, INTEGER value }
+     * (the encoder _encode_list_dict qsorts discrete pair objects, so each pair is
+     * wrapped in its own SEQUENCE and the SET is canonical/sorted) -- NOT a flat
+     * SET of alternating strings and integers. iOS 16's SweetKeyStore used the flat
+     * form; on iOS 26 it fails to decode, and aks_get_device_state then leaves the
+     * caller's struct zeroed yet still returns success, so SpringBoard reads lock
+     * state 0 and shows "Enter Passcode" (no error is logged -- matches the serial).
+     * The device lock state is struct offset 4, filled by der_key_state_lock_state
+     * ("sls", the 2nd field after ss). SpringBoardFoundation:
+     * SBFMobileKeyBagState.lockState = remap[offset4], remap={0,2,1,3,4,5,6,7}, and
+     * -[SBFMobileKeyBag _queue_setHasPasscodeIfNecessary:] sets
+     * hasPasscode = (lockState != 3). So sls=3 => lockState 3 => no passcode =>
+     * the clock lock screen. Provide ss=4 (unlocked since boot) and sls=3, sorted:
+     *   SET { SEQ { "ss", 4 }, SEQ { "sls", 3 } }
      *
      * sel 35 (@0xfffffe0007f354a8) sets w27=0 then falls through into the sel
      * 17 body at 0xfffffe0007f354b0, so a single rewrite at 0xfffffe0007f354b4
@@ -418,17 +429,13 @@ void patch_kc_aks_stub(u8 *bkc_macho) {
      * Validated by the body head (str xzr,[sp,...]); mismatched bytes skip it.
      */
     {
-        static const u8 der[66] = {
-            0x31, 0x40,
-            0x0c,0x02,'s','s',          0x02,0x01,0x04,
-            0x0c,0x03,'s','l','s',      0x02,0x01,0x00,
-            0x0c,0x02,'s','b',          0x02,0x01,0x00,
-            0x0c,0x03,'s','f','a',      0x02,0x01,0x00,
-            0x0c,0x03,'s','g','s',      0x02,0x01,0x00,
-            0x0c,0x03,'s','a','s',      0x02,0x01,0x00,
-            0x0c,0x04,'s','g','p','e',  0x02,0x01,0x00,
-            0x0c,0x04,'s','r','c','d',  0x02,0x01,0x00,
+        static const u8 der[24] = {
+            0x31, 0x13,                                        /* SET, len 0x13 */
+            0x30,0x07, 0x0c,0x02,'s','s',      0x02,0x01,0x04, /* SEQ { "ss",  4 } */
+            0x30,0x08, 0x0c,0x03,'s','l','s',  0x02,0x01,0x03, /* SEQ { "sls", 3 } */
+            0x00,0x00,0x00,                                    /* pad to 8-byte multiple */
         };
+        const int der_len = 21;  /* real DER length (bytes before the pad) */
         const u64 body_va = 0xfffffe0007f354b4ULL;
         const u64 epi_va  = 0xfffffe0007f3a940ULL;
         const u64 next_va = 0xfffffe0007f357d8ULL;  /* sel 18 handler: capacity bound */
@@ -451,7 +458,7 @@ void patch_kc_aks_stub(u8 *bkc_macho) {
         code[n++] = 0xf9402e60u;            /* ldr  x0, [x19, #0x58] (structOutput) */
         cbz_idx = n;
         code[n++] = 0;                      /* cbz  x0, ret  (patched below) */
-        for (i = 0; i + 8 <= 64; i += 8) {  /* 8 full qwords of the 66-byte blob */
+        for (i = 0; i + 8 <= (int)sizeof(der); i += 8) {  /* qwords of the padded blob */
             u64 v = 0;
             int k;
             for (k = 0; k < 8; k++) {
@@ -460,10 +467,8 @@ void patch_kc_aks_stub(u8 *bkc_macho) {
             n += emit_mov_x8(&code[n], v);
             code[n++] = 0xf9000008u | ((u32)(i / 8) << 10);  /* str x8, [x0, #i] */
         }
-        code[n++] = 0x52800008u | ((u32)(der[64] | (der[65] << 8)) << 5); /* movz w8, #last2 */
-        code[n++] = 0x79008008u;            /* strh w8, [x0, #64]  (64/2=32<<10) */
         ret_idx = n;
-        code[n++] = 0x52800848u;            /* movz w8, #66  (0x42) */
+        code[n++] = 0x52800008u | ((u32)der_len << 5);  /* movz w8, #der_len */
         code[n++] = 0xb9006268u;            /* str  w8, [x19, #0x60] (structOutputSize) */
         code[n++] = 0x52800018u;            /* movz w24, #0 */
         off = (i64)(epi_va - (body_va + 4 * n)) >> 2;
