@@ -132,7 +132,15 @@ struct GtkDisplayState {
     /* sidebar=on: phone buttons next to the guest display */
     GtkWidget *sidebar;
     GtkWidget *sidebar_status;
+    GtkWidget *sidebar_lock;
     GtkWidget *sidebar_power;
+    /* the guest's display power, from its keyboard's Scroll Lock LED */
+    GtkWidget *overlay;         /* the notebook, and screen_off over it */
+    GtkWidget *screen_off;
+    Notifier led_notifier;
+    bool guest_display_off;
+    bool guest_display_was_off;
+    bool guest_display_armed;   /* on again after the off while booting */
     char *shots_dir;
     char *ipa_dir;
     GHashTable *ipas_pending;   /* .ipa name -> time copied (s) */
