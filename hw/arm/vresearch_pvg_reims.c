@@ -243,7 +243,11 @@ static void frame_read_back(VResearchPVGReimsState *s)
     }
     n = qatomic_fetch_inc(&s->shown) + 1;
     if (n <= 8 || n % 256 == 0) {
-        fprintf(stderr, "vresearch-pvg-reims: frame %" PRIu64 " shown\n", n);
+        uint64_t guest = 0, host = 0;
+
+        rvg_display_present_counts(s->display, &guest, &host);
+        fprintf(stderr, "vresearch-pvg-reims: frame %" PRIu64 " shown "
+                "(presents: guest %" PRIu64 ", host %" PRIu64 ")\n", n, guest, host);
         fflush(stderr);
     }
 }
