@@ -331,6 +331,58 @@ static void gd_update_geometry_hints(VirtualConsole *vc)
     gtk_window_set_geometry_hints(geo_window, geo_widget, &geo, mask);
 }
 
+/*
+ * Zoom-to-fit: size the window to the guest display's shape, as large as fits
+ * WINDOW_FIT_SHARE of the monitor's work area, so the guest fills it without
+ * bars (a phone's 1080x2400 screen gets a tall, narrow window). Done whenever
+ * the guest display changes size, and by View > Best Fit.
+ */
+#define WINDOW_FIT_SHARE 0.92
+
+static void gd_fit_window(VirtualConsole *vc)
+{
+    GtkDisplayState *s = vc->s;
+    GtkWindow *window = GTK_WINDOW(vc->window ? vc->window : s->window);
+    GdkWindow *gdk_window = gtk_widget_get_window(GTK_WIDGET(window));
+    GdkMonitor *monitor;
+    GdkRectangle area, frame;
+    int width, height, menu = 0, x, y;
+    double scale;
+
+    if (!gdk_window || !vc->gfx.ds) {
+        return;
+    }
+    width = surface_width(vc->gfx.ds);
+    height = surface_height(vc->gfx.ds);
+    monitor = gdk_display_get_monitor_at_window(
+        gtk_widget_get_display(GTK_WIDGET(window)), gdk_window);
+    if (!monitor || width <= 0 || height <= 0) {
+        return;
+    }
+    gdk_monitor_get_workarea(monitor, &area);
+    /* title bar and borders */
+    gdk_window_get_frame_extents(gdk_window, &frame);
+    frame.width -= gdk_window_get_width(gdk_window);
+    frame.height -= gdk_window_get_height(gdk_window);
+    if (!vc->window && gtk_widget_get_visible(s->menu_bar)) {
+        menu = gtk_widget_get_allocated_height(s->menu_bar);
+    }
+    scale = MIN((area.height * WINDOW_FIT_SHARE - frame.height - menu) / height,
+                (area.width * WINDOW_FIT_SHARE - frame.width) / width);
+    if (scale <= VC_SCALE_MIN) {
+        return;
+    }
+    width = width * scale;
+    height = height * scale + menu;
+    gtk_window_resize(window, width, height);
+
+    /* and keep the whole window inside that work area */
+    gtk_window_get_position(window, &x, &y);
+    x = MAX(area.x, MIN(x, area.x + area.width - width - frame.width));
+    y = MAX(area.y, MIN(y, area.y + area.height - height - frame.height));
+    gtk_window_move(window, x, y);
+}
+
 void gd_update_windowsize(VirtualConsole *vc)
 {
     GtkDisplayState *s = vc->s;
@@ -340,6 +392,8 @@ void gd_update_windowsize(VirtualConsole *vc)
     if (vc->type == GD_VC_GFX && !s->full_screen && !s->free_scale) {
         gtk_window_resize(GTK_WINDOW(vc->window ? vc->window : s->window),
                           VC_WINDOW_X_MIN, VC_WINDOW_Y_MIN);
+    } else if (vc->type == GD_VC_GFX && !s->full_screen) {
+        gd_fit_window(vc);
     }
 }
 
