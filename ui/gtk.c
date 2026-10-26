@@ -810,9 +810,15 @@ void gd_update_monitor_refresh_rate(VirtualConsole *vc, GtkWidget *widget)
 
     gd_set_ui_refresh_rate(vc, refresh_rate);
 
-    /* T = 1 / f = 1 [s*Hz] / f = 1000*1000 [ms*mHz] / f */
+    /*
+     * T = 1 / f = 1 [s*Hz] / f = 1000*1000 [ms*mHz] / f, but never shorter
+     * than GUI_REFRESH_INTERVAL_DEFAULT: a refresh redraws the whole surface
+     * of a display without dirty tracking (ramfb) with the BQL held, and at
+     * the 144 Hz of a laptop panel that kept the main loop, and so every vCPU
+     * waiting for the BQL, busy two thirds of the time.
+     */
     vc->gfx.dcl.update_interval = refresh_rate ?
-        MIN(1000 * 1000 / refresh_rate, GUI_REFRESH_INTERVAL_DEFAULT) :
+        MAX(1000 * 1000 / refresh_rate, GUI_REFRESH_INTERVAL_DEFAULT) :
         GUI_REFRESH_INTERVAL_DEFAULT;
 #endif
 }
