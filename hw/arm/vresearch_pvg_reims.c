@@ -44,6 +44,7 @@
 #include "qemu/notify.h"
 #include "qemu/rcu.h"
 #include "qemu/thread.h"
+#include "qemu/timer.h"
 #include "hw/core/irq.h"
 #include "hw/core/qdev-properties.h"
 #include "hw/core/resettable.h"
@@ -184,11 +185,69 @@ static void display_mode_change(void *ctx, uint16_t width, uint16_t height,
     fflush(stderr);
 }
 
+/* ASOFT_LAT=1: host-clock stamps for input-to-frame latency (lat-report.py) */
+static bool lat_on(void)
+{
+    static int on = -1;
+
+    if (on < 0) {
+        on = getenv("ASOFT_LAT") != NULL;
+    }
+    return on;
+}
+
+#define LAT_STEP 8
+
+/*
+ * Compares every LAT_STEP-th pixel of the read-back frame with the previous
+ * one and logs how many differ and where: a tap's first visible answer is the
+ * first frame with a large change, the clock icon's hands are a small one.
+ */
+static void lat_frame_shown(VResearchPVGReimsState *s, uint64_t n,
+                            int64_t t0, int64_t t1)
+{
+    static uint32_t *prev;
+    unsigned cols = (s->width + LAT_STEP - 1) / LAT_STEP;
+    unsigned rows = (s->height + LAT_STEP - 1) / LAT_STEP;
+    unsigned diff = 0, x0 = UINT_MAX, y0 = UINT_MAX, x1 = 0, y1 = 0;
+    bool first = !prev;
+
+    if (first) {
+        prev = g_new0(uint32_t, cols * rows);
+    }
+    for (unsigned r = 0; r < rows; r++) {
+        const uint32_t *line = s->frame + (size_t)r * LAT_STEP * s->width;
+
+        for (unsigned c = 0; c < cols; c++) {
+            uint32_t px = line[c * LAT_STEP];
+            uint32_t *p = &prev[r * cols + c];
+
+            if (px != *p) {
+                diff++;
+                x0 = MIN(x0, c * LAT_STEP);
+                y0 = MIN(y0, r * LAT_STEP);
+                x1 = MAX(x1, c * LAT_STEP);
+                y1 = MAX(y1, r * LAT_STEP);
+                *p = px;
+            }
+        }
+    }
+    if (!diff) {
+        x0 = y0 = 0;
+    }
+    fprintf(stderr, "LAT shown %" PRId64 " n=%" PRIu64 " diff=%u of=%u "
+            "box=%u,%u,%u,%u rb_us=%" PRId64 "\n", t1, n, diff, cols * rows,
+            x0, y0, x1, y1, (t1 - t0) / 1000);
+}
+
 static void display_new_frame(void *ctx)
 {
     VResearchPVGReimsState *s = ctx;
     uint64_t n = qatomic_fetch_inc(&s->frames) + 1;
 
+    if (lat_on()) {
+        fprintf(stderr, "LAT present %" PRId64 " n=%" PRIu64 "\n", get_clock(), n);
+    }
     if (n <= 8 || n % 256 == 0) {
         fprintf(stderr, "vresearch-pvg-reims: new frame %" PRIu64 "\n", n);
         fflush(stderr);
@@ -221,6 +280,7 @@ static void frame_read_back(VResearchPVGReimsState *s)
     RvgFrame *frame = NULL;
     RvgStatus st;
     uint64_t n;
+    int64_t t0 = get_clock();
 
     st = rvg_display_encode_frame(s->display, s->target, NULL, &frame);
     if (st != RVG_OK || !frame) {
@@ -243,6 +303,9 @@ static void frame_read_back(VResearchPVGReimsState *s)
         return;
     }
     n = qatomic_fetch_inc(&s->shown) + 1;
+    if (lat_on()) {
+        lat_frame_shown(s, n, t0, get_clock());
+    }
     if (n <= 8 || n % 256 == 0) {
         uint64_t guest = 0, host = 0;
 

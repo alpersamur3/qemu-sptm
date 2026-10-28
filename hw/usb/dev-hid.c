@@ -750,6 +750,10 @@ static int usb_touchscreen_report(USBHIDState *us, uint8_t *buf, int len,
     if (len < 6) {
         return len;
     }
+    if (getenv("ASOFT_LAT")) {
+        fprintf(stderr, "LAT report %" PRId64 " tip=%d x=%d y=%d\n", get_clock(),
+                buf[0] & 1, buf[1] | buf[2] << 8, buf[3] | buf[4] << 8);
+    }
     flags = (buf[0] & 0x01) ? 0x07 : 0x04;  /* Tip|InRange|Valid, or Valid */
     if (!(us->ts_variant & TS_VARIANT_CONTACT)) {
         buf[0] = flags;

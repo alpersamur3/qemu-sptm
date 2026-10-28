@@ -161,11 +161,29 @@ static void hid_pointer_event(DeviceState *dev, QemuConsole *src,
 
 }
 
+/* ASOFT_LAT=1: host-clock stamps for input-to-frame latency (lat-report.py) */
+static bool hid_lat_on(void)
+{
+    static int on = -1;
+
+    if (on < 0) {
+        on = getenv("ASOFT_LAT") != NULL;
+    }
+    return on;
+}
+
 static void hid_pointer_sync(DeviceState *dev)
 {
     HIDState *hs = (HIDState *)dev;
     HIDPointerEvent *prev, *curr, *next;
     bool event_compression = false;
+
+    if (hid_lat_on()) {
+        HIDPointerEvent *c = &hs->ptr.queue[(hs->head + hs->n) & QUEUE_MASK];
+
+        fprintf(stderr, "LAT in %" PRId64 " btn=%d x=%d y=%d\n", get_clock(),
+                c->buttons_state & 1, c->xdx, c->ydy);
+    }
 
     if (hs->n == QUEUE_LENGTH-1) {
         /*
