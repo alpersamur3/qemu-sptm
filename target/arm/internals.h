@@ -1475,6 +1475,9 @@ typedef struct ARMVAParameters {
  * @el1_is_aa32: true if we are asking about stage 2 when EL1 is AArch32
  *  (ignored if @mmu_idx is for a stage 1 regime; only affects tsz/tsz_oob)
  */
+/* Counter registers without ARM_CP_IO when there is no icount. */
+void arm_cpu_counter_nobql(ARMCPU *cpu);
+
 ARMVAParameters aa64_va_parameters(CPUARMState *env, uint64_t va,
                                    ARMMMUIdx mmu_idx, bool data,
                                    bool el1_is_aa32);

@@ -336,6 +336,52 @@ static void tlbi_aa64_vmalle1_write(CPUARMState *env, const ARMCPRegInfo *ri,
     }
 }
 
+/*
+ * TLBI ASIDE1*: only non-global entries carry an ASID. With x-keep-kernel-tlb
+ * the guest (XNU) has nothing but global mappings in the upper half, so the
+ * EL1 regimes keep their upper half; EL0 and the rest are flushed as before.
+ */
+static bool aside1_keep_upper(CPUARMState *env, int mask,
+                              MMUIdxMap *full, MMUIdxMap *lower)
+{
+    if (!env_archcpu(env)->keep_kernel_tlb) {
+        return false;
+    }
+    *lower = mask & (ARMMMUIdxBit_E10_1 | ARMMMUIdxBit_E10_1_PAN);
+    *full = mask & ~*lower;
+    return true;
+}
+
+static void tlbi_aa64_aside1is_write(CPUARMState *env, const ARMCPRegInfo *ri,
+                                     uint64_t value)
+{
+    CPUState *cs = env_cpu(env);
+    int mask = vae1_tlbmask(env);
+    MMUIdxMap full, lower;
+
+    if (aside1_keep_upper(env, mask, &full, &lower)) {
+        tlb_flush_keep_upper_all_cpus_synced(cs, full, lower);
+    } else {
+        tlb_flush_by_mmuidx_all_cpus_synced(cs, mask);
+    }
+}
+
+static void tlbi_aa64_aside1_write(CPUARMState *env, const ARMCPRegInfo *ri,
+                                   uint64_t value)
+{
+    CPUState *cs = env_cpu(env);
+    int mask = vae1_tlbmask(env);
+    MMUIdxMap full, lower;
+
+    if (!aside1_keep_upper(env, mask, &full, &lower)) {
+        tlbi_aa64_vmalle1_write(env, ri, value);
+    } else if (tlb_force_broadcast(env)) {
+        tlb_flush_keep_upper_all_cpus_synced(cs, full, lower);
+    } else {
+        tlb_flush_keep_upper(cs, full, lower);
+    }
+}
+
 static int e2_tlbmask(CPUARMState *env)
 {
     return (ARMMMUIdxBit_E20_0 |
@@ -648,7 +694,7 @@ static const ARMCPRegInfo tlbi_v8_cp_reginfo[] = {
       .access = PL1_W, .accessfn = access_ttlbis,
       .type = ARM_CP_NO_RAW | ARM_CP_ADD_TLBI_NXS,
       .fgt = FGT_TLBIASIDE1IS,
-      .writefn = tlbi_aa64_vmalle1is_write },
+      .writefn = tlbi_aa64_aside1is_write },
     { .name = "TLBI_VAAE1IS", .state = ARM_CP_STATE_AA64,
       .opc0 = 1, .opc1 = 0, .crn = 8, .crm = 3, .opc2 = 3,
       .access = PL1_W, .accessfn = access_ttlbis,
@@ -684,7 +730,7 @@ static const ARMCPRegInfo tlbi_v8_cp_reginfo[] = {
       .access = PL1_W, .accessfn = access_ttlb,
       .type = ARM_CP_NO_RAW | ARM_CP_ADD_TLBI_NXS,
       .fgt = FGT_TLBIASIDE1,
-      .writefn = tlbi_aa64_vmalle1_write },
+      .writefn = tlbi_aa64_aside1_write },
     { .name = "TLBI_VAAE1", .state = ARM_CP_STATE_AA64,
       .opc0 = 1, .opc1 = 0, .crn = 8, .crm = 7, .opc2 = 3,
       .access = PL1_W, .accessfn = access_ttlb,
@@ -1174,7 +1220,7 @@ static const ARMCPRegInfo tlbios_reginfo[] = {
       .access = PL1_W, .accessfn = access_ttlbos,
       .type = ARM_CP_NO_RAW | ARM_CP_ADD_TLBI_NXS,
       .fgt = FGT_TLBIASIDE1OS,
-      .writefn = tlbi_aa64_vmalle1is_write },
+      .writefn = tlbi_aa64_aside1is_write },
     { .name = "TLBI_VAAE1OS", .state = ARM_CP_STATE_AA64,
       .opc0 = 1, .opc1 = 0, .crn = 8, .crm = 1, .opc2 = 3,
       .access = PL1_W, .accessfn = access_ttlbos,

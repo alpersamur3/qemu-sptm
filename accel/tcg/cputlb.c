@@ -436,6 +436,87 @@ void tlb_flush_all_cpus_synced(CPUState *src_cpu)
     tlb_flush_by_mmuidx_all_cpus_synced(src_cpu, ALL_MMUIDX_BITS);
 }
 
+/* Any of the entry's pages, read, write or code, in the lower half. */
+static bool tlb_entry_in_lower_half(CPUTLBEntry *te)
+{
+    uint64_t a[3] = { te->addr_read, tlb_addr_write(te), te->addr_code };
+
+    for (int i = 0; i < 3; i++) {
+        if (a[i] != -1 && !(a[i] & TLB_INVALID_MASK)) {
+            return !(a[i] >> 63);
+        }
+    }
+    return false;
+}
+
+/* Called with tlb_c.lock held */
+static void tlb_flush_lower_half_locked(CPUState *cpu, int mmu_idx)
+{
+    CPUTLBDesc *desc = &cpu->neg.tlb.d[mmu_idx];
+    CPUTLBDescFast *fast = cpu_tlb_fast(cpu, mmu_idx);
+    size_t n = tlb_n_entries(fast);
+
+    for (size_t i = 0; i < n; i++) {
+        if (tlb_entry_in_lower_half(&fast->table[i])) {
+            memset(&fast->table[i], -1, sizeof(CPUTLBEntry));
+            tlb_n_used_entries_dec(cpu, mmu_idx);
+        }
+    }
+    for (int k = 0; k < CPU_VTLB_SIZE; k++) {
+        if (tlb_entry_in_lower_half(&desc->vtable[k])) {
+            memset(&desc->vtable[k], -1, sizeof(CPUTLBEntry));
+            tlb_n_used_entries_dec(cpu, mmu_idx);
+        }
+    }
+}
+
+static void tlb_flush_keep_upper_async_work(CPUState *cpu, run_on_cpu_data data)
+{
+    MMUIdxMap full = data.host_int & 0xffff;
+    MMUIdxMap lower = (data.host_int >> 16) & 0xffff;
+    MMUIdxMap dirty, work;
+    CPUJumpCache *jc = cpu->tb_jmp_cache;
+    int64_t now = get_clock_realtime();
+
+    assert_cpu_is_self(cpu);
+
+    qemu_spin_lock(&cpu->neg.tlb.c.lock);
+    dirty = cpu->neg.tlb.c.dirty;
+    for (work = full & dirty; work != 0; work &= work - 1) {
+        tlb_flush_one_mmuidx_locked(cpu, ctz32(work), now);
+    }
+    for (work = lower & ~full & dirty; work != 0; work &= work - 1) {
+        tlb_flush_lower_half_locked(cpu, ctz32(work));
+    }
+    cpu->neg.tlb.c.dirty = dirty & ~full;
+    qemu_spin_unlock(&cpu->neg.tlb.c.lock);
+
+    if (jc) {
+        for (int i = 0; i < TB_JMP_CACHE_SIZE; i++) {
+            if (!(jc->array[i].pc >> 63)) {
+                qatomic_set(&jc->array[i].tb, NULL);
+            }
+        }
+    }
+    qatomic_set(&cpu->neg.tlb.c.part_flush_count,
+                cpu->neg.tlb.c.part_flush_count + ctpop16(full & dirty));
+}
+
+void tlb_flush_keep_upper(CPUState *cpu, MMUIdxMap full, MMUIdxMap lower)
+{
+    tlb_flush_keep_upper_async_work(cpu, RUN_ON_CPU_HOST_INT(full | lower << 16));
+}
+
+void tlb_flush_keep_upper_all_cpus_synced(CPUState *src_cpu, MMUIdxMap full,
+                                          MMUIdxMap lower)
+{
+    const run_on_cpu_func fn = tlb_flush_keep_upper_async_work;
+    run_on_cpu_data d = RUN_ON_CPU_HOST_INT(full | lower << 16);
+
+    flush_all_helper(src_cpu, fn, d);
+    async_safe_run_on_cpu(src_cpu, fn, d);
+}
+
 static bool tlb_hit_page_mask_anyprot(CPUTLBEntry *tlb_entry,
                                       vaddr page, vaddr mask)
 {

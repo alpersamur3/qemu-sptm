@@ -1336,6 +1336,15 @@ static const Property arm_cpu_has_el3_property =
 
 static const Property arm_cpu_has_gcie_property =
             DEFINE_PROP_BOOL("has_gcie", ARMCPU, has_gcie, false);
+
+static const Property arm_cpu_keep_kernel_tlb_property =
+            DEFINE_PROP_BOOL("x-keep-kernel-tlb", ARMCPU, keep_kernel_tlb, false);
+
+static const Property arm_cpu_va_param_cache_property =
+            DEFINE_PROP_BOOL("x-va-param-cache", ARMCPU, va_param_cache, false);
+
+static const Property arm_cpu_counter_nobql_property =
+            DEFINE_PROP_BOOL("x-counter-nobql", ARMCPU, counter_nobql, false);
 #endif
 
 static const Property arm_cpu_cfgend_property =
@@ -1730,6 +1739,11 @@ static void arm_cpu_post_init(Object *obj)
                                      qdev_prop_allow_set_link_before_realize,
                                      OBJ_PROP_LINK_STRONG);
         }
+    }
+    if (arm_feature(&cpu->env, ARM_FEATURE_AARCH64)) {
+        qdev_property_add_static(DEVICE(obj), &arm_cpu_keep_kernel_tlb_property);
+        qdev_property_add_static(DEVICE(obj), &arm_cpu_va_param_cache_property);
+        qdev_property_add_static(DEVICE(obj), &arm_cpu_counter_nobql_property);
     }
 #endif
     qdev_property_add_static(DEVICE(obj), &arm_cpu_cfgend_property);
@@ -2412,6 +2426,11 @@ static void arm_cpu_realizefn(DeviceState *dev, Error **errp)
 #endif
 
     register_cp_regs_for_features(cpu);
+#ifndef CONFIG_USER_ONLY
+    if (cpu->counter_nobql) {
+        arm_cpu_counter_nobql(cpu);
+    }
+#endif
     arm_cpu_register_gdb_regs_for_features(cpu);
     arm_cpu_register_gdb_commands(cpu);
 

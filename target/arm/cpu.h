@@ -835,6 +835,17 @@ typedef struct CPUArchState {
     uint64_t afsr1_gl[4];
     uint64_t currentg;
 
+    /*
+     * aa64_va_parameters() results (ARMCPU.va_param_cache), valid while
+     * their gen equals va_param_gen, which every hflags rebuild advances.
+     */
+    uint32_t va_param_gen;
+    struct {
+        uint32_t gen;
+        uint32_t key;
+        uint64_t val[2];
+    } va_param[16];
+
 #if !defined(CONFIG_USER_ONLY)
     NVICState *nvic;
     const struct arm_boot_info *boot_info;
@@ -1153,6 +1164,11 @@ struct ArchCPU {
     bool prop_pauth_qarma3;
     bool prop_pauth_qarma5;
     bool prop_lpa2;
+
+    /* TCG speed-ups for the vresearch guest (x-* properties, off by default) */
+    bool keep_kernel_tlb;   /* ASID changes and TLBI ASIDE1 keep the upper half */
+    bool va_param_cache;    /* aa64_va_parameters() kept between hflags rebuilds */
+    bool counter_nobql;     /* counter reads without the BQL or a TB end */
 
     /* GM blocksize, in log_2(words), ie low 4 bits of GMID_EL0 */
     uint8_t gm_blocksize;

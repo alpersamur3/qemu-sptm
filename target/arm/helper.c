@@ -1581,6 +1581,27 @@ static uint64_t gt_virt_cnt_read(CPUARMState *env, const ARMCPRegInfo *ri)
     return gt_get_countervalue(env) - offset;
 }
 
+static void counter_nobql_one(gpointer key, gpointer value, gpointer opaque)
+{
+    ARMCPRegInfo *ri = value;
+
+    if (ri->readfn == gt_cnt_read || ri->readfn == gt_virt_cnt_read) {
+        ri->type &= ~ARM_CP_IO;
+    }
+}
+
+/*
+ * Without icount the counters read QEMU_CLOCK_VIRTUAL through its seqlock
+ * and the CPU's own offsets, so a read needs neither the BQL nor to end the
+ * TB (x-counter-nobql). The guest reads them for every mach_absolute_time().
+ */
+void arm_cpu_counter_nobql(ARMCPU *cpu)
+{
+    if (!icount_enabled()) {
+        g_hash_table_foreach(cpu->cp_regs, counter_nobql_one, NULL);
+    }
+}
+
 static void gt_cval_write(CPUARMState *env, const ARMCPRegInfo *ri,
                           int timeridx,
                           uint64_t value)
@@ -2870,7 +2891,19 @@ static void vmsa_ttbr_write(CPUARMState *env, const ARMCPRegInfo *ri,
     if (cpreg_field_type(ri) == MO_64 &&
         extract64(raw_read(env, ri) ^ value, 48, 16) != 0) {
         ARMCPU *cpu = env_archcpu(env);
-        tlb_flush(CPU(cpu));
+
+        if (cpu->keep_kernel_tlb) {
+            /*
+             * Only non-global entries belong to an ASID, and the guest
+             * (XNU) maps nothing but global ones in the upper half: keep
+             * the EL1 entries and jump cache entries up there.
+             */
+            MMUIdxMap kern = ARMMMUIdxBit_E10_1 | ARMMMUIdxBit_E10_1_PAN;
+
+            tlb_flush_keep_upper(CPU(cpu), (MMUIdxMap)~kern, kern);
+        } else {
+            tlb_flush(CPU(cpu));
+        }
     }
     raw_write(env, ri, value);
 }
@@ -9915,9 +9948,46 @@ static ARMGranuleSize sanitize_gran_size(ARMCPU *cpu, ARMGranuleSize gran,
     return Gran64K;
 }
 
+static ARMVAParameters aa64_va_parameters_compute(CPUARMState *env,
+                                                  uint64_t va,
+                                                  ARMMMUIdx mmu_idx, bool data,
+                                                  bool el1_is_aa32);
+
+/*
+ * The result depends on va<55> and on state that changes only together
+ * with an hflags rebuild (TCR, TCR2, HCR, HCRX, SCR, the SPRR config, the
+ * regime), so with x-va-param-cache it is kept until the next rebuild.
+ */
 ARMVAParameters aa64_va_parameters(CPUARMState *env, uint64_t va,
                                    ARMMMUIdx mmu_idx, bool data,
                                    bool el1_is_aa32)
+{
+    ARMVAParameters p;
+    uint32_t key, slot;
+
+    QEMU_BUILD_BUG_ON(sizeof(ARMVAParameters) > sizeof(env->va_param[0].val));
+    if (!env_archcpu(env)->va_param_cache) {
+        return aa64_va_parameters_compute(env, va, mmu_idx, data, el1_is_aa32);
+    }
+    key = (((uint32_t)mmu_idx & 0xff) << 3 | extract64(va, 55, 1) << 2 |
+           data << 1 | el1_is_aa32) + 1;
+    slot = (key ^ (key >> 4) ^ (key >> 8)) & (ARRAY_SIZE(env->va_param) - 1);
+    if (env->va_param[slot].key == key &&
+        env->va_param[slot].gen == env->va_param_gen) {
+        memcpy(&p, env->va_param[slot].val, sizeof(p));
+        return p;
+    }
+    p = aa64_va_parameters_compute(env, va, mmu_idx, data, el1_is_aa32);
+    memcpy(env->va_param[slot].val, &p, sizeof(p));
+    env->va_param[slot].key = key;
+    env->va_param[slot].gen = env->va_param_gen;
+    return p;
+}
+
+static ARMVAParameters aa64_va_parameters_compute(CPUARMState *env,
+                                                  uint64_t va,
+                                                  ARMMMUIdx mmu_idx, bool data,
+                                                  bool el1_is_aa32)
 {
     uint64_t tcr = regime_tcr(env, mmu_idx);
     bool epd, hpd, tsz_oob, ds, ha, hd, pie = false;

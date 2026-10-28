@@ -580,6 +580,7 @@ static CPUARMTBFlags rebuild_hflags_internal(CPUARMState *env)
 void arm_rebuild_hflags(CPUARMState *env)
 {
     env->hflags = rebuild_hflags_internal(env);
+    env->va_param_gen++;
 }
 
 /*
@@ -593,6 +594,7 @@ void HELPER(rebuild_hflags_m32_newel)(CPUARMState *env)
     ARMMMUIdx mmu_idx = arm_mmu_idx_el(env, el);
 
     env->hflags = rebuild_hflags_m32(env, fp_el, mmu_idx);
+    env->va_param_gen++;
 }
 
 void HELPER(rebuild_hflags_m32)(CPUARMState *env, int el)
@@ -601,6 +603,7 @@ void HELPER(rebuild_hflags_m32)(CPUARMState *env, int el)
     ARMMMUIdx mmu_idx = arm_mmu_idx_el(env, el);
 
     env->hflags = rebuild_hflags_m32(env, fp_el, mmu_idx);
+    env->va_param_gen++;
 }
 
 /*
@@ -613,6 +616,7 @@ void HELPER(rebuild_hflags_a32_newel)(CPUARMState *env)
     int fp_el = fp_exception_el(env, el);
     ARMMMUIdx mmu_idx = arm_mmu_idx_el(env, el);
     env->hflags = rebuild_hflags_a32(env, fp_el, mmu_idx);
+    env->va_param_gen++;
 }
 
 void HELPER(rebuild_hflags_a32)(CPUARMState *env, int el)
@@ -621,6 +625,7 @@ void HELPER(rebuild_hflags_a32)(CPUARMState *env, int el)
     ARMMMUIdx mmu_idx = arm_mmu_idx_el(env, el);
 
     env->hflags = rebuild_hflags_a32(env, fp_el, mmu_idx);
+    env->va_param_gen++;
 }
 
 void HELPER(rebuild_hflags_a64)(CPUARMState *env, int el)
@@ -629,6 +634,7 @@ void HELPER(rebuild_hflags_a64)(CPUARMState *env, int el)
     ARMMMUIdx mmu_idx = arm_mmu_idx_el(env, el);
 
     env->hflags = rebuild_hflags_a64(env, el, fp_el, mmu_idx);
+    env->va_param_gen++;
 }
 
 static void assert_hflags_rebuild_correctly(CPUARMState *env)

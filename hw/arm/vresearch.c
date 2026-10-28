@@ -858,6 +858,16 @@ static GlobalProperty vresearch_compat_defaults[] = {
     { TYPE_VIRTIO_PCI, "disable-legacy", "on" },
     /* no option ROM: nothing would run it, and a Windows build may not ship efi-virtio.rom */
     { "virtio-net-pci", "romfile", "" },
+    /*
+     * TCG speed-ups for the XNU guest, each with -cpu ...,x-NAME=off to undo:
+     * keep the kernel's (global, upper-half) TLB and jump cache entries across
+     * ASID switches, cache aa64_va_parameters(), read the counters without the
+     * BQL. Measured with them and tb-size=2048: lock screen 130 s, 160-177 s
+     * without.
+     */
+    { TYPE_ARM_CPU, "x-keep-kernel-tlb", "on" },
+    { TYPE_ARM_CPU, "x-va-param-cache", "on" },
+    { TYPE_ARM_CPU, "x-counter-nobql", "on" },
 };
 
 static void vresearch_machine_class_init(ObjectClass *oc, const void *data)
