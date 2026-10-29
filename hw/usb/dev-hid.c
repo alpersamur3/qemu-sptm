@@ -36,6 +36,7 @@
 #include "hw/usb/hid.h"
 #include "hw/core/qdev-properties.h"
 #include "qom/object.h"
+#include "trace.h"
 
 struct USBHIDState {
     USBDevice dev;
@@ -1162,16 +1163,25 @@ static const TypeInfo usb_keyboard_info = {
  * The vphone600 lock screen ("Press home to open") unlocks on a Consumer
  * Home (0x0C:0x40) press; no touch gesture dismisses it. Trigger a press from
  * the monitor:  qom-set /machine/peripheral/<id> press home   (also power,
- * volup, voldown). The button auto-releases after hold-ms (default 100).
+ * volup, voldown). The button auto-releases hold-ms (default 100) after the
+ * guest read it down. "down" and "up" instead hold a button until released.
+ * Each change of the buttons is queued until the guest reads it: a press and
+ * its release both made before the guest's next poll reach it as two reports
+ * (sent as the current state alone, the press would be lost).
  * ======================================================================= */
+
+#define USB_CONSUMER_QUEUE 16
 
 struct USBConsumerState {
     USBDevice dev;
     USBEndpoint *intr;
     uint32_t usb_version;
     uint32_t hold_ms;
-    uint8_t report;        /* current button bitmap */
-    bool changed;
+    uint8_t report;        /* the buttons down, as the newest queued report */
+    uint8_t queue[USB_CONSUMER_QUEUE];  /* reports the guest has not read */
+    unsigned head, count;
+    uint8_t auto_release;  /* buttons "press" holds for hold-ms */
+    uint8_t armed;         /* of those, the ones the guest has read down */
     QEMUTimer *timer;
 };
 
@@ -1274,23 +1284,41 @@ static const USBDesc desc_consumer = {
     .msos = &desc_msos_suspend,
 };
 
+/* The buttons become @report: queued for the guest, which is woken for it. */
+static void usb_consumer_set_report(USBConsumerState *us, uint8_t report)
+{
+    if (report == us->report) {
+        return;
+    }
+    us->report = report;
+    if (us->count == USB_CONSUMER_QUEUE) {
+        /* the guest reads nothing: the newest report becomes this one */
+        us->queue[(us->head + us->count - 1) % USB_CONSUMER_QUEUE] = report;
+    } else {
+        us->queue[(us->head + us->count++) % USB_CONSUMER_QUEUE] = report;
+    }
+    trace_usb_consumer_queue(report, us->count);
+    usb_wakeup(us->intr, 0);
+}
+
 static void usb_consumer_release(void *opaque)
 {
     USBConsumerState *us = opaque;
+    uint8_t release = us->armed & us->auto_release;
 
-    if (us->report != 0) {
-        us->report = 0;
-        us->changed = true;
-        usb_wakeup(us->intr, 0);
-    }
+    us->auto_release &= ~release;
+    us->armed = 0;
+    usb_consumer_set_report(us, us->report & ~release);
 }
 
 static void usb_consumer_handle_reset(USBDevice *dev)
 {
     USBConsumerState *us = USB_CONSUMER(dev);
 
+    timer_del(us->timer);
     us->report = 0;
-    us->changed = false;
+    us->head = us->count = 0;
+    us->auto_release = us->armed = 0;
 }
 
 static void usb_consumer_handle_control(USBDevice *dev, USBPacket *p,
@@ -1337,40 +1365,74 @@ static void usb_consumer_handle_data(USBDevice *dev, USBPacket *p)
     uint8_t buf[1];
 
     if (p->pid == USB_TOKEN_IN && p->ep->nr == 1) {
-        if (!us->changed) {
+        if (!us->count) {
             p->status = USB_RET_NAK;
             return;
         }
-        us->changed = false;
-        buf[0] = us->report;
+        buf[0] = us->queue[us->head];
+        us->head = (us->head + 1) % USB_CONSUMER_QUEUE;
+        us->count--;
         usb_packet_copy(p, buf, 1);
+        trace_usb_consumer_read(buf[0], us->count);
+        /* a press's hold counts from the guest's read of it */
+        if (buf[0] & us->auto_release & ~us->armed) {
+            us->armed |= buf[0] & us->auto_release;
+            timer_mod(us->timer,
+                      qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + us->hold_ms);
+        }
     } else {
         p->status = USB_RET_STALL;
     }
 }
 
+static uint8_t usb_consumer_bit(const char *value, Error **errp)
+{
+    if (!strcmp(value, "home") || !strcmp(value, "menu")) {
+        return 0x01;
+    } else if (!strcmp(value, "power")) {
+        return 0x02;
+    } else if (!strcmp(value, "volup")) {
+        return 0x04;
+    } else if (!strcmp(value, "voldown")) {
+        return 0x08;
+    }
+    error_setg(errp, "usb-consumer: unknown button '%s' "
+               "(home|power|volup|voldown)", value);
+    return 0;
+}
+
+/* press: down, then up hold-ms after the guest read it down */
 static void usb_consumer_set_press(Object *obj, const char *value, Error **errp)
 {
     USBConsumerState *us = USB_CONSUMER(obj);
-    uint8_t bit;
+    uint8_t bit = usb_consumer_bit(value, errp);
 
-    if (!strcmp(value, "home") || !strcmp(value, "menu")) {
-        bit = 0x01;
-    } else if (!strcmp(value, "power")) {
-        bit = 0x02;
-    } else if (!strcmp(value, "volup")) {
-        bit = 0x04;
-    } else if (!strcmp(value, "voldown")) {
-        bit = 0x08;
-    } else {
-        error_setg(errp, "usb-consumer: unknown button '%s' "
-                   "(home|power|volup|voldown)", value);
-        return;
+    if (bit && !(us->report & bit)) {
+        us->auto_release |= bit;
+        us->armed &= ~bit;
+        usb_consumer_set_report(us, us->report | bit);
     }
-    us->report |= bit;
-    us->changed = true;
-    usb_wakeup(us->intr, 0);
-    timer_mod(us->timer, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + us->hold_ms);
+}
+
+/* down / up: a button held until it is released */
+static void usb_consumer_set_down(Object *obj, const char *value, Error **errp)
+{
+    USBConsumerState *us = USB_CONSUMER(obj);
+    uint8_t bit = usb_consumer_bit(value, errp);
+
+    us->auto_release &= ~bit;
+    us->armed &= ~bit;
+    usb_consumer_set_report(us, us->report | bit);
+}
+
+static void usb_consumer_set_up(Object *obj, const char *value, Error **errp)
+{
+    USBConsumerState *us = USB_CONSUMER(obj);
+    uint8_t bit = usb_consumer_bit(value, errp);
+
+    us->auto_release &= ~bit;
+    us->armed &= ~bit;
+    usb_consumer_set_report(us, us->report & ~bit);
 }
 
 static char *usb_consumer_get_press(Object *obj, Error **errp)
@@ -1387,11 +1449,16 @@ static void usb_consumer_realize(USBDevice *dev, Error **errp)
     usb_desc_init(dev);
     us->intr = usb_ep_get(dev, USB_TOKEN_IN, 1);
     us->report = 0;
-    us->changed = false;
+    us->head = us->count = 0;
+    us->auto_release = us->armed = 0;
     us->timer = timer_new_ms(QEMU_CLOCK_VIRTUAL, usb_consumer_release, us);
 
     object_property_add_str(OBJECT(dev), "press",
                             usb_consumer_get_press, usb_consumer_set_press);
+    object_property_add_str(OBJECT(dev), "down",
+                            usb_consumer_get_press, usb_consumer_set_down);
+    object_property_add_str(OBJECT(dev), "up",
+                            usb_consumer_get_press, usb_consumer_set_up);
 }
 
 static void usb_consumer_unrealize(USBDevice *dev)

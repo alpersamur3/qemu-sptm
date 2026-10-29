@@ -147,6 +147,10 @@ usb_uhci_td_nextqh(uint32_t qh, uint32_t td) "qh 0x%x, td 0x%x"
 usb_uhci_td_async(uint32_t qh, uint32_t td) "qh 0x%x, td 0x%x"
 usb_uhci_td_complete(uint32_t qh, uint32_t td) "qh 0x%x, td 0x%x"
 
+# dev-hid.c
+usb_consumer_queue(uint8_t report, unsigned queued) "buttons 0x%x, %u report(s) for the guest"
+usb_consumer_read(uint8_t report, unsigned queued) "guest read buttons 0x%x, %u left"
+
 # hcd-xhci.c
 usb_xhci_reset(void) "=== RESET ==="
 usb_xhci_exit(void) "=== EXIT ==="
