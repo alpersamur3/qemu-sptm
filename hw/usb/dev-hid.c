@@ -49,6 +49,12 @@ struct USBHIDState {
     uint32_t ts_variant;  /* usb-touchscreen: TS_VARIANT_* bits */
     uint8_t ts_desc[96];  /* usb-touchscreen: report descriptor built for ts_variant */
     int ts_desc_len;
+    /*
+     * usb-kbd: repeat the report at the guest's idle rate (SET_IDLE), as the
+     * HID spec has it. iOS 26 asks for one every 16 ms, and its HID driver
+     * and event system then handle ~60 unchanged keyboard reports a second.
+     */
+    bool idle_reports;
 };
 
 /* usb-touchscreen report layout variants (the "variant" property, a bitmask) */
@@ -897,7 +903,11 @@ static void usb_hid_handle_control(USBDevice *dev, USBPacket *p,
         p->actual_length = 1;
         break;
     case HID_SET_IDLE:
+        trace_usb_hid_set_idle(hs->kind, value >> 8);
         hs->idle = (uint8_t) (value >> 8);
+        if (hs->kind == HID_KEYBOARD && !us->idle_reports) {
+            hs->idle = 0;
+        }
         hid_set_next_idle(hs);
         if (hs->kind == HID_MOUSE || hs->kind == HID_TABLET) {
             hid_pointer_activate(hs);
@@ -1138,6 +1148,7 @@ static const TypeInfo usb_mouse_info = {
 static const Property usb_keyboard_properties[] = {
         DEFINE_PROP_UINT32("usb_version", USBHIDState, usb_version, 2),
         DEFINE_PROP_STRING("display", USBHIDState, display),
+        DEFINE_PROP_BOOL("idle-reports", USBHIDState, idle_reports, true),
 };
 
 static void usb_keyboard_class_initfn(ObjectClass *klass, const void *data)
