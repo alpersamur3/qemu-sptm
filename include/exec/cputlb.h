@@ -195,15 +195,20 @@ void tlb_flush_by_mmuidx_all_cpus_synced(CPUState *cpu, MMUIdxMap idxmap);
  * @lower: bitmap of MMU indexes of which to flush only the lower half of the
  *         64-bit address space (virtual bit 63 clear)
  *
+ * @drop_tag: the address space (ASID) whose lower-half jump cache entries
+ *            go as well, or -1 (an address space switch keeps them: the
+ *            jump cache follows the ASID, tb_jmp_cache_switch())
+ *
  * For a target whose upper half holds only global mappings: an address
  * space switch or a flush by ASID then keeps the upper half's TLB entries
  * and jump cache entries, and drops every other.
  */
-void tlb_flush_keep_upper(CPUState *cpu, MMUIdxMap full, MMUIdxMap lower);
+void tlb_flush_keep_upper(CPUState *cpu, MMUIdxMap full, MMUIdxMap lower,
+                          int drop_tag);
 
 /* Similarly, with broadcast and syncing. */
 void tlb_flush_keep_upper_all_cpus_synced(CPUState *cpu, MMUIdxMap full,
-                                          MMUIdxMap lower);
+                                          MMUIdxMap lower, int drop_tag);
 
 /**
  * tlb_flush_page_bits_by_mmuidx
@@ -265,12 +270,13 @@ static inline void tlb_flush_by_mmuidx(CPUState *cpu, MMUIdxMap idxmap)
 {
 }
 static inline void tlb_flush_keep_upper(CPUState *cpu, MMUIdxMap full,
-                                        MMUIdxMap lower)
+                                        MMUIdxMap lower, int drop_tag)
 {
 }
 static inline void tlb_flush_keep_upper_all_cpus_synced(CPUState *cpu,
                                                         MMUIdxMap full,
-                                                        MMUIdxMap lower)
+                                                        MMUIdxMap lower,
+                                                        int drop_tag)
 {
 }
 static inline void tlb_flush_page_by_mmuidx_all_cpus_synced(CPUState *cpu,

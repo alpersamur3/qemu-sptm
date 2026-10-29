@@ -846,6 +846,12 @@ typedef struct CPUArchState {
         uint64_t val[2];
     } va_param[16];
 
+    /* arm_hcr_el2_eff() result (ARMCPU.hcr_cache), keyed on HCR_EL2 and SCR_EL3 */
+    struct {
+        uint64_t hcr, scr, eff;
+        bool valid;
+    } hcr_eff;
+
 #if !defined(CONFIG_USER_ONLY)
     NVICState *nvic;
     const struct arm_boot_info *boot_info;
@@ -1169,6 +1175,9 @@ struct ArchCPU {
     bool keep_kernel_tlb;   /* ASID changes and TLBI ASIDE1 keep the upper half */
     bool va_param_cache;    /* aa64_va_parameters() kept between hflags rebuilds */
     bool counter_nobql;     /* counter reads without the BQL or a TB end */
+    bool hcr_cache;         /* arm_hcr_el2_eff() kept; PAC helpers take the regime from hflags */
+    bool has_bti;           /* "bti": FEAT_BTI; off like Apple's cores, no guarded-page probes */
+    uint8_t page_bits;      /* "x-page-bits": softmmu page size; 14 keeps a 16K-granule guest to it */
 
     /* GM blocksize, in log_2(words), ie low 4 bits of GMID_EL0 */
     uint8_t gm_blocksize;
@@ -2238,7 +2247,31 @@ void arm_cpu_finalize_features(ARMCPU *cpu, Error **errp);
  * an exception return to those levels.  Unlike arm_security_space,
  * this doesn't care about the current EL.
  */
-ARMSecuritySpace arm_security_space_below_el3(CPUARMState *env);
+static inline ARMSecuritySpace arm_security_space_below_el3(CPUARMState *env)
+{
+    assert(!arm_feature(env, ARM_FEATURE_M));
+
+    /*
+     * If EL3 is not supported then the secure state is implementation
+     * defined, in which case QEMU defaults to non-secure.
+     */
+    if (!arm_feature(env, ARM_FEATURE_EL3)) {
+        return ARMSS_NonSecure;
+    }
+
+    /*
+     * Note NSE cannot be set without RME, and NSE & !NS is Reserved.
+     * Ignoring NSE when !NS retains consistency without having to
+     * modify other predicates.
+     */
+    if (!(env->cp15.scr_el3 & SCR_NS)) {
+        return ARMSS_Secure;
+    } else if (env->cp15.scr_el3 & SCR_NSE) {
+        return ARMSS_Realm;
+    } else {
+        return ARMSS_NonSecure;
+    }
+}
 
 /**
  * arm_is_secure_below_el3:

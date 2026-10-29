@@ -892,23 +892,34 @@ static inline void tb_jmp_unlink(TranslationBlock *dest)
     qemu_spin_unlock(&dest->jmp_lock);
 }
 
+#include "asoft-stats.h"
+
 static void tb_jmp_cache_inval_tb(TranslationBlock *tb)
 {
     CPUState *cpu;
 
     if (tb_cflags(tb) & CF_PCREL) {
-        /* A TB may be at any virtual address */
-        CPU_FOREACH(cpu) {
-            tcg_flush_jmp_cache(cpu);
-        }
+        /*
+         * A TB may be at any virtual address, so its entries can't be found
+         * cheaply.  They are left: CF_INVALID is set on the TB by now, so
+         * tb_lookup()'s cflags compare rejects them, and the TB's memory
+         * lives on until the next tb_flush, which empties every cache.
+         * (Upstream wipes every vCPU's cache here; the guest's page reuse
+         * invalidates tens of thousands of TBs per run.)
+         */
+        ASTAT_ANY(ASTAT_JC_WIPE_INVAL);
     } else {
         uint32_t h = tb_jmp_cache_hash_func(tb->pc);
 
         CPU_FOREACH(cpu) {
-            CPUJumpCache *jc = cpu->tb_jmp_cache;
+            CPUJumpArray *arr = tb_jmp_cache_array(cpu->tb_jmp_cache, tb->pc);
 
-            if (qatomic_read(&jc->array[h].tb) == tb) {
-                qatomic_set(&jc->array[h].tb, NULL);
+            for (int way = 0; way < TB_JMP_CACHE_WAYS; way++) {
+                uintptr_t word = qatomic_read(&arr->array[h + way].tb);
+
+                if ((TranslationBlock *)(word & TB_JMP_PTR_MASK) == tb) {
+                    qatomic_set(&arr->array[h + way].tb, 0);
+                }
             }
         }
     }

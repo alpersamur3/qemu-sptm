@@ -619,20 +619,114 @@ void cpu_io_recompile(CPUState *cpu, uintptr_t retaddr)
 
 #endif /* CONFIG_USER_ONLY */
 
+#include "asoft-stats.h"
+uint64_t asoft_stats[16][ASTAT_N];
+
+static void tb_jmp_array_clear(CPUJumpArray *arr)
+{
+    for (int i = 0; i < TB_JMP_CACHE_SIZE; i++) {
+        qatomic_set(&arr->array[i].tb, 0);
+    }
+}
+
+/* Empty the arrays themselves: the upper half's, the one in use, and mark the rest free. */
+void tb_jmp_cache_clear_all(CPUState *cpu)
+{
+    CPUJumpCache *jc = cpu->tb_jmp_cache;
+
+    if (unlikely(jc == NULL)) {
+        return;
+    }
+    tb_jmp_array_clear(&jc->kernel);
+    tb_jmp_array_clear(jc->cur);
+    /* the other address spaces' caches are cleared when selected again */
+    for (int i = 0; i < TB_JMP_USER_CACHES; i++) {
+        if (&jc->user[i] != jc->cur) {
+            jc->user_tag[i] = 0;
+        }
+    }
+}
+
 /*
  * Called by generic code at e.g. cpu reset after cpu creation,
  * therefore we must be prepared to allocate the jump cache.
  */
 void tcg_flush_jmp_cache(CPUState *cpu)
 {
+    tb_jmp_cache_clear_all(cpu);
+}
+
+/*
+ * The lower half's entries go, the upper half's stay: a flush of a range
+ * of user addresses (XNU: a process's region, often over 16 MB) says
+ * nothing about the kernel's mappings.
+ */
+void tb_jmp_cache_drop_users(CPUState *cpu)
+{
     CPUJumpCache *jc = cpu->tb_jmp_cache;
 
-    /* During early initialization, the cache may not yet be allocated. */
     if (unlikely(jc == NULL)) {
         return;
     }
+    tb_jmp_array_clear(jc->cur);
+    for (int i = 0; i < TB_JMP_USER_CACHES; i++) {
+        if (&jc->user[i] != jc->cur) {
+            jc->user_tag[i] = 0;
+        }
+    }
+}
 
-    for (int i = 0; i < TB_JMP_CACHE_SIZE; i++) {
-        qatomic_set(&jc->array[i].tb, NULL);
+/*
+ * Select the lower half's cache for address space @tag (the ASID). A space
+ * not seen lately takes the least recently used cache, cleared.  Called on
+ * the cpu's own thread.
+ */
+void tb_jmp_cache_switch(CPUState *cpu, uint32_t tag)
+{
+    CPUJumpCache *jc = cpu->tb_jmp_cache;
+    int i, lru = 0;
+
+    if (unlikely(jc == NULL) || jc->cur_tag == tag) {
+        return;
+    }
+    ASTAT(cpu, ASTAT_JC_SWITCH);
+    for (i = 0; i < TB_JMP_USER_CACHES; i++) {
+        if (jc->user_tag[i] == tag + 1) {
+            goto found;
+        }
+        if (jc->user_use[i] < jc->user_use[lru]) {
+            lru = i;
+        }
+    }
+    i = lru;
+    jc->user_tag[i] = tag + 1;
+    tb_jmp_array_clear(&jc->user[i]);
+    ASTAT(cpu, ASTAT_JC_SWITCH_NEW);
+found:
+    jc->user_use[i] = ++jc->use_clock;
+    jc->cur = &jc->user[i];
+    jc->cur_tag = tag;
+}
+
+/*
+ * Address space @tag's lower-half entries are stale (its TLB entries were
+ * invalidated by ASID): drop its cache.  Called on the cpu's own thread.
+ */
+void tb_jmp_cache_drop(CPUState *cpu, uint32_t tag)
+{
+    CPUJumpCache *jc = cpu->tb_jmp_cache;
+
+    if (unlikely(jc == NULL)) {
+        return;
+    }
+    ASTAT(cpu, ASTAT_JC_WIPE_LOWER);
+    for (int i = 0; i < TB_JMP_USER_CACHES; i++) {
+        if (jc->user_tag[i] == tag + 1) {
+            if (&jc->user[i] == jc->cur) {
+                tb_jmp_array_clear(&jc->user[i]);
+            } else {
+                jc->user_tag[i] = 0;
+            }
+        }
     }
 }

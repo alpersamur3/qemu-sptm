@@ -20,6 +20,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "exec/target_page.h"
 #include "qapi/error.h"
 #include "qemu/error-report.h"
 #include "qemu/log.h"
@@ -803,6 +804,10 @@ static void vresearch_init(MachineState *ms)
         if (object_property_find(cpuobj, "has_el2")) {
             object_property_set_bool(cpuobj, "has_el2", false, &error_fatal);
         }
+        if (TARGET_PAGE_BITS == 14) {
+            /* ASOFT_PAGE_BITS=14 (class_init): the cpu keeps the guest to 16K too */
+            object_property_set_uint(cpuobj, "x-page-bits", 14, &error_fatal);
+        }
         object_property_set_int(cpuobj, "psci-conduit", QEMU_PSCI_CONDUIT_HVC,
                                 &error_fatal);
         /* vphone600ap cpuN has reg=N and no cluster node, so Aff0 = index */
@@ -868,6 +873,9 @@ static GlobalProperty vresearch_compat_defaults[] = {
     { TYPE_ARM_CPU, "x-keep-kernel-tlb", "on" },
     { TYPE_ARM_CPU, "x-va-param-cache", "on" },
     { TYPE_ARM_CPU, "x-counter-nobql", "on" },
+    { TYPE_ARM_CPU, "x-hcr-cache", "on" },
+    /* Apple's cores have no FEAT_BTI; with it, TCG probes the page on every br */
+    { TYPE_ARM_CPU, "bti", "off" },
 };
 
 static void vresearch_machine_class_init(ObjectClass *oc, const void *data)
@@ -881,7 +889,13 @@ static void vresearch_machine_class_init(ObjectClass *oc, const void *data)
     mc->block_default_type = IF_VIRTIO;
     mc->no_cdrom = 1;
     mc->pci_allow_0_address = true;
-    mc->minimum_page_bits = 12;
+    /*
+     * ASOFT_PAGE_BITS=14: 16K softmmu pages, so a guest that only uses the
+     * 16K granule (XNU) costs one TLB entry and one page walk per page
+     * instead of four. The size is decided before the machine's options
+     * are read (vl.c, qemu_create_machine), hence the environment.
+     */
+    mc->minimum_page_bits = getenv("ASOFT_PAGE_BITS") ? atoi(getenv("ASOFT_PAGE_BITS")) : 12;
 
     compat_props_add(mc->compat_props, vresearch_compat_defaults,
                      G_N_ELEMENTS(vresearch_compat_defaults));

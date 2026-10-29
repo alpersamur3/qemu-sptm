@@ -327,11 +327,45 @@ static uint64_t pauth_computepac(CPUARMState *env, uint64_t data,
     }
 }
 
+/*
+ * The current translation regime and, for EL0, the SCTLR that governs it.
+ * With x-hcr-cache they come from the hflags the TB was built with (the same
+ * arm_mmu_idx_el() result; a register write that changes it ends the TB and
+ * rebuilds them) instead of being derived from HCR_EL2 and SCR_EL3 again on
+ * every PAC instruction.
+ */
+static ARMMMUIdx pauth_mmu_idx(CPUARMState *env)
+{
+    if (env_archcpu(env)->hcr_cache) {
+        return core_to_arm_mmu_idx(env, arm_env_mmu_index(env));
+    }
+    return arm_mmu_idx(env);
+}
+
+static uint64_t pauth_sctlr(CPUARMState *env, int el)
+{
+    if (el == 0 && env_archcpu(env)->hcr_cache) {
+        switch (pauth_mmu_idx(env)) {
+        case ARMMMUIdx_E20_0:
+            el = 2;
+            break;
+        case ARMMMUIdx_E30_0:
+            el = 3;
+            break;
+        default:
+            el = 1;
+            break;
+        }
+        return env->cp15.sctlr_el[el];
+    }
+    return arm_sctlr(env, el);
+}
+
 static uint64_t pauth_addpac(CPUARMState *env, uint64_t ptr, uint64_t modifier,
                              ARMPACKey *key, bool data)
 {
     ARMCPU *cpu = env_archcpu(env);
-    ARMMMUIdx mmu_idx = arm_stage1_mmu_idx(env);
+    ARMMMUIdx mmu_idx = stage_1_mmu_idx(pauth_mmu_idx(env));
     ARMVAParameters param = aa64_va_parameters(env, ptr, mmu_idx, data, false);
     ARMPauthFeature pauth_feature = cpu_isar_feature(pauth_feature, cpu);
     uint64_t pac, ext_ptr, ext, test;
@@ -429,7 +463,7 @@ static uint64_t pauth_auth(CPUARMState *env, uint64_t ptr, uint64_t modifier,
                            uintptr_t ra, bool is_combined)
 {
     ARMCPU *cpu = env_archcpu(env);
-    ARMMMUIdx mmu_idx = arm_stage1_mmu_idx(env);
+    ARMMMUIdx mmu_idx = stage_1_mmu_idx(pauth_mmu_idx(env));
     ARMVAParameters param = aa64_va_parameters(env, ptr, mmu_idx, data, false);
     ARMPauthFeature pauth_feature = cpu_isar_feature(pauth_feature, cpu);
     int bot_bit, top_bit;
@@ -476,7 +510,7 @@ static uint64_t pauth_auth(CPUARMState *env, uint64_t ptr, uint64_t modifier,
 
 static uint64_t pauth_strip(CPUARMState *env, uint64_t ptr, bool data)
 {
-    ARMMMUIdx mmu_idx = arm_stage1_mmu_idx(env);
+    ARMMMUIdx mmu_idx = stage_1_mmu_idx(pauth_mmu_idx(env));
     ARMVAParameters param = aa64_va_parameters(env, ptr, mmu_idx, data, false);
 
     return pauth_original_ptr(ptr, param);
@@ -511,7 +545,7 @@ static void pauth_check_trap(CPUARMState *env, int el, uintptr_t ra)
 
 static bool pauth_key_enabled(CPUARMState *env, int el, uint32_t bit)
 {
-    return (arm_sctlr(env, el) & bit) != 0;
+    return (pauth_sctlr(env, el) & bit) != 0;
 }
 
 uint64_t HELPER(pacia)(CPUARMState *env, uint64_t x, uint64_t y)

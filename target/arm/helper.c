@@ -19,6 +19,7 @@
 #include "qemu/bitops.h"
 #include "qemu/qemu-print.h"
 #include "exec/cputlb.h"
+#include "exec/tb-flush.h"
 #include "exec/translation-block.h"
 #include "hw/core/irq.h"
 #include "system/cpu-timers.h"
@@ -2900,7 +2901,9 @@ static void vmsa_ttbr_write(CPUARMState *env, const ARMCPRegInfo *ri,
              */
             MMUIdxMap kern = ARMMMUIdxBit_E10_1 | ARMMMUIdxBit_E10_1_PAN;
 
-            tlb_flush_keep_upper(CPU(cpu), (MMUIdxMap)~kern, kern);
+            tlb_flush_keep_upper(CPU(cpu), (MMUIdxMap)~kern, kern, -1);
+            /* the lower half's jump cache entries follow the ASID */
+            tb_jmp_cache_switch(CPU(cpu), extract64(value, 48, 16));
         } else {
             tlb_flush(CPU(cpu));
         }
@@ -4028,6 +4031,21 @@ uint64_t arm_hcr_el2_eff(CPUARMState *env)
 {
     if (arm_feature(env, ARM_FEATURE_M)) {
         return 0;
+    }
+    if (env_archcpu(env)->hcr_cache) {
+        /*
+         * A pure function of HCR_EL2, SCR_EL3 and the cpu's features, so
+         * the last result stands while the two registers keep their values.
+         */
+        if (env->hcr_eff.valid && env->hcr_eff.hcr == env->cp15.hcr_el2 &&
+            env->hcr_eff.scr == env->cp15.scr_el3) {
+            return env->hcr_eff.eff;
+        }
+        env->hcr_eff.hcr = env->cp15.hcr_el2;
+        env->hcr_eff.scr = env->cp15.scr_el3;
+        env->hcr_eff.eff = arm_hcr_el2_eff_secstate(env, arm_security_space_below_el3(env));
+        env->hcr_eff.valid = true;
+        return env->hcr_eff.eff;
     }
     return arm_hcr_el2_eff_secstate(env, arm_security_space_below_el3(env));
 }
@@ -10484,29 +10502,5 @@ ARMSecuritySpace arm_security_space(CPUARMState *env)
     return arm_security_space_below_el3(env);
 }
 
-ARMSecuritySpace arm_security_space_below_el3(CPUARMState *env)
-{
-    assert(!arm_feature(env, ARM_FEATURE_M));
-
-    /*
-     * If EL3 is not supported then the secure state is implementation
-     * defined, in which case QEMU defaults to non-secure.
-     */
-    if (!arm_feature(env, ARM_FEATURE_EL3)) {
-        return ARMSS_NonSecure;
-    }
-
-    /*
-     * Note NSE cannot be set without RME, and NSE & !NS is Reserved.
-     * Ignoring NSE when !NS retains consistency without having to
-     * modify other predicates.
-     */
-    if (!(env->cp15.scr_el3 & SCR_NS)) {
-        return ARMSS_Secure;
-    } else if (env->cp15.scr_el3 & SCR_NSE) {
-        return ARMSS_Realm;
-    } else {
-        return ARMSS_NonSecure;
-    }
-}
+/* arm_security_space_below_el3() is inline in cpu.h: the PAC and ptw paths call it per instruction. */
 #endif /* !CONFIG_USER_ONLY */

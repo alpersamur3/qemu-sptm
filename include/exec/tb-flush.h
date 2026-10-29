@@ -34,5 +34,11 @@ void tb_flush__exclusive_or_serial(void);
 void queue_tb_flush(CPUState *cs);
 
 void tcg_flush_jmp_cache(CPUState *cs);
+void tb_jmp_cache_clear_all(CPUState *cs);
+void tb_jmp_cache_drop_users(CPUState *cs);
+
+/* the lower half's jump cache follows the guest's address space (ASID) */
+void tb_jmp_cache_switch(CPUState *cs, uint32_t tag);
+void tb_jmp_cache_drop(CPUState *cs, uint32_t tag);
 
 #endif /* _TB_FLUSH_H_ */

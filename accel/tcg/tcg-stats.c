@@ -132,6 +132,8 @@ static gboolean tb_tree_stats_iter(gpointer key, gpointer value, gpointer data)
     return false;
 }
 
+#include "asoft-stats.h"
+
 static void tlb_flush_counts(size_t *pfull, size_t *ppart, size_t *pelide)
 {
     CPUState *cpu;
@@ -160,6 +162,33 @@ static void tcg_dump_flush_info(GString *buf)
     g_string_append_printf(buf, "TLB full flushes    %zu\n", flush_full);
     g_string_append_printf(buf, "TLB partial flushes %zu\n", flush_part);
     g_string_append_printf(buf, "TLB elided flushes  %zu\n", flush_elide);
+
+    {
+        uint64_t s[ASTAT_N] = {};
+
+        for (int c = 0; c < 16; c++) {
+            for (int e = 0; e < ASTAT_N; e++) {
+                s[e] += asoft_stats[c][e];
+            }
+        }
+        g_string_append_printf(buf, "jc lookups %" PRIu64 ", misses %" PRIu64 " (%.2f%%)\n",
+                               s[ASTAT_JC_LOOKUP], s[ASTAT_JC_MISS],
+                               100.0 * s[ASTAT_JC_MISS] / MAX(1, s[ASTAT_JC_LOOKUP]));
+        g_string_append_printf(buf, "jc wipes: tlb %" PRIu64 ", range %" PRIu64 ", inval %" PRIu64 ", "
+                               "asid drops %" PRIu64 "; switches %" PRIu64 " (new %" PRIu64 "); "
+                               "page clears %" PRIu64 "\n",
+                               s[ASTAT_JC_WIPE_TLB], s[ASTAT_JC_WIPE_RANGE],
+                               s[ASTAT_JC_WIPE_INVAL], s[ASTAT_JC_WIPE_LOWER],
+                               s[ASTAT_JC_SWITCH], s[ASTAT_JC_SWITCH_NEW],
+                               s[ASTAT_JC_CLEAR_PAGE]);
+        g_string_append_printf(buf, "tlb fills %" PRIu64 " (lower %" PRIu64 "); code probes %" PRIu64 ", "
+                               "bti probes %" PRIu64 "\n",
+                               s[ASTAT_TLB_FILL], s[ASTAT_TLB_FILL_LOWER],
+                               s[ASTAT_PROBE_CODE], s[ASTAT_PROBE_BTI]);
+        g_string_append_printf(buf, "tlb flush sets: all %" PRIu64 ", el1&0 %" PRIu64 ", el0 %" PRIu64 ", "
+                               "other %" PRIu64 "\n", s[ASTAT_FLUSH_MAP0], s[ASTAT_FLUSH_MAP0 + 1],
+                               s[ASTAT_FLUSH_MAP0 + 2], s[ASTAT_FLUSH_MAP0 + 3]);
+    }
 }
 
 static void dump_exec_info(GString *buf)

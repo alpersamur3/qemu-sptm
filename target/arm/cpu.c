@@ -1345,6 +1345,15 @@ static const Property arm_cpu_va_param_cache_property =
 
 static const Property arm_cpu_counter_nobql_property =
             DEFINE_PROP_BOOL("x-counter-nobql", ARMCPU, counter_nobql, false);
+
+static const Property arm_cpu_hcr_cache_property =
+            DEFINE_PROP_BOOL("x-hcr-cache", ARMCPU, hcr_cache, false);
+
+static const Property arm_cpu_has_bti_property =
+            DEFINE_PROP_BOOL("bti", ARMCPU, has_bti, true);
+
+static const Property arm_cpu_page_bits_property =
+            DEFINE_PROP_UINT8("x-page-bits", ARMCPU, page_bits, 0);
 #endif
 
 static const Property arm_cpu_cfgend_property =
@@ -1744,6 +1753,9 @@ static void arm_cpu_post_init(Object *obj)
         qdev_property_add_static(DEVICE(obj), &arm_cpu_keep_kernel_tlb_property);
         qdev_property_add_static(DEVICE(obj), &arm_cpu_va_param_cache_property);
         qdev_property_add_static(DEVICE(obj), &arm_cpu_counter_nobql_property);
+        qdev_property_add_static(DEVICE(obj), &arm_cpu_hcr_cache_property);
+        qdev_property_add_static(DEVICE(obj), &arm_cpu_has_bti_property);
+        qdev_property_add_static(DEVICE(obj), &arm_cpu_page_bits_property);
     }
 #endif
     qdev_property_add_static(DEVICE(obj), &arm_cpu_cfgend_property);
@@ -2168,6 +2180,23 @@ static void arm_cpu_realizefn(DeviceState *dev, Error **errp)
              */
             pagebits = 10;
         }
+        if (cpu->page_bits) {
+            if (cpu->page_bits != 14) {
+                error_setg(errp, "x-page-bits: only 14 (16K pages) is supported");
+                return;
+            }
+            /*
+             * The guest must not map anything smaller than the softmmu
+             * page (tlb_set_page_full() fills whole pages): take the 4K
+             * and 64K granules away, so a 16K-granule guest stays there.
+             * The machine has to ask for the same size (page-bits).
+             */
+            FIELD_DP64_IDREG(isar, ID_AA64MMFR0, TGRAN4, 0xf);
+            FIELD_DP64_IDREG(isar, ID_AA64MMFR0, TGRAN64, 0xf);
+            FIELD_DP64_IDREG(isar, ID_AA64MMFR0, TGRAN4_2, 1);
+            FIELD_DP64_IDREG(isar, ID_AA64MMFR0, TGRAN64_2, 1);
+            pagebits = cpu->page_bits;
+        }
         if (!set_preferred_target_page_bits(pagebits)) {
             /*
              * This can only ever happen for hotplugging a CPU, or if
@@ -2223,6 +2252,10 @@ static void arm_cpu_realizefn(DeviceState *dev, Error **errp)
 
     if (!cpu->has_el2) {
         unset_feature(env, ARM_FEATURE_EL2);
+    }
+
+    if (!cpu->has_bti) {
+        FIELD_DP64_IDREG(isar, ID_AA64PFR1, BT, 0);
     }
 
     if (!cpu->has_pmu) {

@@ -147,18 +147,26 @@ static void tlb_window_reset(CPUTLBDesc *desc, int64_t ns,
     desc->window_max_entries = max_entries;
 }
 
+#include "asoft-stats.h"
+
 static void tb_jmp_cache_clear_page(CPUState *cpu, vaddr page_addr)
 {
     CPUJumpCache *jc = cpu->tb_jmp_cache;
-    int i, i0;
+    unsigned int slot;
 
     if (unlikely(!jc)) {
         return;
     }
 
-    i0 = tb_jmp_cache_hash_page(page_addr);
-    for (i = 0; i < TB_JMP_PAGE_SIZE; i++) {
-        qatomic_set(&jc->array[i0 + i].tb, NULL);
+    ASTAT(cpu, ASTAT_JC_CLEAR_PAGE);
+    /*
+     * The page's entries carry its epoch; a new one leaves them behind
+     * (the guest drops tens of thousands of pages a second).  16 bits:
+     * a wrap would revive them, so everything goes then.
+     */
+    slot = tb_jmp_cache_page_slot(page_addr);
+    if (unlikely(++jc->page_epoch[slot] == 0)) {
+        tb_jmp_cache_clear_all(cpu);
     }
 }
 
@@ -391,6 +399,10 @@ static void tlb_flush_by_mmuidx_async_work(CPUState *cpu, run_on_cpu_data data)
 
     qemu_spin_unlock(&cpu->neg.tlb.c.lock);
 
+    ASTAT(cpu, ASTAT_JC_WIPE_TLB);
+    /* which set was asked for: everything / the EL1&0 regime / EL0 only / other */
+    ASTAT(cpu, ASTAT_FLUSH_MAP0 + (asked == ALL_MMUIDX_BITS ? 0 :
+                                   (asked & 7) == 7 ? 1 : asked == 1 ? 2 : 3));
     tcg_flush_jmp_cache(cpu);
 
     if (to_clean == ALL_MMUIDX_BITS) {
@@ -470,12 +482,19 @@ static void tlb_flush_lower_half_locked(CPUState *cpu, int mmu_idx)
     }
 }
 
+/* full | lower << 16 | (the address space whose jump cache goes, + 1) << 32 */
+static vaddr tlb_flush_keep_upper_data(MMUIdxMap full, MMUIdxMap lower,
+                                       int drop_tag)
+{
+    return (vaddr)full | (vaddr)lower << 16 | (vaddr)(drop_tag + 1) << 32;
+}
+
 static void tlb_flush_keep_upper_async_work(CPUState *cpu, run_on_cpu_data data)
 {
-    MMUIdxMap full = data.host_int & 0xffff;
-    MMUIdxMap lower = (data.host_int >> 16) & 0xffff;
+    MMUIdxMap full = data.target_ptr & 0xffff;
+    MMUIdxMap lower = (data.target_ptr >> 16) & 0xffff;
+    uint32_t drop = data.target_ptr >> 32;
     MMUIdxMap dirty, work;
-    CPUJumpCache *jc = cpu->tb_jmp_cache;
     int64_t now = get_clock_realtime();
 
     assert_cpu_is_self(cpu);
@@ -491,27 +510,28 @@ static void tlb_flush_keep_upper_async_work(CPUState *cpu, run_on_cpu_data data)
     cpu->neg.tlb.c.dirty = dirty & ~full;
     qemu_spin_unlock(&cpu->neg.tlb.c.lock);
 
-    if (jc) {
-        for (int i = 0; i < TB_JMP_CACHE_SIZE; i++) {
-            if (!(jc->array[i].pc >> 63)) {
-                qatomic_set(&jc->array[i].tb, NULL);
-            }
-        }
+    if (drop) {
+        tb_jmp_cache_drop(cpu, drop - 1);
     }
     qatomic_set(&cpu->neg.tlb.c.part_flush_count,
                 cpu->neg.tlb.c.part_flush_count + ctpop16(full & dirty));
 }
 
-void tlb_flush_keep_upper(CPUState *cpu, MMUIdxMap full, MMUIdxMap lower)
+void tlb_flush_keep_upper(CPUState *cpu, MMUIdxMap full, MMUIdxMap lower,
+                          int drop_tag)
 {
-    tlb_flush_keep_upper_async_work(cpu, RUN_ON_CPU_HOST_INT(full | lower << 16));
+    run_on_cpu_data d =
+        RUN_ON_CPU_TARGET_PTR(tlb_flush_keep_upper_data(full, lower, drop_tag));
+
+    tlb_flush_keep_upper_async_work(cpu, d);
 }
 
 void tlb_flush_keep_upper_all_cpus_synced(CPUState *src_cpu, MMUIdxMap full,
-                                          MMUIdxMap lower)
+                                          MMUIdxMap lower, int drop_tag)
 {
     const run_on_cpu_func fn = tlb_flush_keep_upper_async_work;
-    run_on_cpu_data d = RUN_ON_CPU_HOST_INT(full | lower << 16);
+    run_on_cpu_data d =
+        RUN_ON_CPU_TARGET_PTR(tlb_flush_keep_upper_data(full, lower, drop_tag));
 
     flush_all_helper(src_cpu, fn, d);
     async_safe_run_on_cpu(src_cpu, fn, d);
@@ -818,11 +838,18 @@ static void tlb_flush_range_by_mmuidx_async_0(CPUState *cpu,
     qemu_spin_unlock(&cpu->neg.tlb.c.lock);
 
     /*
-     * If the length is larger than the jump cache size, then it will take
-     * longer to clear each entry individually than it will to clear it all.
+     * A page's entries go by one epoch increment, but the epoch table has
+     * TB_JMP_EPOCH_SIZE slots: a longer range would advance them all anyway.
+     * The guest (XNU) does this hundreds of times a second for user regions;
+     * those leave the upper half's entries alone.
      */
-    if (d.len >= (TARGET_PAGE_SIZE * TB_JMP_CACHE_SIZE)) {
-        tcg_flush_jmp_cache(cpu);
+    if (d.len >= (vaddr)TARGET_PAGE_SIZE * TB_JMP_EPOCH_SIZE) {
+        ASTAT(cpu, ASTAT_JC_WIPE_RANGE);
+        if (!((d.addr | (d.addr + d.len - 1)) >> 63)) {
+            tb_jmp_cache_drop_users(cpu);
+        } else {
+            tcg_flush_jmp_cache(cpu);
+        }
         return;
     }
 
@@ -1118,6 +1145,10 @@ void tlb_set_page_full(CPUState *cpu, int mmu_idx,
     bool is_ram, is_romd;
 
     assert_cpu_is_self(cpu);
+    ASTAT(cpu, ASTAT_TLB_FILL);
+    if (!(addr >> 63)) {
+        ASTAT(cpu, ASTAT_TLB_FILL_LOWER);
+    }
 
     if (full->lg_page_size <= TARGET_PAGE_BITS) {
         sz = TARGET_PAGE_SIZE;
@@ -1625,6 +1656,7 @@ tb_page_addr_t get_page_addr_code_hostp(CPUArchState *env, vaddr addr,
     CPUTLBEntryFull *full;
     void *p;
 
+    ASTAT(env_cpu(env), ASTAT_PROBE_CODE);
     (void)probe_access_internal(env_cpu(env), addr, 1, MMU_INST_FETCH,
                                 cpu_mmu_index(env_cpu(env), true), false,
                                 hostp, &full, 0, false);

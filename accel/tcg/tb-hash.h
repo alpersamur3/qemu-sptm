@@ -28,32 +28,30 @@
 
 #ifdef CONFIG_SOFTMMU
 
-/* Only the bottom TB_JMP_PAGE_BITS of the jump cache hash bits vary for
-   addresses on the same page.  The top bits are the same.  This allows
-   TLB invalidation to quickly clear a subset of the hash table.  */
-#define TB_JMP_PAGE_BITS (TB_JMP_CACHE_BITS / 2)
-#define TB_JMP_PAGE_SIZE (1 << TB_JMP_PAGE_BITS)
-#define TB_JMP_ADDR_MASK (TB_JMP_PAGE_SIZE - 1)
-#define TB_JMP_PAGE_MASK (TB_JMP_CACHE_SIZE - TB_JMP_PAGE_SIZE)
-
-static inline unsigned int tb_jmp_cache_hash_page(vaddr pc)
-{
-    vaddr tmp;
-    tmp = pc ^ (pc >> (TARGET_PAGE_BITS - TB_JMP_PAGE_BITS));
-    return (tmp >> (TARGET_PAGE_BITS - TB_JMP_PAGE_BITS)) & TB_JMP_PAGE_MASK;
-}
+/*
+ * Sets of TB_JMP_CACHE_WAYS entries, the set chosen by all the pc's bits.
+ * (Upstream splits the index into a page group and a slot within the page,
+ * so that a page's entries can be dropped without a scan, but that caps a
+ * page at 64 cached TBs: ARM64 TBs average 18 bytes, a hot 4K page holds
+ * hundreds.)  tb_jmp_cache_clear_page() scans instead.
+ *
+ * The result is the index of the set's first entry.
+ */
+#define TB_JMP_CACHE_WAYS 2
 
 static inline unsigned int tb_jmp_cache_hash_func(vaddr pc)
 {
-    vaddr tmp;
-    tmp = pc ^ (pc >> (TARGET_PAGE_BITS - TB_JMP_PAGE_BITS));
-    return (((tmp >> (TARGET_PAGE_BITS - TB_JMP_PAGE_BITS)) & TB_JMP_PAGE_MASK)
-           | (tmp & TB_JMP_ADDR_MASK));
+    unsigned int set = ((pc >> 2) * 0x9E3779B97F4A7C15ull)
+                       >> (64 - (TB_JMP_CACHE_BITS - 1));
+
+    return set * TB_JMP_CACHE_WAYS;
 }
 
 #else
 
 /* In user-mode we can get better hashing because we do not have a TLB */
+#define TB_JMP_CACHE_WAYS 1
+
 static inline unsigned int tb_jmp_cache_hash_func(vaddr pc)
 {
     return (pc ^ (pc >> TB_JMP_CACHE_BITS)) & (TB_JMP_CACHE_SIZE - 1);

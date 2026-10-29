@@ -360,7 +360,8 @@ static void tlbi_aa64_aside1is_write(CPUARMState *env, const ARMCPRegInfo *ri,
     MMUIdxMap full, lower;
 
     if (aside1_keep_upper(env, mask, &full, &lower)) {
-        tlb_flush_keep_upper_all_cpus_synced(cs, full, lower);
+        tlb_flush_keep_upper_all_cpus_synced(cs, full, lower,
+                                             extract64(value, 48, 16));
     } else {
         tlb_flush_by_mmuidx_all_cpus_synced(cs, mask);
     }
@@ -376,9 +377,10 @@ static void tlbi_aa64_aside1_write(CPUARMState *env, const ARMCPRegInfo *ri,
     if (!aside1_keep_upper(env, mask, &full, &lower)) {
         tlbi_aa64_vmalle1_write(env, ri, value);
     } else if (tlb_force_broadcast(env)) {
-        tlb_flush_keep_upper_all_cpus_synced(cs, full, lower);
+        tlb_flush_keep_upper_all_cpus_synced(cs, full, lower,
+                                             extract64(value, 48, 16));
     } else {
-        tlb_flush_keep_upper(cs, full, lower);
+        tlb_flush_keep_upper(cs, full, lower, extract64(value, 48, 16));
     }
 }
 

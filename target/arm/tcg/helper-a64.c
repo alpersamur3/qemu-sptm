@@ -44,6 +44,7 @@
 #include "user/page-protection.h"
 #endif
 #include "vec_internal.h"
+#include "accel/tcg/asoft-stats.h"
 
 #define HELPER_H "tcg/helper-a64-defs.h"
 #include "exec/helper-info.c.inc"
@@ -1755,6 +1756,7 @@ static bool is_guarded_page(CPUARMState *env, vaddr addr, uintptr_t ra)
                                   false, &host, &full, ra);
 
     assert(!(flags & TLB_INVALID_MASK));
+    ASTAT(env_cpu(env), ASTAT_PROBE_BTI);
     return full->extra.arm.guarded;
 #endif
 }

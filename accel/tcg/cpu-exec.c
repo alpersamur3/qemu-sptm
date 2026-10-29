@@ -227,34 +227,70 @@ static TranslationBlock *tb_htable_lookup(CPUState *cpu, TCGTBCPUState s)
  *
  * Returns: an existing translation block or NULL.
  */
-static inline TranslationBlock *tb_lookup(CPUState *cpu, TCGTBCPUState s)
+#include "asoft-stats.h"
+
+/*
+ * The newest entry goes into the set's first way; the one it displaces
+ * moves to the next, so a set keeps its last TB_JMP_CACHE_WAYS pcs.
+ */
+static inline void tb_jmp_cache_insert(CPUJumpCache *jc, vaddr pc,
+                                       TranslationBlock *tb)
+{
+    CPUJumpArray *arr = tb_jmp_cache_array(jc, pc);
+    uint32_t hash = tb_jmp_cache_hash_func(pc);
+    uintptr_t word = (uintptr_t)tb |
+        ((uintptr_t)jc->page_epoch[tb_jmp_cache_page_slot(pc)]
+         << TB_JMP_EPOCH_SHIFT);
+
+    for (int way = TB_JMP_CACHE_WAYS - 1; way > 0; way--) {
+        if (arr->array[hash].pc == pc) {
+            break;
+        }
+        arr->array[hash + way].pc = arr->array[hash + way - 1].pc;
+        qatomic_set(&arr->array[hash + way].tb,
+                    qatomic_read(&arr->array[hash + way - 1].tb));
+    }
+    arr->array[hash].pc = pc;
+    qatomic_set(&arr->array[hash].tb, word);
+}
+
+/* always inline: the set-associative lookup grew past gcc's limit (one more call per indirect branch) */
+static inline __attribute__((always_inline))
+TranslationBlock *tb_lookup(CPUState *cpu, TCGTBCPUState s)
 {
     TranslationBlock *tb;
-    CPUJumpCache *jc;
-    uint32_t hash;
+    CPUJumpCache *jc = cpu->tb_jmp_cache;
+    CPUJumpArray *arr = tb_jmp_cache_array(jc, s.pc);
+    uintptr_t epoch = (uintptr_t)jc->page_epoch[tb_jmp_cache_page_slot(s.pc)]
+                      << TB_JMP_EPOCH_SHIFT;
+    uint32_t hash = tb_jmp_cache_hash_func(s.pc);
 
     /* we should never be trying to look up an INVALID tb */
     tcg_debug_assert(!(s.cflags & CF_INVALID));
 
-    hash = tb_jmp_cache_hash_func(s.pc);
-    jc = cpu->tb_jmp_cache;
+    ASTAT(cpu, ASTAT_JC_LOOKUP);
 
-    tb = qatomic_read(&jc->array[hash].tb);
-    if (likely(tb &&
-               jc->array[hash].pc == s.pc &&
-               tb->cs_base == s.cs_base &&
-               tb->flags == s.flags &&
-               tb_cflags(tb) == s.cflags)) {
-        goto hit;
+    for (int way = 0; way < TB_JMP_CACHE_WAYS; way++) {
+        uintptr_t word = qatomic_read(&arr->array[hash + way].tb);
+
+        tb = (TranslationBlock *)(word & TB_JMP_PTR_MASK);
+        if (likely(tb &&
+                   (word & ~TB_JMP_PTR_MASK) == epoch &&
+                   arr->array[hash + way].pc == s.pc &&
+                   tb->cs_base == s.cs_base &&
+                   tb->flags == s.flags &&
+                   tb_cflags(tb) == s.cflags)) {
+            goto hit;
+        }
     }
 
+    ASTAT(cpu, ASTAT_JC_MISS);
     tb = tb_htable_lookup(cpu, s);
     if (tb == NULL) {
         return NULL;
     }
 
-    jc->array[hash].pc = s.pc;
-    qatomic_set(&jc->array[hash].tb, tb);
+    tb_jmp_cache_insert(jc, s.pc, tb);
 
 hit:
     /*
@@ -966,9 +1002,6 @@ cpu_exec_loop(CPUState *cpu, SyncClocks *sc)
 
             tb = tb_lookup(cpu, s);
             if (tb == NULL) {
-                CPUJumpCache *jc;
-                uint32_t h;
-
                 mmap_lock();
                 tb = tb_gen_code(cpu, s);
                 mmap_unlock();
@@ -977,10 +1010,7 @@ cpu_exec_loop(CPUState *cpu, SyncClocks *sc)
                  * We add the TB in the virtual pc hash table
                  * for the fast lookup
                  */
-                h = tb_jmp_cache_hash_func(s.pc);
-                jc = cpu->tb_jmp_cache;
-                jc->array[h].pc = s.pc;
-                qatomic_set(&jc->array[h].tb, tb);
+                tb_jmp_cache_insert(cpu->tb_jmp_cache, s.pc, tb);
             }
 
 #ifndef CONFIG_USER_ONLY
@@ -1069,6 +1099,9 @@ bool tcg_exec_realizefn(CPUState *cpu, Error **errp)
     }
 
     cpu->tb_jmp_cache = g_new0(CPUJumpCache, 1);
+    /* the lower half starts in the cache of address space 0 */
+    cpu->tb_jmp_cache->cur = &cpu->tb_jmp_cache->user[0];
+    cpu->tb_jmp_cache->user_tag[0] = 1;
     tlb_init(cpu);
 #ifndef CONFIG_USER_ONLY
     tcg_iommu_init_notifier_list(cpu);
