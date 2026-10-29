@@ -256,6 +256,15 @@ static void display_new_frame(void *ctx)
     qemu_event_set(&s->frame_event);
 }
 
+/*
+ * The guest put the display to sleep or woke it (its FIFO's opcode 9): iOS
+ * keeps the last frame on screen meanwhile, so the window says it is off.
+ */
+static void display_sleep(void *ctx, bool asleep)
+{
+    qemu_console_set_guest_asleep(asleep);
+}
+
 /* --- the frame path (its own thread; no BQL, no library callback) --- */
 
 /*
@@ -559,6 +568,7 @@ static void pvg_reims_machine_done(Notifier *notifier, void *data)
         .ctx = s,
         .mode_change = display_mode_change,
         .new_frame = display_new_frame,
+        .sleep = display_sleep,
     };
     RvgDisplayConfig dcfg = {
         .struct_size = sizeof(dcfg),
@@ -650,6 +660,8 @@ static void pvg_reims_reset_hold(Object *obj, ResetType type)
     };
     size_t i;
 
+    /* a guest that restarts asleep starts awake */
+    qemu_console_set_guest_asleep(false);
     if (s->dev) {
         rvg_device_reset(s->dev);
     }

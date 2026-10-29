@@ -433,6 +433,15 @@ void qemu_console_add_notifier(Notifier *notifier);
 void qemu_console_remove_notifier(Notifier *notifier);
 void qemu_console_notify(QemuConsoleEventType type, QemuConsole *con);
 
+/*
+ * The guest's own display sleep, as a device that sees it reports it (the
+ * vresearch machine's reims display), for a front end to show the display as
+ * off. The notifiers run on the reporting device's thread.
+ */
+void qemu_console_set_guest_asleep(bool asleep);
+bool qemu_console_guest_asleep(void);
+void qemu_console_add_guest_sleep_notifier(Notifier *notifier);
+
 /* vnc.c */
 void vnc_display_add_client(const char *id, int csock, bool skipauth);
 int vnc_display_password(const char *id, const char *password, Error **errp);

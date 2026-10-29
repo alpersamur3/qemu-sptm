@@ -139,6 +139,7 @@ struct GtkDisplayState {
     GtkWidget *overlay;         /* the notebook, and screen_off over it */
     GtkWidget *screen_off;
     Notifier led_notifier;
+    Notifier sleep_notifier;
     bool guest_display_off;
     bool guest_display_was_off;
     bool guest_display_armed;   /* on again after the off while booting */

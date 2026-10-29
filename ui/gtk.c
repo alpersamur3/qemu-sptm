@@ -918,7 +918,10 @@ static void gd_sidebar_key(GtkButton *button, void *opaque)
  * while iOS has the display off (xnu 0102), and keeps showing the last frame.
  * A cover over the guest display says so instead, and Lock becomes Wake. iOS
  * also turns the display off once while it boots, under the Apple logo: the
- * cover comes only once the display was on again after that.
+ * cover comes only once the display was on again after that. On the vresearch
+ * machine (iOS 26) the reims display reports the guest's display sleep itself
+ * (qemu_console_guest_asleep), which covers at once: iOS 26 sleeps the display
+ * at the lock screen while it boots, not under the logo.
  */
 static gboolean gd_guest_display_update(void *opaque)
 {
@@ -926,16 +929,18 @@ static gboolean gd_guest_display_update(void *opaque)
     bool off = qemu_input_get_leds_mask(NULL) & QEMU_SCROLL_LOCK_LED;
     bool cover;
 
-    if (off == s->guest_display_off) {
+    if (off != s->guest_display_off) {
+        s->guest_display_off = off;
+        if (off) {
+            s->guest_display_was_off = true;
+        } else if (s->guest_display_was_off) {
+            s->guest_display_armed = true;
+        }
+    }
+    cover = (off && s->guest_display_armed) || qemu_console_guest_asleep();
+    if (cover == gtk_widget_get_visible(s->screen_off)) {
         return G_SOURCE_REMOVE;
     }
-    s->guest_display_off = off;
-    if (off) {
-        s->guest_display_was_off = true;
-    } else if (s->guest_display_was_off) {
-        s->guest_display_armed = true;
-    }
-    cover = off && s->guest_display_armed;
     gtk_widget_set_visible(s->screen_off, cover);
     gd_sidebar_set_label(s->sidebar_lock, cover ? "Wake" : "Lock");
     gtk_widget_set_tooltip_text(s->sidebar_lock,
@@ -948,6 +953,15 @@ static gboolean gd_guest_display_update(void *opaque)
 static void gd_guest_leds(Notifier *notifier, void *data)
 {
     GtkDisplayState *s = container_of(notifier, GtkDisplayState, led_notifier);
+
+    g_idle_add(gd_guest_display_update, s);
+}
+
+/* from the reims display's thread: GTK on the main loop */
+static void gd_guest_sleep(Notifier *notifier, void *data)
+{
+    GtkDisplayState *s = container_of(notifier, GtkDisplayState,
+                                      sleep_notifier);
 
     g_idle_add(gd_guest_display_update, s);
 }
@@ -999,6 +1013,8 @@ static void gd_create_screen_off(GtkDisplayState *s)
 
     s->led_notifier.notify = gd_guest_leds;
     qemu_input_led_notifier_add(&s->led_notifier);
+    s->sleep_notifier.notify = gd_guest_sleep;
+    qemu_console_add_guest_sleep_notifier(&s->sleep_notifier);
 }
 
 static void gd_sidebar_screenshot(GtkButton *button, void *opaque)

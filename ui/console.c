@@ -1090,6 +1090,26 @@ void qemu_console_add_notifier(Notifier *notifier)
     notifier_list_add(&ds->console_notifiers, notifier);
 }
 
+static bool guest_asleep;
+static NotifierList guest_sleep_notifiers =
+    NOTIFIER_LIST_INITIALIZER(guest_sleep_notifiers);
+
+void qemu_console_set_guest_asleep(bool asleep)
+{
+    qatomic_set(&guest_asleep, asleep);
+    notifier_list_notify(&guest_sleep_notifiers, NULL);
+}
+
+bool qemu_console_guest_asleep(void)
+{
+    return qatomic_read(&guest_asleep);
+}
+
+void qemu_console_add_guest_sleep_notifier(Notifier *notifier)
+{
+    notifier_list_add(&guest_sleep_notifiers, notifier);
+}
+
 void qemu_console_remove_notifier(Notifier *notifier)
 {
     notifier_remove(notifier);
