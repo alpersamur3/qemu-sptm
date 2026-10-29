@@ -147,11 +147,54 @@ def resolve_placeholders(n):
         resolve_placeholders(c)
 
 
+def fill_from_gestalt_variant(root):
+    """
+    The vphone600 tree carries the values of its product's syscfg keys itself:
+    /product/vphone600-gestalt-variants (compatible 'gestalt-variant-list')
+    holds one variant whose 'tag-XXXX' properties are the keys of the
+    'syscfg/XXXX' placeholders, d47vm2025vre-variant's those of an iPhone 16
+    Pro (artwork-device-subtype 2556, display-corner-radius, the island's and
+    buttons' locations, home-button-type 2, ...). Fill each placeholder whose
+    key the variant has a value for, as the host fills syscfg; the rest go to
+    resolve_placeholders. Without them MobileGestalt answers no artwork
+    subtype and a home button, and SpringBoard takes the iPhone for one of
+    those: the old status bar, 'Press home to open', Control Center from the
+    bottom and no home gestures. Returns the filled (path, property) pairs.
+    """
+    product = root.child('product')
+    lists = [c for c in product.children
+             if c.props.get('compatible', [0, b''])[1].rstrip(b'\0') == b'gestalt-variant-list']
+    if not lists or not lists[0].children:
+        return []
+    variant = lists[0].children[0]
+    tags = {k[4:]: v for k, (f, v) in variant.props.items() if k.startswith('tag-') and v}
+    filled = []
+
+    def walk(n, path):
+        for name, (flags, val) in list(n.props.items()):
+            if not flags:
+                continue
+            for alt in val.rstrip(b'\0').decode(errors='replace').split(','):
+                parts = alt.split('/')
+                if len(parts) == 2 and parts[0] == 'syscfg' and parts[1] in tags:
+                    n.props[name] = [0, tags[parts[1]]]
+                    filled.append((path, name))
+                    break
+        for c in n.children:
+            walk(c, path.rstrip('/') + '/' + c.name)
+
+    walk(root, '/')
+    return filled
+
+
 def fixup(root, dram_base, dram_size, ncpus, keep_sep, nvram,
-          display_scale=None, no_effaceable_storage=False, timeout_scale=None):
+          display_scale=None, no_effaceable_storage=False, timeout_scale=None,
+          gestalt_variant=False):
     chosen = root.child('chosen')
     arm_io = root.child('arm-io')
 
+    if gestalt_variant:
+        fill_from_gestalt_variant(root)
     resolve_placeholders(root)
 
     root.set('platform-name', padded(PLATFORM_NAME, len(root.props['platform-name'][1])))
@@ -244,6 +287,8 @@ def main():
                    help='set /defaults/no-effaceable-storage=1 (flat-plist keybag)')
     p.add_argument('--timeout-scale', type=int, default=None,
                    help='set /chosen/machine-timeouts/global-scale (SMP on a slow host)')
+    p.add_argument('--gestalt-variant', action='store_true',
+                   help="fill syscfg placeholders from /product's gestalt variant (device identity)")
     args = p.parse_args()
 
     root, _ = parse(args.dtree.read())
@@ -251,7 +296,8 @@ def main():
         raise SystemExit('not a VResearch1 device tree (arm-io isn\'t arm-io,vmapple1)')
     nvram = args.nvram.read() if args.nvram else empty_nvram()
     fixup(root, args.dram_base, args.dram_size, args.cpus, args.keep_sep, nvram,
-          args.display_scale, args.no_effaceable_storage, args.timeout_scale)
+          args.display_scale, args.no_effaceable_storage, args.timeout_scale,
+          args.gestalt_variant)
     args.out.write(encode(root))
 
 

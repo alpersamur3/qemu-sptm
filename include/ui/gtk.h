@@ -160,6 +160,10 @@ struct GtkDisplayState {
     bool gesture_down;          /* the gesture's finger touches */
     bool mouse_down;            /* the real button: no gesture then */
     double wheel_pending;       /* wheel steps not yet swiped, + = down */
+    /* a drag from the display's left edge, played as iOS's back gesture */
+    int edge_drag;              /* GD_EDGE_* */
+    double edge_x0, edge_y0;    /* where it pressed, fractions of the display */
+    double edge_x;              /* where the guest's finger was left */
 
     /* text pasted from the PC, typed one character at a time */
     char *paste;

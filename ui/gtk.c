@@ -1356,6 +1356,51 @@ static void gd_sidebar_switcher(GtkButton *button, void *opaque)
 }
 
 /*
+ * iOS's back gesture: from the left edge to the right, the finger down at x0.
+ * Under TCG an app sees a quick swipe too late: its interactive pop starts
+ * after the lift and is cancelled (measured: 0.3 s to the middle, lifted or
+ * still for 1.5 s, cancels). 1 s to 94 % of the width, then 1.5 s still,
+ * completes every time.
+ */
+#define BACK_EDGE 0.03              /* a press this near the left edge */
+#define BACK_SWIPE_X 0.94
+#define BACK_DECIDE 0.02            /* moved this far, the drag is a back or not */
+#define BACK_MIN 0.12               /* a back drag lifted after this far plays one */
+
+/*
+ * A real drag that presses within BACK_EDGE of the left edge is pending until
+ * it has moved BACK_DECIDE: mostly to the right, it is a back drag, whose
+ * finger stays where it is in the guest until the lift plays gd_back_gesture
+ * (if it went BACK_MIN); else it goes on as any drag.
+ */
+enum { GD_EDGE_NONE, GD_EDGE_PENDING, GD_EDGE_BACK };
+
+static void gd_back_gesture(GtkDisplayState *s, double x0, double y)
+{
+    int i;
+
+    for (i = 1; i <= 40; i++) {
+        gd_gesture_add(s, x0 + (BACK_SWIPE_X - x0) * i / 40, y, true, 25);
+    }
+    for (i = 0; i < 75; i++) {
+        gd_gesture_add(s, BACK_SWIPE_X + (i & 1) * 0.0005, y, true, 20);
+    }
+    gd_gesture_add(s, BACK_SWIPE_X, y, false, 30);
+    gd_gesture_run(s);
+}
+
+static void gd_sidebar_back(GtkButton *button, void *opaque)
+{
+    GtkDisplayState *s = opaque;
+
+    if (s->gesture_timer || s->mouse_down) {
+        return;
+    }
+    gd_gesture_add(s, 0.003, 0.5, true, 40);
+    gd_back_gesture(s, 0.003, 0.5);
+}
+
+/*
  * Text from the PC's clipboard, typed on the guest's keyboard one character
  * every PASTE_INTERVAL_MS. A US layout: printable ASCII, tabs and new lines;
  * anything else is left out.
@@ -1941,6 +1986,9 @@ static void gd_create_sidebar(GtkDisplayState *s)
     gd_sidebar_button(s, group, "App switcher", NULL,
                       "Swipe up from the bottom edge and hold",
                       G_CALLBACK(gd_sidebar_switcher), 0);
+    gd_sidebar_button(s, group, "Back", NULL,
+                      "Swipe from the left edge (or drag from the display's left edge)",
+                      G_CALLBACK(gd_sidebar_back), 0);
     gd_sidebar_button(s, group, "Volume up", "F4", "Volume up (F4)",
                       G_CALLBACK(gd_sidebar_key), KEY_F4);
     gd_sidebar_button(s, group, "Volume down", "F3", "Volume down (F3)",
@@ -2382,6 +2430,30 @@ static gboolean gd_motion_event(GtkWidget *widget, GdkEventMotion *motion,
             fby >= surface_height(vc->gfx.ds)) {
             return TRUE;
         }
+        /* a gesture under way holds the guest's finger */
+        if (s->gesture_down && !s->mouse_down) {
+            s->last_x = fbx;
+            s->last_y = fby;
+            return TRUE;
+        }
+        if (s->edge_drag != GD_EDGE_NONE && s->mouse_down) {
+            double dx = (double)fbx / surface_width(vc->gfx.ds) - s->edge_x0;
+            double dy = (double)fby / surface_height(vc->gfx.ds) - s->edge_y0;
+
+            if (s->edge_drag == GD_EDGE_PENDING) {
+                if (dx >= BACK_DECIDE && dx > fabs(dy)) {
+                    s->edge_drag = GD_EDGE_BACK;
+                } else if (fabs(dx) >= BACK_DECIDE || fabs(dy) >= BACK_DECIDE) {
+                    s->edge_drag = GD_EDGE_NONE;
+                }
+            }
+            if (s->edge_drag == GD_EDGE_BACK) {
+                s->last_x = fbx;
+                s->last_y = fby;
+                return TRUE;
+            }
+            s->edge_x = (double)fbx / surface_width(vc->gfx.ds);
+        }
         qemu_input_queue_abs(vc->gfx.dcl.con, INPUT_AXIS_X, fbx,
                              0, surface_width(vc->gfx.ds));
         qemu_input_queue_abs(vc->gfx.dcl.con, INPUT_AXIS_Y, fby,
@@ -2472,6 +2544,29 @@ static gboolean gd_button_event(GtkWidget *widget, GdkEventButton *button,
             gd_gesture_abort(s);
         }
         s->mouse_down = button->type == GDK_BUTTON_PRESS;
+        if (s->sidebar && vc->gfx.ds && qemu_input_is_absolute(vc->gfx.dcl.con)) {
+            double x = (double)s->last_x / surface_width(vc->gfx.ds);
+            double y = (double)s->last_y / surface_height(vc->gfx.ds);
+
+            if (button->type == GDK_BUTTON_PRESS) {
+                s->edge_drag = x < BACK_EDGE ? GD_EDGE_PENDING : GD_EDGE_NONE;
+                s->edge_x0 = s->edge_x = x;
+                s->edge_y0 = y;
+            } else if (s->edge_drag == GD_EDGE_BACK) {
+                /* the finger is still down in the guest, at edge_x */
+                s->edge_drag = GD_EDGE_NONE;
+                s->gesture_down = true;
+                if (x - s->edge_x0 >= BACK_MIN) {
+                    gd_back_gesture(s, s->edge_x, s->edge_y0);
+                } else {
+                    gd_gesture_add(s, s->edge_x, s->edge_y0, false, 30);
+                    gd_gesture_run(s);
+                }
+                return TRUE;
+            } else {
+                s->edge_drag = GD_EDGE_NONE;
+            }
+        }
     }
     qemu_input_queue_btn(vc->gfx.dcl.con, btn,
                          button->type == GDK_BUTTON_PRESS);
