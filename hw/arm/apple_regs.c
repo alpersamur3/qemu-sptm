@@ -52,15 +52,22 @@ typedef struct {
     uint64_t   pmc1;
 } apple_pmc_t;
 
+/*
+ * NO_RAW: the counters have no state to migrate, and a read never returns what
+ * was written, which fails a load's write-and-read-back check (loadvm: "post
+ * load hook failed for: cpu").
+ */
 static const ARMCPRegInfo apple_pmcregs[] = {
     {
         .name = "PMC0", .state = ARM_CP_STATE_AA64, .access = PL1_RW,
         .opc0 = 3, .opc1 = 2, .crn = 15, .crm = 0, .opc2 = 0,
+        .type = ARM_CP_NO_RAW,
         .readfn = pmc0_read, .writefn = pmc0_write,
     },
     {
         .name = "PMC1", .state = ARM_CP_STATE_AA64, .access = PL1_RW,
         .opc0 = 3, .opc1 = 2, .crn = 15, .crm = 1, .opc2 = 0,
+        .type = ARM_CP_NO_RAW,
         .readfn = pmc1_read, .writefn = pmc1_write,
     },
 };

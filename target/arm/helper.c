@@ -8,6 +8,7 @@
 
 #include "qemu/osdep.h"
 #include "qemu/log.h"
+#include "qemu/error-report.h"
 #include "trace.h"
 #include "cpu.h"
 #include "internals.h"
@@ -226,6 +227,8 @@ bool write_list_to_cpustate(ARMCPU *cpu)
          */
         write_raw_cp_reg(&cpu->env, ri, v);
         if (read_raw_cp_reg(&cpu->env, ri) != v) {
+            warn_report("cpreg %s (0x%x): wrote 0x%" PRIx64 ", reads 0x%" PRIx64,
+                        ri->name, regidx, v, read_raw_cp_reg(&cpu->env, ri));
             ok = false;
         }
     }
