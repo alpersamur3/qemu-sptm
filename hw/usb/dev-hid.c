@@ -1479,6 +1479,28 @@ static void usb_consumer_unrealize(USBDevice *dev)
     timer_free(us->timer);
 }
 
+/*
+ * Without it a saved state's load in a new QEMU left the device as realized
+ * while the host controller's state had it addressed: its first packet hit
+ * usb_handle_packet's assertion on the device's state.
+ */
+static const VMStateDescription vmstate_usb_consumer = {
+    .name = "usb-consumer",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .fields = (const VMStateField[]) {
+        VMSTATE_USB_DEVICE(dev, USBConsumerState),
+        VMSTATE_UINT8(report, USBConsumerState),
+        VMSTATE_UINT8_ARRAY(queue, USBConsumerState, USB_CONSUMER_QUEUE),
+        VMSTATE_UINT32(head, USBConsumerState),
+        VMSTATE_UINT32(count, USBConsumerState),
+        VMSTATE_UINT8(auto_release, USBConsumerState),
+        VMSTATE_UINT8(armed, USBConsumerState),
+        VMSTATE_TIMER_PTR(timer, USBConsumerState),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
 static const Property usb_consumer_properties[] = {
     DEFINE_PROP_UINT32("usb_version", USBConsumerState, usb_version, 2),
     DEFINE_PROP_UINT32("hold-ms", USBConsumerState, hold_ms, 100),
@@ -1496,6 +1518,7 @@ static void usb_consumer_class_initfn(ObjectClass *klass, const void *data)
     uc->handle_control = usb_consumer_handle_control;
     uc->handle_data    = usb_consumer_handle_data;
     uc->handle_attach  = usb_desc_attach;
+    dc->vmsd = &vmstate_usb_consumer;
     device_class_set_props(dc, usb_consumer_properties);
     set_bit(DEVICE_CATEGORY_INPUT, dc->categories);
 }
