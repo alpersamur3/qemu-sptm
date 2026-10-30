@@ -133,6 +133,7 @@ struct AESState {
     IV iv[4];
     bool is_encrypt;
     QCryptoCipherMode block_mode;
+    uint32_t block_mode_saved;  /* block_mode in a saved state */
 };
 
 static void aes_update_irq(AESState *s)
@@ -559,11 +560,74 @@ static void aes_init(Object *obj)
     s->as = &address_space_memory;
 }
 
+/* A saved state keeps the registers, the command FIFO and the guest's keys and IVs. */
+static const VMStateDescription vmstate_aes_key = {
+    .name = "apple-aes/key",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT32(key_len, Key),
+        VMSTATE_UINT8_ARRAY(key, Key, 32),
+        VMSTATE_END_OF_LIST()
+    },
+};
+
+static const VMStateDescription vmstate_aes_iv = {
+    .name = "apple-aes/iv",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT32_ARRAY(iv, IV, 4),
+        VMSTATE_END_OF_LIST()
+    },
+};
+
+static int aes_pre_save(void *opaque)
+{
+    AESState *s = opaque;
+
+    s->block_mode_saved = s->block_mode;
+    return 0;
+}
+
+static int aes_post_load(void *opaque, int version_id)
+{
+    AESState *s = opaque;
+
+    s->block_mode = s->block_mode_saved;
+    return 0;
+}
+
+static const VMStateDescription vmstate_aes = {
+    .name = TYPE_APPLE_AES,
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .pre_save = aes_pre_save,
+    .post_load = aes_post_load,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT32(status, AESState),
+        VMSTATE_UINT32(q_status, AESState),
+        VMSTATE_UINT32(irq_status, AESState),
+        VMSTATE_UINT32(irq_enable, AESState),
+        VMSTATE_UINT32(watermark, AESState),
+        VMSTATE_UINT32(flag_info, AESState),
+        VMSTATE_UINT32_ARRAY(fifo, AESState, MAX_FIFO_SIZE),
+        VMSTATE_UINT32(fifo_idx, AESState),
+        VMSTATE_STRUCT_ARRAY(key, AESState, 2, 1, vmstate_aes_key, Key),
+        VMSTATE_STRUCT_ARRAY(iv, AESState, 4, 1, vmstate_aes_iv, IV),
+        VMSTATE_BOOL(is_encrypt, AESState),
+        VMSTATE_UINT32(block_mode_saved, AESState),
+        VMSTATE_END_OF_LIST()
+    },
+};
+
 static void aes_class_init(ObjectClass *klass, const void *data)
 {
     ResettableClass *rc = RESETTABLE_CLASS(klass);
+    DeviceClass *dc = DEVICE_CLASS(klass);
 
     rc->phases.hold = aes_reset;
+    dc->vmsd = &vmstate_aes;
 }
 
 static const TypeInfo aes_info = {

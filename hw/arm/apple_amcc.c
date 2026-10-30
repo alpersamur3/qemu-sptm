@@ -6,6 +6,7 @@
 #include "hw/core/qdev-properties.h"
 #include "hw/core/qdev-properties-system.h"
 #include "xnu/apple_dtree.h"
+#include "migration/vmstate.h"
 #include "trace.h"
 
 DeviceState *amcc_create(struct dtree_node *amcc_node) {
@@ -91,11 +92,29 @@ static void amcc_init(Object *obj) {
     sysbus_init_mmio(sbd, &s->iomem);
 }
 
+/* A saved state keeps the CTRR ranges the guest programmed (the register
+ * offsets come from the device tree). */
+static const VMStateDescription vmstate_amcc = {
+    .name = TYPE_AMCC,
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT64_ARRAY(ctrr_lwr, AMCCState, AMCC_NUM_BANKS),
+        VMSTATE_UINT64_ARRAY(ctrr_upr, AMCCState, AMCC_NUM_BANKS),
+        VMSTATE_END_OF_LIST()
+    },
+};
+
+static void amcc_class_init(ObjectClass *oc, const void *data) {
+    DEVICE_CLASS(oc)->vmsd = &vmstate_amcc;
+}
+
 static const TypeInfo amcc_info = {
     .name           =  TYPE_AMCC,
     .parent         =  TYPE_SYS_BUS_DEVICE,
     .instance_size  =  sizeof(AMCCState),
     .instance_init  =  amcc_init,
+    .class_init     =  amcc_class_init,
 };
 
 static void amcc_register_types(void) {

@@ -63,6 +63,7 @@
 #include "hw/core/qdev-properties.h"
 #include "hw/core/sysbus.h"
 #include "hw/arm/vresearch_sep.h"
+#include "migration/vmstate.h"
 
 OBJECT_DECLARE_SIMPLE_TYPE(VResearchSEPState, VRESEARCH_SEP)
 
@@ -389,11 +390,35 @@ static void sep_init(Object *obj)
     sysbus_init_irq(sbd, &s->irq_b);
 }
 
+/* A saved state keeps the mailbox: a load's reset would leave the guest's
+ * driver talking to a SEP that has not booted. */
+static const VMStateDescription vmstate_sep = {
+    .name = TYPE_VRESEARCH_SEP,
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT32(control, VResearchSEPState),
+        VMSTATE_UINT32(int_enable, VResearchSEPState),
+        VMSTATE_UINT64_ARRAY(rx, VResearchSEPState, SEP_RX_DEPTH),
+        VMSTATE_UINT32(rx_head, VResearchSEPState),
+        VMSTATE_UINT32(rx_count, VResearchSEPState),
+        VMSTATE_BOOL(rx_half, VResearchSEPState),
+        VMSTATE_UINT64(tx_low, VResearchSEPState),
+        VMSTATE_UINT32(rom_status, VResearchSEPState),
+        VMSTATE_BOOL(booted, VResearchSEPState),
+        VMSTATE_BOOL(startup_sent, VResearchSEPState),
+        VMSTATE_BOOL(adverts_sent, VResearchSEPState),
+        VMSTATE_BOOL(irq_level, VResearchSEPState),
+        VMSTATE_END_OF_LIST()
+    },
+};
+
 static void sep_class_init(ObjectClass *oc, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(oc);
 
     device_class_set_legacy_reset(dc, sep_reset);
+    dc->vmsd = &vmstate_sep;
     dc->user_creatable = false;
 }
 
