@@ -49,7 +49,7 @@
 #include "hw/core/qdev-properties.h"
 #include "hw/core/resettable.h"
 #include "hw/core/sysbus.h"
-#include "migration/blocker.h"
+#include "migration/vmstate.h"
 #include "system/address-spaces.h"
 #include "system/memory.h"
 #include "system/system.h"
@@ -77,7 +77,18 @@ struct VResearchPVGReimsState {
     uint32_t width, height;     /* the display's one mode */
 
     Notifier init_done;
-    Error *mig_blocker;
+
+    /* save state: the reims device suspends to this blob and resumes from it; it is
+     * only in flight during a save or load. guest_asleep tracks the display's sleep
+     * (display_sleep) so a resume restores the screen-off cover. */
+    uint8_t *suspend_blob;
+    uint32_t suspend_blob_len;
+    bool guest_asleep;
+    /* the IOSurface device's registers (iosfc_saved_regs), which have no suspend */
+    uint64_t iosfc_regs[6];
+    /* where the GPU VAs the state's placements name end: a load in a new process
+     * places the guest's new resources past them */
+    uint64_t gpu_va_high;
 
     /* the library's objects; NULL until machine-init-done */
     RvgDevice *dev;
@@ -262,6 +273,9 @@ static void display_new_frame(void *ctx)
  */
 static void display_sleep(void *ctx, bool asleep)
 {
+    VResearchPVGReimsState *s = ctx;
+
+    s->guest_asleep = asleep;
     qemu_console_set_guest_asleep(asleep);
 }
 
@@ -685,11 +699,9 @@ static void pvg_reims_realize(DeviceState *dev, Error **errp)
                    s->width, s->height);
         return;
     }
-    error_setg(&s->mig_blocker, "vresearch-pvg-reims: the reims-vgpu GPU's "
-               "state is not migratable");
-    if (migrate_add_blocker(&s->mig_blocker, errp) < 0) {
-        return;
-    }
+    /* The reims-vgpu GPU migrates through its suspend/resume (vmstate_pvg_reims):
+     * the device serializes its state in pre_save and rebuilds it in post_load, so
+     * quick boot and saved states work. No migration blocker. */
 
     /* Before the first library call; REIMS_VGPU_LOG's filter overrides the level. */
     rvg_log_set_handler(reims_log, s, RVG_LOG_INFO);
@@ -725,6 +737,153 @@ static const Property pvg_reims_properties[] = {
     DEFINE_PROP_UINT32("height", VResearchPVGReimsState, height, 2556),
 };
 
+/* --- save state: the reims device suspends to a blob and resumes from it --- */
+
+/*
+ * The IOSurface device has no suspend: its registers are saved as they read,
+ * and written back on a load in this order, after the machine's reset zeroed
+ * them. The read counter is only stored while no ring is mapped, the
+ * descriptor enable drops the table, the ring maps once its size is written
+ * after its base, and the write counter (the doorbell) goes last.
+ */
+static const uint64_t iosfc_saved_regs[6] = {
+    0x1020,     /* ring read counter */
+    0x1030,     /* descriptor enable */
+    0x1010,     /* descriptor table base */
+    0x1000,     /* ring base */
+    0x1008,     /* ring size */
+    0x1018,     /* ring write counter */
+};
+
+static void pvg_reims_iosfc_save(VResearchPVGReimsState *s)
+{
+    size_t i;
+
+    for (i = 0; i < ARRAY_SIZE(iosfc_saved_regs); i++) {
+        s->iosfc_regs[i] = s->iosfc ?
+            rvg_iosurface_device_mmio_read(s->iosfc, iosfc_saved_regs[i]) : 0;
+    }
+}
+
+/*
+ * The guest's memory comes back with its surfaces marked mapped, while the
+ * reset device holds none: map them again before the GPU, whose tasks look
+ * surfaces up by mapping id, runs.
+ */
+static void pvg_reims_iosfc_load(VResearchPVGReimsState *s)
+{
+    size_t i;
+    uint32_t mapped;
+
+    if (!s->iosfc) {
+        return;
+    }
+    for (i = 0; i < ARRAY_SIZE(iosfc_saved_regs); i++) {
+        rvg_iosurface_device_mmio_write(s->iosfc, iosfc_saved_regs[i],
+                                        s->iosfc_regs[i]);
+    }
+    mapped = rvg_iosurface_device_remap_surfaces(s->iosfc);
+    info_report("vresearch-pvg-reims: load: %u IOSurfaces mapped again", mapped);
+}
+
+/*
+ * Before the machine is saved: quiesce the device and serialize its state into
+ * s->suspend_blob, which vmstate_pvg_reims then writes. Before machine-init-done
+ * there is no device and nothing to save.
+ */
+static int pvg_reims_pre_save(void *opaque)
+{
+    VResearchPVGReimsState *s = opaque;
+    RvgBytes state = { NULL, 0 };
+
+    g_clear_pointer(&s->suspend_blob, g_free);
+    s->suspend_blob_len = 0;
+    pvg_reims_iosfc_save(s);
+    if (!s->dev) {
+        return 0;
+    }
+    s->gpu_va_high = rvg_device_gpu_va_high(s->dev);
+    rvg_device_will_suspend(s->dev);
+    if (rvg_device_finish_suspend(s->dev, &state) != RVG_OK || !state.data) {
+        error_report("vresearch-pvg-reims: finish_suspend failed");
+        rvg_bytes_free(state);
+        return -1;
+    }
+    s->suspend_blob = g_memdup2(state.data, state.length);
+    s->suspend_blob_len = state.length;
+    rvg_bytes_free(state);
+    return 0;
+}
+
+/* Rebuild the device from the blob so the machine can keep running after a save. */
+static int pvg_reims_resume_from_blob(VResearchPVGReimsState *s, const char *when)
+{
+    RvgResumeError err = RVG_RESUME_ERROR_NONE;
+    int ret = 0;
+
+    if (s->dev && s->suspend_blob) {
+        /*
+         * Resume a stopped device. A suspend keeps the root node, and did_resume
+         * tears a live root down after will_resume staged the state's registers,
+         * which clears the root FIFO's enabled: the root FIFO and its stamp memory
+         * never come back, and a child's first stamp ends the process
+         * (device.stamp.write_without_memory). A load's system reset has stopped
+         * it already; after a save it has not.
+         */
+        rvg_device_stop(s->dev);
+        if (rvg_device_will_resume(s->dev, s->suspend_blob, s->suspend_blob_len,
+                                   &err) == RVG_OK) {
+            rvg_device_did_resume(s->dev);
+        } else {
+            error_report("vresearch-pvg-reims: resume %s refused the state (%u)",
+                         when, err);
+            ret = -1;
+        }
+    }
+    g_clear_pointer(&s->suspend_blob, g_free);
+    s->suspend_blob_len = 0;
+    return ret;
+}
+
+static void pvg_reims_post_save(void *opaque)
+{
+    pvg_reims_resume_from_blob(opaque, "after save");
+}
+
+static int pvg_reims_post_load(void *opaque, int version_id)
+{
+    VResearchPVGReimsState *s = opaque;
+    int ret;
+
+    if (s->dev) {
+        rvg_device_keep_gpu_vas_below(s->dev, s->gpu_va_high);
+    }
+    pvg_reims_iosfc_load(s);
+    ret = pvg_reims_resume_from_blob(s, "on load");
+
+    /* restore the screen-off cover the state was taken with */
+    qemu_console_set_guest_asleep(s->guest_asleep);
+    return ret;
+}
+
+static const VMStateDescription vmstate_pvg_reims = {
+    .name = "vresearch-pvg-reims",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .pre_save = pvg_reims_pre_save,
+    .post_save = pvg_reims_post_save,
+    .post_load = pvg_reims_post_load,
+    .fields = (const VMStateField[]) {
+        VMSTATE_BOOL(guest_asleep, VResearchPVGReimsState),
+        VMSTATE_UINT32(suspend_blob_len, VResearchPVGReimsState),
+        VMSTATE_VBUFFER_ALLOC_UINT32(suspend_blob, VResearchPVGReimsState, 0,
+                                     NULL, suspend_blob_len),
+        VMSTATE_UINT64_ARRAY(iosfc_regs, VResearchPVGReimsState, 6),
+        VMSTATE_UINT64(gpu_va_high, VResearchPVGReimsState),
+        VMSTATE_END_OF_LIST()
+    },
+};
+
 static void pvg_reims_class_init(ObjectClass *oc, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(oc);
@@ -733,6 +892,7 @@ static void pvg_reims_class_init(ObjectClass *oc, const void *data)
     dc->realize = pvg_reims_realize;
     rc->phases.hold = pvg_reims_reset_hold;
     device_class_set_props(dc, pvg_reims_properties);
+    dc->vmsd = &vmstate_pvg_reims;
     dc->user_creatable = false;
 }
 
