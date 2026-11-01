@@ -182,6 +182,11 @@ typedef struct DisasContext {
     bool nv2_mem_e20;
     /* True if NV2 enabled and NV2 RAM accesses are big-endian */
     bool nv2_mem_be;
+    /*
+     * True for an Apple machine's cpu (apple_regs_init: -M vresearch, darwin):
+     * an access to an unknown system register is logged and ignored, not UNDEF
+     */
+    bool apple_sysregs;
     /* True if FPCR.AH is 1 (alternate floating point handling) */
     bool fpcr_ah;
     /* True if FPCR.NEP is 1 (FEAT_AFP scalar upper-element result handling) */

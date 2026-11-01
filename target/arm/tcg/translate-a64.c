@@ -2919,6 +2919,13 @@ static void handle_sys(DisasContext *s, bool isread,
         qemu_log_mask(LOG_UNIMP, "%s access to unsupported AArch64 "
                       "system register S%d_%d_c%d_c%d_%d (pc = 0x%016lX)\n",
                       isread ? "r" : "w", op0, op1, crn, crm, op2, s->pc_curr);
+        /*
+         * An Apple machine's XNU touches registers QEMU does not model; on
+         * every other cpu (-M virt) the access UNDEFs, as in upstream QEMU.
+         */
+        if (!s->apple_sysregs) {
+            gen_sysreg_undef(s, isread, op0, op1, op2, crn, crm, rt);
+        }
         return;
     }
 
@@ -11044,6 +11051,7 @@ static void aarch64_tr_init_disas_context(DisasContextBase *dcbase,
     dc->nv2 = EX_TBFLAG_A64(tb_flags, NV2);
     dc->nv2_mem_e20 = dc->nv2 && dc->e2h;
     dc->nv2_mem_be = EX_TBFLAG_A64(tb_flags, NV2_MEM_BE);
+    dc->apple_sysregs = env->apple_state != NULL;
     dc->fpcr_ah = EX_TBFLAG_A64(tb_flags, AH);
     dc->fpcr_nep = EX_TBFLAG_A64(tb_flags, NEP);
     dc->gcs_en = EX_TBFLAG_A64(tb_flags, GCS_EN);
