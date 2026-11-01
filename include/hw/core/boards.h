@@ -262,6 +262,10 @@ typedef struct {
  * @get_valid_cpu_types:
  *    Returns a list of valid CPU types for this board. May be NULL
  *    if not needed.
+ * @loadvm_catch_up_ns:
+ *    With loadvm-catch-up=on: how far to move QEMU_CLOCK_VIRTUAL on, once a
+ *    snapshot is loaded, so that the guest's clock gains @away_ns (the time
+ *    since the snapshot was saved). May be NULL if that is @away_ns itself.
  */
 struct MachineClass {
     /*< private >*/
@@ -333,6 +337,7 @@ struct MachineClass {
     uint64_t smbios_memory_device_size;
     bool (*create_default_memdev)(MachineState *ms, const char *path,
                                   Error **errp);
+    int64_t (*loadvm_catch_up_ns)(MachineState *ms, int64_t away_ns);
 };
 
 /**
@@ -413,6 +418,7 @@ struct MachineState {
     char *firmware;
     bool iommu;
     bool suppress_vmdesc;
+    bool loadvm_catch_up;
     bool enable_graphics;
     ConfidentialGuestSupport *cgs;
     HostMemoryBackend *memdev;

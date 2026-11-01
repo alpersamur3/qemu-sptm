@@ -61,6 +61,8 @@
 #include "io/channel-buffer.h"
 #include "io/channel-file.h"
 #include "system/replay.h"
+#include "system/cpu-timers.h"
+#include "exec/icount.h"
 #include "system/runstate.h"
 #include "system/system.h"
 #include "system/xen.h"
@@ -3453,6 +3455,34 @@ void qmp_xen_load_devices_state(const char *filename, Error **errp)
     migration_incoming_state_destroy();
 }
 
+/*
+ * -M ...,loadvm-catch-up=on: a guest that reads its real-time clock only at
+ * boot and then keeps its calendar on the CPU's counter (XNU) would come back
+ * at the time the snapshot was saved, however long ago that was. Move the
+ * virtual clock on by the wall-clock time since the save (the snapshot's
+ * date), or by what the machine says shows that time to the guest, so the
+ * counter, and the calendar the guest keeps on it, show the time now. Never
+ * back: a host clock set back leaves the clock as it was loaded.
+ */
+static void load_snapshot_catch_up(const QEMUSnapshotInfo *sn)
+{
+    int64_t saved = sn->date_sec * NANOSECONDS_PER_SECOND + sn->date_nsec;
+    int64_t away = g_get_real_time() * SCALE_US - saved;
+    int64_t delta = away;
+    MachineClass *mc;
+
+    if (!current_machine || !current_machine->loadvm_catch_up ||
+        icount_enabled() || replay_mode != REPLAY_MODE_NONE || !sn->date_sec) {
+        return;
+    }
+    mc = MACHINE_GET_CLASS(current_machine);
+    if (away > 0 && mc->loadvm_catch_up_ns) {
+        delta = mc->loadvm_catch_up_ns(current_machine, away);
+    }
+    trace_load_snapshot_catch_up(sn->name, away, delta);
+    cpu_clock_advance(delta);
+}
+
 bool load_snapshot(const char *name, const char *vmstate,
                    bool has_devices, strList *devices, Error **errp)
 {
@@ -3532,6 +3562,7 @@ bool load_snapshot(const char *name, const char *vmstate,
         return false;
     }
 
+    load_snapshot_catch_up(&sn);
     return true;
 
 err_drain:

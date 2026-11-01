@@ -483,6 +483,20 @@ static bool machine_get_suppress_vmdesc(Object *obj, Error **errp)
     return ms->suppress_vmdesc;
 }
 
+static void machine_set_loadvm_catch_up(Object *obj, bool value, Error **errp)
+{
+    MachineState *ms = MACHINE(obj);
+
+    ms->loadvm_catch_up = value;
+}
+
+static bool machine_get_loadvm_catch_up(Object *obj, Error **errp)
+{
+    MachineState *ms = MACHINE(obj);
+
+    return ms->loadvm_catch_up;
+}
+
 static char *machine_get_memory_encryption(Object *obj, Error **errp)
 {
     MachineState *ms = MACHINE(obj);
@@ -1180,6 +1194,12 @@ static void machine_class_init(ObjectClass *oc, const void *data)
         machine_get_suppress_vmdesc, machine_set_suppress_vmdesc);
     object_class_property_set_description(oc, "suppress-vmdesc",
         "Set on to disable self-describing migration");
+
+    object_class_property_add_bool(oc, "loadvm-catch-up",
+        machine_get_loadvm_catch_up, machine_set_loadvm_catch_up);
+    object_class_property_set_description(oc, "loadvm-catch-up",
+        "Set on to move the guest's clock on by the time since a snapshot "
+        "was saved when it is loaded");
 
     object_class_property_add_link(oc, "confidential-guest-support",
                                    TYPE_CONFIDENTIAL_GUEST_SUPPORT,

@@ -878,12 +878,28 @@ static GlobalProperty vresearch_compat_defaults[] = {
     { TYPE_ARM_CPU, "bti", "off" },
 };
 
+/*
+ * loadvm-catch-up: the generic timer's counter ticks every
+ * gt_cntfrq_period_ns() ns of the virtual clock, 1e9 / CNTFRQ rounded down
+ * (41 ns at 24 MHz, so it runs at 24.39 MHz and the guest's clock 1.6% fast).
+ * Move the virtual clock on by the ticks @away_ns makes at CNTFRQ, so the
+ * guest's clock gains @away_ns, not 1.6% more.
+ */
+static int64_t vresearch_loadvm_catch_up_ns(MachineState *ms, int64_t away_ns)
+{
+    ARMCPU *cpu = ARM_CPU(first_cpu);
+
+    return muldiv64(away_ns, cpu->gt_cntfrq_hz * gt_cntfrq_period_ns(cpu),
+                    NANOSECONDS_PER_SECOND);
+}
+
 static void vresearch_machine_class_init(ObjectClass *oc, const void *data)
 {
     MachineClass *mc = MACHINE_CLASS(oc);
 
     mc->desc = "Apple VResearch1 research VM (vphone600ap, vresearch101ap)";
     mc->init = vresearch_init;
+    mc->loadvm_catch_up_ns = vresearch_loadvm_catch_up_ns;
     mc->max_cpus = VR_MAX_CPUS;
     mc->default_cpu_type = ARM_CPU_TYPE_NAME("max");
     mc->block_default_type = IF_VIRTIO;
@@ -950,10 +966,22 @@ static void vresearch_machine_class_init(ObjectClass *oc, const void *data)
         "(sealed APFS) volume, e.g. an HFS+ disk");
 }
 
+/*
+ * loadvm-catch-up on by default: XNU reads the PL031 only at boot, then keeps
+ * its calendar on the generic timer's counter, so a loaded snapshot (-loadvm,
+ * the side bar's saved states) would show the time it was saved at until the
+ * next boot. -M vresearch,loadvm-catch-up=off keeps the clock as it was saved.
+ */
+static void vresearch_instance_init(Object *obj)
+{
+    MACHINE(obj)->loadvm_catch_up = true;
+}
+
 static const TypeInfo vresearch_machine_info = {
     .name           = TYPE_VRESEARCH_MACHINE,
     .parent         = TYPE_MACHINE,
     .instance_size  = sizeof(VResearchState),
+    .instance_init  = vresearch_instance_init,
     .class_init     = vresearch_machine_class_init,
     .interfaces     = arm_machine_interfaces,
 };

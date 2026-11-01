@@ -135,6 +135,27 @@ void cpu_disable_ticks(void)
                          &timers_state.vm_clock_lock);
 }
 
+/*
+ * Move QEMU_CLOCK_VIRTUAL forward, never back: e.g. by the time a snapshot
+ * spent on the disk, once it is loaded, so that the guest's counters (Arm's
+ * generic timer counts this clock) show the time that went by. Timers whose
+ * deadline it passes fire as soon as the clock runs. cpu_ticks_offset (host
+ * cycles, for cpu_get_ticks) is left as it is: no guest counter reads it here.
+ * Caller must hold BQL which serves as mutex for vm_clock_seqlock.
+ */
+void cpu_clock_advance(int64_t delta)
+{
+    if (delta <= 0) {
+        return;
+    }
+    seqlock_write_lock(&timers_state.vm_clock_seqlock,
+                       &timers_state.vm_clock_lock);
+    timers_state.cpu_clock_offset += delta;
+    seqlock_write_unlock(&timers_state.vm_clock_seqlock,
+                         &timers_state.vm_clock_lock);
+    qemu_clock_notify(QEMU_CLOCK_VIRTUAL);
+}
+
 static bool icount_state_needed(void *opaque)
 {
     return icount_enabled();

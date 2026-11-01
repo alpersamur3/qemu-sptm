@@ -36,6 +36,12 @@ int64_t cpu_get_ticks(void);
  */
 int64_t cpu_get_clock(void);
 
+/*
+ * Move the virtual clock forward by @delta ns (nothing if @delta <= 0).
+ * Without icount only. Caller must hold BQL.
+ */
+void cpu_clock_advance(int64_t delta);
+
 void qemu_timer_notify_cb(void *opaque, QEMUClockType type);
 
 /* get/set VIRTUAL clock and VM elapsed ticks via the cpus accel interface */
