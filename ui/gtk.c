@@ -1391,6 +1391,15 @@ static void gd_sidebar_switcher(GtkButton *button, void *opaque)
  */
 enum { GD_EDGE_NONE, GD_EDGE_PENDING, GD_EDGE_BACK };
 
+/*
+ * The Back row and the edge drags were measured on the iOS 26 research VM
+ * only: on -M virt (iOS 16) the side bar and a drag stay as they were.
+ */
+static bool gd_machine_has_back_gesture(void)
+{
+    return object_resolve_path_type("", "vresearch-machine", NULL) != NULL;
+}
+
 static void gd_back_gesture(GtkDisplayState *s, double x0, double y)
 {
     int i;
@@ -2002,9 +2011,12 @@ static void gd_create_sidebar(GtkDisplayState *s)
     gd_sidebar_button(s, group, "App switcher", NULL,
                       "Swipe up from the bottom edge and hold",
                       G_CALLBACK(gd_sidebar_switcher), 0);
-    gd_sidebar_button(s, group, "Back", NULL,
-                      "Swipe from the left edge (or drag from the display's left edge)",
-                      G_CALLBACK(gd_sidebar_back), 0);
+    s->back_gesture = gd_machine_has_back_gesture();
+    if (s->back_gesture) {
+        gd_sidebar_button(s, group, "Back", NULL,
+                          "Swipe from the left edge (or drag from the display's left edge)",
+                          G_CALLBACK(gd_sidebar_back), 0);
+    }
     gd_sidebar_button(s, group, "Volume up", "F4", "Volume up (F4)",
                       G_CALLBACK(gd_sidebar_key), KEY_F4);
     gd_sidebar_button(s, group, "Volume down", "F3", "Volume down (F3)",
@@ -2560,7 +2572,7 @@ static gboolean gd_button_event(GtkWidget *widget, GdkEventButton *button,
             gd_gesture_abort(s);
         }
         s->mouse_down = button->type == GDK_BUTTON_PRESS;
-        if (s->sidebar && vc->gfx.ds && qemu_input_is_absolute(vc->gfx.dcl.con)) {
+        if (s->back_gesture && vc->gfx.ds && qemu_input_is_absolute(vc->gfx.dcl.con)) {
             double x = (double)s->last_x / surface_width(vc->gfx.ds);
             double y = (double)s->last_y / surface_height(vc->gfx.ds);
 
