@@ -22,8 +22,10 @@
 #include "qemu/osdep.h"
 #include "exec/target_page.h"
 #include "qapi/error.h"
+#include "qemu/cutils.h"
 #include "qemu/error-report.h"
 #include "qemu/log.h"
+#include "qemu/timer.h"
 #include "qobject/qlist.h"
 #include "hw/arm/boot.h"
 #include "hw/arm/machines-qom.h"
@@ -46,10 +48,12 @@
 #include "net/net.h"
 #include "system/address-spaces.h"
 #include "system/reset.h"
+#include "system/rtc.h"
 #include "system/system.h"
 #include "ui/console.h"
 #include "target/arm/gtimer.h"
 #include "cpu.h"
+#include "trace.h"
 #include "xnu/boot/xnuboot.h"
 #include "xnu/apple_dtree.h"
 #include "xnu/apple_regs.h"
@@ -166,6 +170,8 @@ struct VResearchState {
     DeviceState           *gic;
     MemoryRegion           msi_frame;
     MemoryRegion           ecam_alias;
+    MemoryRegion           avp_rtc;
+    int64_t                avp_rtc_offset_us;
     struct xnu_boot_info   bootinfo;
     GMappedFile           *bootkc_m, *dtree_m, *sptm_m, *txm_m, *tc_m, *ramdisk_m;
     char                  *fb;
@@ -665,6 +671,64 @@ static void create_sep(VResearchState *s)
     sysbus_connect_irq(sbd, 1, spi(s, 0x34 - GIC_INTERNAL));
 }
 
+/*
+ * avp,rtc: AppleVirtualPlatformRTC takes register 0 as a microsecond counter
+ * and (counter + NVRAM com.apple.System.rtc-offset) / 1e6 as the calendar. The
+ * proxy NVRAM starts empty, so a cold boot has no offset. It and ApplePL031RTC
+ * both publish IORTC: when this one is first, the kernel's calendar comes from
+ * here, and a counter of 0 starts iOS at 1970. So the counter is the PL031's
+ * time in microseconds. No interrupts: the enable, mask, status and clear
+ * registers stay as they were, read as zero and ignored.
+ */
+#define AVP_RTC_COUNTER 0x00
+
+static uint64_t avp_rtc_read(void *opaque, hwaddr addr, unsigned size)
+{
+    VResearchState *s = opaque;
+    uint64_t usec;
+
+    if (addr != AVP_RTC_COUNTER) {
+        qemu_log_mask(LOG_UNIMP, "avp-rtc: unimplemented read  (size %u, "
+                      "offset 0x%03" HWADDR_PRIx ")\n", size, addr);
+        return 0;
+    }
+    usec = s->avp_rtc_offset_us + qemu_clock_get_us(rtc_clock);
+    trace_vresearch_avp_rtc_counter(usec);
+    return usec;
+}
+
+static void avp_rtc_write(void *opaque, hwaddr addr, uint64_t val,
+                          unsigned size)
+{
+    qemu_log_mask(LOG_UNIMP, "avp-rtc: unimplemented write (size %u, "
+                  "offset 0x%03" HWADDR_PRIx ", value 0x%016" PRIx64 ")\n",
+                  size, addr, val);
+}
+
+static const MemoryRegionOps avp_rtc_ops = {
+    .read = avp_rtc_read,
+    .write = avp_rtc_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid.min_access_size = 1,
+    .valid.max_access_size = 8,
+    .impl.min_access_size = 8,
+    .impl.max_access_size = 8,
+};
+
+static void create_avp_rtc(VResearchState *s)
+{
+    struct tm tm;
+
+    /* the same start as the PL031's tick_offset; nothing here to save */
+    qemu_get_timedate(&tm, 0);
+    s->avp_rtc_offset_us = mktimegm(&tm) * (int64_t)1000000 -
+                           qemu_clock_get_us(rtc_clock);
+    memory_region_init_io(&s->avp_rtc, OBJECT(s), &avp_rtc_ops, s, "avp-rtc",
+                          memmap[VR_AVP_RTC].size);
+    memory_region_add_subregion(get_system_memory(), memmap[VR_AVP_RTC].base,
+                                &s->avp_rtc);
+}
+
 static void create_devices(VResearchState *s)
 {
     SysBusDevice *sbd;
@@ -708,8 +772,7 @@ static void create_devices(VResearchState *s)
         create_unimplemented_device("apv-iosfc", memmap[VR_APV_IOSFC].base,
                                     memmap[VR_APV_IOSFC].size);
     }
-    create_unimplemented_device("avp-rtc", memmap[VR_AVP_RTC].base,
-                                memmap[VR_AVP_RTC].size);
+    create_avp_rtc(s);
     if (s->sep) {
         create_sep(s);
     } else {
