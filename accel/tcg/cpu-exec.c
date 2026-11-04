@@ -797,6 +797,9 @@ void tcg_kick_vcpu_thread(CPUState *cpu)
      * CPU thread; see kvm_arch_pre_run() for example.
      */
     qatomic_store_release(&cpu->exit_request, true);
+    if (cpu->cc->tcg_ops->native_kick) {
+        cpu->cc->tcg_ops->native_kick(cpu);
+    }
 
     /* Ensure cpu_exec will see the exit request after TCG has exited.  */
     qatomic_store_release(&cpu->neg.icount_decr.u16.high, -1);
@@ -980,6 +983,10 @@ cpu_exec_loop(CPUState *cpu, SyncClocks *sc)
 
         while (!cpu_handle_interrupt(cpu, &last_tb)) {
             TranslationBlock *tb;
+
+            if (unlikely(cpu->cc->tcg_ops->try_native)) {
+                cpu->cc->tcg_ops->try_native(cpu);
+            }
             TCGTBCPUState s = cpu->cc->tcg_ops->get_tb_cpu_state(cpu);
             s.cflags = cpu->cflags_next_tb;
 

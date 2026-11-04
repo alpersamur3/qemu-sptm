@@ -33,6 +33,9 @@
 #include "accel/tcg/cpu-ops.h"
 #endif /* CONFIG_TCG */
 #include "internals.h"
+#ifndef CONFIG_USER_ONLY
+#include "tcg/native-el0.h"
+#endif
 #include "cpu-features.h"
 #include "exec/target_page.h"
 #include "hw/core/qdev-properties.h"
@@ -1339,6 +1342,10 @@ static const Property arm_cpu_has_gcie_property =
 
 static const Property arm_cpu_keep_kernel_tlb_property =
             DEFINE_PROP_BOOL("x-keep-kernel-tlb", ARMCPU, keep_kernel_tlb, false);
+static const Property arm_cpu_el0_pac_off_property =
+            DEFINE_PROP_BOOL("x-el0-pac-off", ARMCPU, el0_pac_off, false);
+static const Property arm_cpu_host_counter_property =
+            DEFINE_PROP_BOOL("x-host-counter", ARMCPU, host_counter, false);
 
 static const Property arm_cpu_va_param_cache_property =
             DEFINE_PROP_BOOL("x-va-param-cache", ARMCPU, va_param_cache, false);
@@ -1751,6 +1758,8 @@ static void arm_cpu_post_init(Object *obj)
     }
     if (arm_feature(&cpu->env, ARM_FEATURE_AARCH64)) {
         qdev_property_add_static(DEVICE(obj), &arm_cpu_keep_kernel_tlb_property);
+        qdev_property_add_static(DEVICE(obj), &arm_cpu_el0_pac_off_property);
+        qdev_property_add_static(DEVICE(obj), &arm_cpu_host_counter_property);
         qdev_property_add_static(DEVICE(obj), &arm_cpu_va_param_cache_property);
         qdev_property_add_static(DEVICE(obj), &arm_cpu_counter_nobql_property);
         qdev_property_add_static(DEVICE(obj), &arm_cpu_hcr_cache_property);
@@ -2654,6 +2663,10 @@ static vaddr aprofile_pointer_wrap(CPUState *cs, int mmu_idx,
 
 static const TCGCPUOps arm_tcg_ops = {
     .mttcg_supported = true,
+#ifndef CONFIG_USER_ONLY
+    .try_native = native_el0_try,
+    .native_kick = native_el0_kick,
+#endif
     /* ARM processors have a weak memory model */
     .guest_default_memory_order = 0,
 

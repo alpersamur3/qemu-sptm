@@ -1200,6 +1200,20 @@ bool memory_region_init_ram_from_file(MemoryRegion *mr,
                                       const char *path,
                                       ram_addr_t offset,
                                       Error **errp);
+
+/**
+ * memory_region_init_ram_from_fd_align: memory_region_init_ram_from_fd whose
+ *                                       host mapping is aligned to @align.
+ */
+bool memory_region_init_ram_from_fd_align(MemoryRegion *mr,
+                                          Object *owner,
+                                          const char *name,
+                                          uint64_t size,
+                                          uint64_t align,
+                                          uint32_t ram_flags,
+                                          int fd,
+                                          ram_addr_t offset,
+                                          Error **errp);
 #endif
 
 /**

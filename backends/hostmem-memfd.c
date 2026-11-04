@@ -47,6 +47,23 @@ memfd_backend_memory_alloc(HostMemoryBackend *backend, Error **errp)
         goto have_fd;
     }
 
+    /*
+     * ASOFT_GUEST_RAM_FD=<n>: a memfd of the right size the parent made and
+     * left open for us (an Android app maps the guest framebuffer from it;
+     * it may neither look into our /proc/<pid>/fd nor reopen a memfd).
+     */
+    const char *inherited = getenv("ASOFT_GUEST_RAM_FD");
+    if (inherited && *inherited) {
+        struct stat st;
+        fd = atoi(inherited);
+        if (fstat(fd, &st) < 0 || st.st_size != backend->size) {
+            error_setg(errp, "ASOFT_GUEST_RAM_FD=%s is not a guest RAM memfd of %" PRIu64 " bytes",
+                       inherited, backend->size);
+            return false;
+        }
+        goto have_fd;
+    }
+
     fd = qemu_memfd_create(TYPE_MEMORY_BACKEND_MEMFD, backend->size,
                            m->hugetlb, m->hugetlbsize, m->seal ?
                            F_SEAL_GROW | F_SEAL_SHRINK | F_SEAL_SEAL : 0,

@@ -66,5 +66,6 @@ static void a##_darwin_class_set(Object *obj, const char *path, Error **errp) { 
 }
 
 void arm_load_xnu(ARMCPU *cpu, MachineState *ms, struct xnu_boot_info *info);
+void xnu_init_guest_ram(MemoryRegion *mr, const char *name, size_t len);
 
 #endif /* XNUBOOT_H */

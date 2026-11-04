@@ -1360,6 +1360,13 @@ uint64_t gt_get_countervalue(CPUARMState *env)
 {
     ARMCPU *cpu = env_archcpu(env);
 
+#if defined(__aarch64__) && defined(__linux__)
+    if (cpu->host_counter) {
+        uint64_t v;
+        __asm__ volatile("isb; mrs %0, cntvct_el0" : "=r"(v));
+        return v;
+    }
+#endif
     return qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) / gt_cntfrq_period_ns(cpu);
 }
 
@@ -1550,7 +1557,20 @@ static void gt_recalc_timer(ARMCPU *cpu, int timeridx)
          * set the timer for as far in the future as possible. When the
          * timer expires we will reset the timer for any remaining period.
          */
-        if (nexttick > INT64_MAX / gt_cntfrq_period_ns(cpu)) {
+        if (cpu->host_counter) {
+            /*
+             * The counter is not the virtual clock, so schedule the
+             * expiry relative to now: in (nexttick - count) ticks.
+             */
+            uint64_t ticks = nexttick > count ? nexttick - count : 0;
+            uint64_t period = gt_cntfrq_period_ns(cpu);
+            int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+            if (ticks > (uint64_t)(INT64_MAX - now) / period) {
+                timer_mod_ns(cpu->gt_timer[timeridx], INT64_MAX);
+            } else {
+                timer_mod_ns(cpu->gt_timer[timeridx], now + ticks * period);
+            }
+        } else if (nexttick > INT64_MAX / gt_cntfrq_period_ns(cpu)) {
             timer_mod_ns(cpu->gt_timer[timeridx], INT64_MAX);
         } else {
             timer_mod(cpu->gt_timer[timeridx], nexttick);
@@ -2912,6 +2932,7 @@ static void vmsa_ttbr_write(CPUARMState *env, const ARMCPRegInfo *ri,
         }
     }
     raw_write(env, ri, value);
+    smp_mb();   /* against native_el0_tlbi_scope(): our next walk sees the PTE its TLBI is for */
 }
 
 static void vmsa_tcr_ttbr_el2_write(CPUARMState *env, const ARMCPRegInfo *ri,
@@ -9448,6 +9469,80 @@ static bool syndrome_is_sync_extabt(uint32_t syndrome)
 }
 
 /* Handle exception entry to a target EL which is using AArch64 */
+static void asoft_exc_trace(CPUState *cs, CPUARMState *env)
+{
+    static int left = -1;
+    static int64_t t0;
+    if (left < 0) {
+        const char *e = getenv("ASOFT_EXC_TRACE");
+        left = e ? atoi(e) : 0;
+        t0 = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+    }
+    if (left <= 0) {
+        return;
+    }
+    left--;
+    uint64_t ttbr = (env->cp15.tcr_el[1] & (1ULL << 22))
+                    ? env->cp15.ttbr1_el[1] : env->cp15.ttbr0_el[1];
+    fprintf(stderr, "exc[%d] %" PRId64 "ms asid=%u excp=%d pc=%#" PRIx64
+            " syn=%#" PRIx64 " far=%#" PRIx64 " x16=%" PRId64 " x0=%#" PRIx64
+            " x1=%#" PRIx64 " x2=%#" PRIx64 " x3=%#" PRIx64 " x4=%#" PRIx64 " x5=%#" PRIx64 " lr=%#" PRIx64 " sp=%#" PRIx64 "\n",
+            cs->cpu_index, (qemu_clock_get_ns(QEMU_CLOCK_REALTIME) - t0) / 1000000,
+            (unsigned)extract64(ttbr, 48, 16), cs->exception_index, env->pc,
+            env->exception.syndrome, env->exception.vaddress,
+            (int64_t)env->xregs[16], env->xregs[0], env->xregs[1], env->xregs[2],
+            env->xregs[3], env->xregs[4], env->xregs[5], env->xregs[30], env->xregs[31]);
+}
+
+static uint64_t asoft_ld64(CPUState *cs, uint64_t va)
+{
+    uint64_t v = 0;
+    cpu_memory_rw_debug(cs, va, &v, 8, false);
+    return v;
+}
+
+static uint32_t asoft_ld32(CPUState *cs, uint64_t va)
+{
+    uint32_t v = 0;
+    cpu_memory_rw_debug(cs, va, &v, 4, false);
+    return v;
+}
+
+static void asoft_malloc_globals(CPUState *cs, CPUARMState *env)
+{
+    static int done;
+    if (done || cs->exception_index != EXCP_SWI || (int64_t)env->xregs[16] != -15 ||
+        env->xregs[2] != 0x800000) {
+        return;
+    }
+    done = 1;
+    uint64_t fp = env->xregs[29];
+    uint64_t ret0 = asoft_ld64(cs, fp + 8);
+    uint32_t a = 0, b = 0;
+    uint64_t site = ret0;
+    for (int k = 0; k < 160; k++) {          /* find 'adrp x2, ..; add x2, x2, #imm' */
+        a = asoft_ld32(cs, ret0 + k * 4);
+        b = asoft_ld32(cs, ret0 + k * 4 + 4);
+        if ((a & 0x9f00001fu) == 0x90000002u && (b & 0xffc003ffu) == 0x91000042u) {
+            site = ret0 + k * 4;
+            break;
+        }
+    }
+    fprintf(stderr, "malloc-globals: fp=%#" PRIx64 " ret0=%#" PRIx64 " a=%#x b=%#x", fp, ret0, a, b);
+    if ((a & 0x9f000000u) == 0x90000000u && (b & 0xff800000u) == 0x91000000u) {
+        int64_t immlo = (a >> 29) & 3, immhi = (a >> 5) & 0x7ffff;
+        int64_t imm = ((immhi << 2) | immlo) << 12;
+        imm = (imm << 31) >> 31;
+        uint64_t page = (site & ~0xfffULL) + imm;
+        uint64_t g = page + ((b >> 10) & 0xfff);
+        fprintf(stderr, " &entropic_address=%#" PRIx64 " values:", g);
+        for (int k = -6; k < 2; k++) {
+            fprintf(stderr, " %#" PRIx64, asoft_ld64(cs, g + k * 8));
+        }
+    }
+    fprintf(stderr, "\n");
+}
+
 static void arm_cpu_do_interrupt_aarch64(CPUState *cs)
 {
     ARMCPU *cpu = ARM_CPU(cs);
@@ -9457,6 +9552,11 @@ static void arm_cpu_do_interrupt_aarch64(CPUState *cs)
     uint64_t new_mode = aarch64_pstate_mode(new_el, true);
     uint64_t old_mode;
     unsigned int cur_el = arm_current_el(env);
+
+    if (cur_el == 0) {
+        asoft_exc_trace(cs, env);
+        asoft_malloc_globals(cs, env);
+    }
     int rt;
 
     if (arm_apple_is_gl(env)) {

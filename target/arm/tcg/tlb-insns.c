@@ -13,6 +13,7 @@
 #include "internals.h"
 #include "cpu-features.h"
 #include "cpregs.h"
+#include "native-el0.h"
 
 /* Check for traps from EL1 due to HCR_EL2.TTLB. */
 static CPAccessResult access_ttlb(CPUARMState *env, const ARMCPRegInfo *ri,
@@ -320,6 +321,8 @@ static void tlbi_aa64_vmalle1is_write(CPUARMState *env, const ARMCPRegInfo *ri,
     CPUState *cs = env_cpu(env);
     int mask = vae1_tlbmask(env);
 
+    native_el0_tlbi_all();
+
     tlb_flush_by_mmuidx_all_cpus_synced(cs, mask);
 }
 
@@ -328,6 +331,8 @@ static void tlbi_aa64_vmalle1_write(CPUARMState *env, const ARMCPRegInfo *ri,
 {
     CPUState *cs = env_cpu(env);
     int mask = vae1_tlbmask(env);
+
+    native_el0_tlbi_all();
 
     if (tlb_force_broadcast(env)) {
         tlb_flush_by_mmuidx_all_cpus_synced(cs, mask);
@@ -359,6 +364,8 @@ static void tlbi_aa64_aside1is_write(CPUARMState *env, const ARMCPRegInfo *ri,
     int mask = vae1_tlbmask(env);
     MMUIdxMap full, lower;
 
+    native_el0_tlbi_asid(extract64(value, 48, 16));
+
     if (aside1_keep_upper(env, mask, &full, &lower)) {
         tlb_flush_keep_upper_all_cpus_synced(cs, full, lower,
                                              extract64(value, 48, 16));
@@ -373,6 +380,8 @@ static void tlbi_aa64_aside1_write(CPUARMState *env, const ARMCPRegInfo *ri,
     CPUState *cs = env_cpu(env);
     int mask = vae1_tlbmask(env);
     MMUIdxMap full, lower;
+
+    native_el0_tlbi_asid(extract64(value, 48, 16));
 
     if (!aside1_keep_upper(env, mask, &full, &lower)) {
         tlbi_aa64_vmalle1_write(env, ri, value);
@@ -398,6 +407,7 @@ static int e2_tlbmask(CPUARMState *env)
 static void tlbi_aa64_alle1_write(CPUARMState *env, const ARMCPRegInfo *ri,
                                   uint64_t value)
 {
+    native_el0_tlbi_all();
     CPUState *cs = env_cpu(env);
     int mask = alle1_tlbmask(env);
 
@@ -425,6 +435,7 @@ static void tlbi_aa64_alle3_write(CPUARMState *env, const ARMCPRegInfo *ri,
 static void tlbi_aa64_alle1is_write(CPUARMState *env, const ARMCPRegInfo *ri,
                                     uint64_t value)
 {
+    native_el0_tlbi_all();
     CPUState *cs = env_cpu(env);
     int mask = alle1_tlbmask(env);
 
@@ -487,6 +498,19 @@ static void tlbi_aa64_vae1is_write(CPUARMState *env, const ARMCPRegInfo *ri,
     uint64_t pageaddr = sextract64(value << 12, 0, 56);
     int bits = vae1_tlbbits(env, pageaddr);
 
+    native_el0_tlbi_page(pageaddr, (ri->opc2 & 2) ? -1 : (int)extract64(value, 48, 16));
+
+    if (!(ri->opc2 & 2)) {
+        switch (native_el0_tlbi_scope(cs, pageaddr, extract64(value, 48, 16))) {
+        case TLBI_SCOPE_NONE:
+            return;
+        case TLBI_SCOPE_SELF:
+            tlb_flush_page_bits_by_mmuidx(cs, pageaddr, mask, bits);
+            return;
+        default:
+            break;
+        }
+    }
     tlb_flush_page_bits_by_mmuidx_all_cpus_synced(cs, pageaddr, mask, bits);
 }
 
@@ -503,6 +527,8 @@ static void tlbi_aa64_vae1_write(CPUARMState *env, const ARMCPRegInfo *ri,
     int mask = vae1_tlbmask(env);
     uint64_t pageaddr = sextract64(value << 12, 0, 56);
     int bits = vae1_tlbbits(env, pageaddr);
+
+    native_el0_tlbi_page(pageaddr, (ri->opc2 & 2) ? -1 : (int)extract64(value, 48, 16));
 
     if (tlb_force_broadcast(env)) {
         tlb_flush_page_bits_by_mmuidx_all_cpus_synced(cs, pageaddr, mask, bits);
@@ -942,6 +968,8 @@ static void do_rvae_write(CPUARMState *env, uint64_t value,
 
     range = tlbi_aa64_get_range(env, one_idx, value);
     bits = tlbbits_for_regime(env, one_idx, range.base);
+
+    native_el0_tlbi_range(range.base, range.length, -1);
 
     if (synced) {
         tlb_flush_range_by_mmuidx_all_cpus_synced(env_cpu(env),

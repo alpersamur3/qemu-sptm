@@ -545,6 +545,9 @@ static void pauth_check_trap(CPUARMState *env, int el, uintptr_t ra)
 
 static bool pauth_key_enabled(CPUARMState *env, int el, uint32_t bit)
 {
+    if (el == 0 && env_archcpu(env)->el0_pac_off) {
+        return false;
+    }
     return (pauth_sctlr(env, el) & bit) != 0;
 }
 

@@ -7,6 +7,8 @@
 #include <sys/stat.h>
 #include <inttypes.h>
 #include "qemu/bitops.h"
+#include "qemu/memfd.h"
+#include "migration/vmstate.h"
 #include "xnu/boot/xnuboot.h"
 #include "xnu/boot/args.h"
 #include "xnu/boot/trustcache.h"
@@ -32,10 +34,27 @@
 #define GET_L2_PT_INDEX(a)      (( ((a)) & ( (BIT_ULL(36)-1)) ))
 #define STRIP_L2_PT_INDEX(a)    (( ((a)) & (~(BIT_ULL(36)-1)) ))
 
+void xnu_init_guest_ram(MemoryRegion *mr, const char *name, size_t len)
+{
+#ifdef CONFIG_LINUX
+    /*
+     * A file behind the guest's pages, which pvg=reims aliases and imports (Windows' RAM is a section).
+     * At the guest's page in the host too: reims refuses an isolated task a range that is not, and a
+     * 4 KiB host only gives its own page by itself.
+     */
+    int fd = qemu_memfd_create(name, len, false, 0, 0, &error_fatal);
+
+    memory_region_init_ram_from_fd_align(mr, NULL, name, len, PAGE_SIZE, RAM_SHARED, fd, 0, &error_fatal);
+    vmstate_register_ram_global(mr);
+#else
+    memory_region_init_ram(mr, NULL, name, len, &error_fatal);
+#endif
+}
+
 static void alloc_ram(Object *cpuobj, hwaddr base, size_t len) {
     MemoryRegion *ram_main = get_system_memory();
     MemoryRegion *ram_subreg = g_new(MemoryRegion, 1);
-    memory_region_init_ram(ram_subreg, NULL, "dram", len, &error_fatal);
+    xnu_init_guest_ram(ram_subreg, "dram", len);
     memory_region_add_subregion(ram_main, base, ram_subreg);
 }
 

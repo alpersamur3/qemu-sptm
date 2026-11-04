@@ -1640,19 +1640,30 @@ bool memory_region_init_ram_from_file(MemoryRegion *mr, Object *owner,
     return memory_region_set_ram_block(mr, rb);
 }
 
-bool memory_region_init_ram_from_fd(MemoryRegion *mr, Object *owner,
-                                    const char *name, uint64_t size,
-                                    uint32_t ram_flags, int fd,
-                                    ram_addr_t offset, Error **errp)
+bool memory_region_init_ram_from_fd_align(MemoryRegion *mr, Object *owner,
+                                          const char *name, uint64_t size,
+                                          uint64_t align, uint32_t ram_flags,
+                                          int fd, ram_addr_t offset,
+                                          Error **errp)
 {
     RAMBlock *rb;
 
     memory_region_init(mr, owner, name, size);
     mr->ram = true;
     mr->readonly = !!(ram_flags & RAM_READONLY);
+    mr->align = align;
     rb = qemu_ram_alloc_from_fd(size, size, NULL, mr, ram_flags, fd, offset,
                                 false, errp);
     return memory_region_set_ram_block(mr, rb);
+}
+
+bool memory_region_init_ram_from_fd(MemoryRegion *mr, Object *owner,
+                                    const char *name, uint64_t size,
+                                    uint32_t ram_flags, int fd,
+                                    ram_addr_t offset, Error **errp)
+{
+    return memory_region_init_ram_from_fd_align(mr, owner, name, size, 0,
+                                                ram_flags, fd, offset, errp);
 }
 #else
 bool memory_region_init_ram_from_fd(MemoryRegion *mr,

@@ -34,6 +34,15 @@ struct TCGCPUOps {
     bool mttcg_supported;
 
     /**
+     * @try_native: run guest user-mode code outside TCG when possible.
+     * Returns when it did nothing; a run ends through cpu_loop_exit() or
+     * an exception, never by returning here.
+     */
+    bool (*try_native)(CPUState *cpu);
+    /** @native_kick: interrupt a vCPU running outside TCG */
+    void (*native_kick)(CPUState *cpu);
+
+    /**
      * @precise_smc: Stores which modify code within the current TB force
      *               the TB to exit; the next executed instruction will see
      *               the result of the store.

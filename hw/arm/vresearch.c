@@ -452,7 +452,7 @@ static void create_util(struct dtree_node *dt_root)
     }
     reg = adt_get_prop_val(util, "reg");
     mr = g_new(MemoryRegion, 1);
-    memory_region_init_ram(mr, NULL, "util", reg->len, &error_fatal);
+    xnu_init_guest_ram(mr, "util", reg->len);
     memory_region_add_subregion(get_system_memory(), reg->base, mr);
 }
 
@@ -605,7 +605,7 @@ static void create_fb(VResearchState *s)
     if (!info->video_base) {
         return;
     }
-    memory_region_init_ram(&s->fb_ram, NULL, "vresearch.fb", size, &error_fatal);
+    xnu_init_guest_ram(&s->fb_ram, "vresearch.fb", size);
     memory_region_add_subregion(get_system_memory(), info->video_base, &s->fb_ram);
     s->fb_con = qemu_graphic_console_create(NULL, 0, &fb_ops, s);
     surface = qemu_create_displaysurface_from(info->video_width, info->video_height,

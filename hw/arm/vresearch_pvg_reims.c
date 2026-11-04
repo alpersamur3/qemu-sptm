@@ -14,8 +14,9 @@
  *   system memory's flat view at machine-init-done, each range with the
  *   pagefile section behind it (qemu_win_ram_section(), the Windows memory
  *   file ABI: fd = the section handle, offset = the range's byte offset in
- *   it) so that the library can alias runs of guest pages for the root page,
- *   the FIFO rings and the surfaces.
+ *   it; elsewhere fd = the RAM block's file, a shared memory-backend-memfd)
+ *   so that the library can alias runs of guest pages for the root page, the
+ *   FIFO rings and the surfaces.
  * - TCG takes the BQL at every MMIO access and a root FIFO write waits for
  *   the library's FIFO thread, so no library callback may take the BQL or
  *   wait for a bottom half: raise_interrupt only schedules one. The GPU line
@@ -52,6 +53,7 @@
 #include "migration/vmstate.h"
 #include "system/address-spaces.h"
 #include "system/memory.h"
+#include "system/ramblock.h"
 #include "system/system.h"
 #include "ui/console.h"
 #include "hw/arm/vresearch_pvg.h"
@@ -494,9 +496,15 @@ static bool map_add_range(Int128 start, Int128 len, const MemoryRegion *mr,
     MapBuilder *b = opaque;
     uint64_t gpa, size, offset = 0;
     uint8_t *host;
-    HANDLE section;
     RvgMemoryRange range;
     RvgMemoryRangeFile file;
+#ifdef _WIN32
+    HANDLE section;
+#else
+    ram_addr_t in_block;
+    RAMBlock *block;
+    int section;
+#endif
 
     if (!memory_region_is_ram(mr) || memory_region_is_rom(mr) ||
         memory_region_is_romd(mr) || memory_region_is_ram_device(mr)) {
@@ -505,7 +513,14 @@ static bool map_add_range(Int128 start, Int128 len, const MemoryRegion *mr,
     gpa = int128_get64(start);
     size = int128_get64(len);
     host = (uint8_t *)memory_region_get_ram_ptr(mr) + offset_in_region;
+#ifdef _WIN32
     section = qemu_win_ram_section(host, &offset);
+#else
+    /* The RAM block's file, and the range's offset in it (-object memory-backend-memfd) */
+    block = qemu_ram_block_from_host(host, false, &in_block);
+    section = block ? qemu_ram_get_fd(block) : -1;
+    offset = section >= 0 ? qemu_ram_get_fd_offset(block) + in_block : 0;
+#endif
     if (gpa % PVG_PAGE || size % PVG_PAGE || offset % qemu_real_host_page_size()) {
         warn_report("vresearch-pvg-reims: RAM '%s' at 0x%" PRIx64 " (%" PRIu64
                     " bytes) left out of the GPU's memory map: not whole 16 KiB pages",
@@ -513,7 +528,11 @@ static bool map_add_range(Int128 start, Int128 len, const MemoryRegion *mr,
         b->skipped++;
         return false;
     }
+#ifdef _WIN32
     if (!section) {
+#else
+    if (section < 0) {
+#endif
         warn_report("vresearch-pvg-reims: RAM '%s' at 0x%" PRIx64 " has no section "
                     "behind it: the GPU can't alias its pages", memory_region_name(mr),
                     gpa);
@@ -523,7 +542,11 @@ static bool map_add_range(Int128 start, Int128 len, const MemoryRegion *mr,
         .physical_address = gpa, .physical_length = size, .host_address = host,
     };
     file = (RvgMemoryRangeFile) {
+#ifdef _WIN32
         .fd = section ? (int32_t)(intptr_t)section : -1,
+#else
+        .fd = section,
+#endif
         .flags = 0,
         .offset = offset,
     };
@@ -531,7 +554,7 @@ static bool map_add_range(Int128 start, Int128 len, const MemoryRegion *mr,
     g_array_append_val(b->files, file);
     info_report("vresearch-pvg-reims: GPU memory map: '%s' guest 0x%" PRIx64
                 " + 0x%" PRIx64 " at host %p, section %p offset 0x%" PRIx64,
-                memory_region_name(mr), gpa, size, host, (void *)section, offset);
+                memory_region_name(mr), gpa, size, host, (void *)(intptr_t)section, offset);
     return false;
 }
 
