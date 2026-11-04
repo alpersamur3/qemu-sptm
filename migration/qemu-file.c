@@ -34,8 +34,14 @@
 #include "rdma.h"
 #include "io/channel-file.h"
 
-#define IO_BUF_SIZE 32768
-#define MAX_IOV_SIZE MIN_CONST(IOV_MAX, 64)
+/*
+ * ASoftware for Android saves to a qcow2 opened with O_DIRECT (cache=none: through the page
+ * cache, the ~3 GB of RAM a save writes filled the phone's memory and lmkd killed the app). Each
+ * flush lands at an unaligned offset of the vmstate area, so O_DIRECT pays a read-modify-write per
+ * flush: flush 1024 pages at a time instead of 64, and read 1 MiB at a time when loading.
+ */
+#define IO_BUF_SIZE (1024 * 1024)
+#define MAX_IOV_SIZE MIN_CONST(IOV_MAX, 1024)
 
 typedef struct FdEntry {
     QTAILQ_ENTRY(FdEntry) entry;
