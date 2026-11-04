@@ -135,10 +135,32 @@ qemu_input_find_handler(uint32_t mask, const QemuConsole *con)
     return NULL;
 }
 
+/*
+ * ASOFT_LEDS_FILE=<path>: the guest keyboard's LED mask (QEMU_*_LOCK_LED) as the
+ * file's first byte, kept current. A display without a QEMU UI (the Android
+ * app) maps the file and reads it each frame: ASoftware's XNU lights Scroll
+ * Lock while iOS has its display off.
+ */
+static void asoft_leds_file(uint32_t leds_mask)
+{
+    static int fd = -2;
+    uint8_t b = leds_mask;
+
+    if (fd == -2) {
+        const char *path = getenv("ASOFT_LEDS_FILE");
+
+        fd = path ? open(path, O_WRONLY | O_CREAT | O_CLOEXEC, 0600) : -1;
+    }
+    if (fd >= 0 && pwrite(fd, &b, 1, 0) != 1) {
+        /* nobody to tell */
+    }
+}
+
 void qemu_input_handler_set_leds_mask(QemuInputHandlerState *s, uint32_t leds_mask)
 {
     assert(s->handler->mask & INPUT_EVENT_MASK_KEY);
     s->leds_mask = leds_mask;
+    asoft_leds_file(leds_mask);
     notifier_list_notify(&leds_notifiers, NULL);
 }
 
