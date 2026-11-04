@@ -307,8 +307,6 @@ update_map_file:
 
     map_fd = fileno(fp);
     assert(map_fd != -1);
-    ret = fchmod(map_fd, 0600);
-    assert(ret == 0);
 
     if (credp->fc_uid != -1) {
         uid = credp->fc_uid;
@@ -545,9 +543,23 @@ static void local_rewinddir(FsContext *ctx, V9fsFidOpenState *fs)
     rewinddir(fs->dir.stream);
 }
 
+struct DIR {
+    int fd_;
+};
+
+static long android_telldir(struct DIR *dirp)
+{
+    return (long) lseek(dirp->fd_, 0, SEEK_CUR);
+}
+
+static void android_seekdir(DIR *dirp, long loc)
+{
+    (void) lseek(dirp->fd_, loc, SEEK_SET);
+}
+
 static off_t local_telldir(FsContext *ctx, V9fsFidOpenState *fs)
 {
-    return telldir(fs->dir.stream);
+    return android_telldir(fs->dir.stream);
 }
 
 static bool local_is_mapped_file_metadata(FsContext *fs_ctx, const char *name)
@@ -590,7 +602,7 @@ again:
 
 static void local_seekdir(FsContext *ctx, V9fsFidOpenState *fs, off_t off)
 {
-    seekdir(fs->dir.stream, off);
+    android_seekdir(fs->dir.stream, off);
 }
 
 static ssize_t local_preadv(FsContext *ctx, V9fsFidOpenState *fs,

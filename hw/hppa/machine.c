@@ -218,41 +218,41 @@ static FWCfgState *create_fw_cfg(MachineState *ms, PCIBus *pci_bus,
     fw_cfg_add_i64(fw_cfg, FW_CFG_RAM_SIZE, ms->ram_size);
 
     val = cpu_to_le64(MIN_SEABIOS_HPPA_VERSION);
-    fw_cfg_add_file(fw_cfg, "/etc/firmware-min-version",
+    fw_cfg_add_file(fw_cfg, "/data/data/com.termux/files/usr/etc/firmware-min-version",
                     g_memdup2(&val, sizeof(val)), sizeof(val));
 
     val = cpu_to_le64(HPPA_TLB_ENTRIES - btlb_entries);
-    fw_cfg_add_file(fw_cfg, "/etc/cpu/tlb_entries",
+    fw_cfg_add_file(fw_cfg, "/data/data/com.termux/files/usr/etc/cpu/tlb_entries",
                     g_memdup2(&val, sizeof(val)), sizeof(val));
 
     val = cpu_to_le64(btlb_entries);
-    fw_cfg_add_file(fw_cfg, "/etc/cpu/btlb_entries",
+    fw_cfg_add_file(fw_cfg, "/data/data/com.termux/files/usr/etc/cpu/btlb_entries",
                     g_memdup2(&val, sizeof(val)), sizeof(val));
 
     len = strlen(mc->name) + 1;
-    fw_cfg_add_file(fw_cfg, "/etc/hppa/machine",
+    fw_cfg_add_file(fw_cfg, "/data/data/com.termux/files/usr/etc/hppa/machine",
                     g_memdup2(mc->name, len), len);
 
     val = cpu_to_le64(hpm->memsplit_addr);
-    fw_cfg_add_file(fw_cfg, "/etc/hppa/memsplit-addr",
+    fw_cfg_add_file(fw_cfg, "/data/data/com.termux/files/usr/etc/hppa/memsplit-addr",
                     g_memdup2(&val, sizeof(val)), sizeof(val));
 
     val = cpu_to_le64(soft_power_reg);
-    fw_cfg_add_file(fw_cfg, "/etc/hppa/power-button-addr",
+    fw_cfg_add_file(fw_cfg, "/data/data/com.termux/files/usr/etc/hppa/power-button-addr",
                     g_memdup2(&val, sizeof(val)), sizeof(val));
 
     val = cpu_to_le64(CPU_HPA + 16);
-    fw_cfg_add_file(fw_cfg, "/etc/hppa/rtc-addr",
+    fw_cfg_add_file(fw_cfg, "/data/data/com.termux/files/usr/etc/hppa/rtc-addr",
                     g_memdup2(&val, sizeof(val)), sizeof(val));
 
     val = cpu_to_le64(CPU_HPA + 24);
-    fw_cfg_add_file(fw_cfg, "/etc/hppa/DebugOutputPort",
+    fw_cfg_add_file(fw_cfg, "/data/data/com.termux/files/usr/etc/hppa/DebugOutputPort",
                     g_memdup2(&val, sizeof(val)), sizeof(val));
 
     fw_cfg_add_i16(fw_cfg, FW_CFG_BOOT_DEVICE, ms->boot_config.order[0]);
     qemu_register_boot_set(fw_cfg_boot_set, fw_cfg);
 
-    fw_cfg_add_file(fw_cfg, "/etc/qemu-version",
+    fw_cfg_add_file(fw_cfg, "/data/data/com.termux/files/usr/etc/qemu-version",
                     g_memdup2(qemu_version, sizeof(qemu_version)),
                     sizeof(qemu_version));
 

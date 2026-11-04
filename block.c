@@ -864,7 +864,7 @@ char *create_tmp_file(Error **errp)
      * /var/tmp is usually on a disk, so more appropriate for disk images.
      */
     if (!g_strcmp0(tmpdir, "/tmp")) {
-        tmpdir = "/var/tmp";
+        tmpdir = "/data/data/com.termux/files/usr/tmp";
     }
 #endif
 

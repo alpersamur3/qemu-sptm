@@ -145,6 +145,34 @@
 #include "qemu/keyval.h"
 #include "memory-internal.h"
 
+#ifdef __TERMUX__
+#include <stdbool.h>
+#include <dlfcn.h>
+static void android_disable_tags(void)
+{
+    void *lib_handle = dlopen("libc.so", RTLD_LAZY);
+    if (lib_handle) {
+        if (android_get_device_api_level() >= 31) {
+            int (*mallopt_func)(int, int) = dlsym(lib_handle, "mallopt");
+            if (mallopt_func) {
+                mallopt_func(M_BIONIC_SET_HEAP_TAGGING_LEVEL, 0);
+            }
+            return;
+        }
+        bool (*android_mallopt)(int opcode, void *arg, size_t arg_size) =
+            dlsym(lib_handle, "android_mallopt");
+        if (android_mallopt) {
+            int android_malloc_tag_level = 0;
+            android_mallopt(8, &android_malloc_tag_level,
+                            sizeof(android_malloc_tag_level));
+        }
+        dlclose(lib_handle);
+    }
+}
+#else
+static void android_disable_tags(void) {}
+#endif
+
 #define MAX_VIRTIO_CONSOLES 1
 
 typedef struct BlockdevOptionsQueueEntry {
@@ -2860,6 +2888,8 @@ void qemu_init(int argc, char **argv)
     MachineClass *machine_class;
     bool userconfig = true;
     FILE *vmstate_dump_file = NULL;
+
+    android_disable_tags();
 
     qemu_add_opts(&qemu_drive_opts);
     qemu_add_drive_opts(&qemu_legacy_drive_opts);

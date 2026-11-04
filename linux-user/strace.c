@@ -2,7 +2,7 @@
 
 #include <sys/ipc.h>
 #include <sys/msg.h>
-#include <sys/sem.h>
+#include <linux/sem.h>
 #include <sys/shm.h>
 #include <sys/select.h>
 #include <sys/mount.h>
@@ -1056,7 +1056,7 @@ UNUSED static const struct flags access_flags[] = {
 
 UNUSED static const struct flags at_file_flags[] = {
 #ifdef AT_EACCESS
-    FLAG_GENERIC(AT_EACCESS),
+    FLAG_GENERIC(/* AT_EACCESS */ 0x200),
 #endif
 #ifdef AT_SYMLINK_NOFOLLOW
     FLAG_GENERIC(AT_SYMLINK_NOFOLLOW),

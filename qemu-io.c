@@ -124,7 +124,7 @@ static void open_help(void)
 " opens a new file in the requested mode\n"
 "\n"
 " Example:\n"
-" 'open -n -o driver=raw /tmp/data' - opens raw data file read-write, uncached\n"
+" 'open -n -o driver=raw /data/data/com.termux/files/usr/tmp/data' - opens raw data file read-write, uncached\n"
 "\n"
 " Opens a file for subsequent use by all of the other qemu-io commands.\n"
 " -r, -- open file read-only\n"

@@ -1409,7 +1409,7 @@ abi_ulong target_shmat(CPUArchState *cpu_env, int shmid,
      */
     t_shmlba = target_shmlba(cpu_env);
     h_pagesize = qemu_real_host_page_size();
-    h_shmlba = (HOST_FORCE_SHMLBA ? SHMLBA : h_pagesize);
+    h_shmlba = (HOST_FORCE_SHMLBA ? /* SHMLBA */ getpagesize() : h_pagesize);
     m_shmlba = MAX(t_shmlba, h_shmlba);
 
     if (shmaddr) {

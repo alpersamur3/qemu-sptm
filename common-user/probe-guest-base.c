@@ -325,7 +325,7 @@ void probe_guest_base(const char *image_name, const PGBRange *image_range,
                       const PGBRange *commpage_range)
 {
     /* In order to use host shmat, we must be able to honor SHMLBA.  */
-    uintptr_t align = MAX(SHMLBA, TARGET_PAGE_SIZE);
+    uintptr_t align = MAX(qemu_real_host_page_size(), TARGET_PAGE_SIZE);
 
     /* Sanity check the guest binary. */
     if (reserved_va && image_range && image_range->hi > reserved_va) {

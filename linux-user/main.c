@@ -531,7 +531,7 @@ static const struct qemu_argument arg_table[] = {
      "",           "assume CALL0 Xtensa ABI"},
 #endif
     {"perfmap",    "QEMU_PERFMAP",     false, handle_arg_perfmap,
-     "",           "Generate a /tmp/perf-${pid}.map file for perf"},
+     "",           "Generate a /data/data/com.termux/files/usr/tmp/perf-${pid}.map file for perf"},
     {"jitdump",    "QEMU_JITDUMP",     false, handle_arg_jitdump,
      "",           "Generate a jit-${pid}.dump file for perf"},
     {NULL, NULL, false, NULL, NULL, NULL}

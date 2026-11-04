@@ -50,7 +50,7 @@ void perf_enable_perfmap(void)
 {
     char map_file[32];
 
-    snprintf(map_file, sizeof(map_file), "/tmp/perf-%d.map", getpid());
+    snprintf(map_file, sizeof(map_file), "/data/data/com.termux/files/usr/tmp/perf-%d.map", getpid());
     perfmap = safe_fopen_w(map_file);
     if (perfmap == NULL) {
         warn_report("Could not open %s: %s, proceeding without perfmap",

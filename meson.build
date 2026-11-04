@@ -28,6 +28,10 @@ ss = import('sourceset')
 fs = import('fs')
 
 host_os = host_machine.system()
+# Termux's Python 3.13+ answers "android" where a cross build says "linux": the kernel is Linux
+if host_os == 'android'
+  host_os = 'linux'
+endif
 config_host = keyval.load(meson.current_build_dir() / 'config-host.mak')
 
 # Temporary directory used for files created while
@@ -2638,7 +2642,9 @@ config_host_data.set('CONFIG_SYNC_FILE_RANGE', cc.has_function('sync_file_range'
 config_host_data.set('CONFIG_TIMERFD', cc.has_function('timerfd_create'))
 config_host_data.set('CONFIG_GETLOADAVG', cc.has_function('getloadavg'))
 config_host_data.set('CONFIG_ARPA_INET_64', cc.has_function('htonll'))
-config_host_data.set('HAVE_COPY_FILE_RANGE', cc.has_function('copy_file_range'))
+# with the prefix: bionic declares it only from API level 34, where Termux builds at 24
+config_host_data.set('HAVE_COPY_FILE_RANGE', cc.has_function('copy_file_range',
+                     prefix: '#include <unistd.h>'))
 config_host_data.set('HAVE_GETIFADDRS', cc.has_function('getifaddrs'))
 config_host_data.set('HAVE_GLIB_WITH_SLICE_ALLOCATOR', glib_has_gslice)
 config_host_data.set('HAVE_OPENPTY', cc.has_function('openpty', dependencies: util))
@@ -2896,9 +2902,6 @@ config_host_data.set('CONFIG_PTHREAD_AFFINITY_NP', cc.links(osdep_prefix + '''
     CPU_FREE(cpuset);
     return 0;
   }''', dependencies: threads))
-config_host_data.set('CONFIG_SIGNALFD', cc.links(osdep_prefix + '''
-  #include <sys/signalfd.h>
-  int main(void) { return signalfd(-1, NULL, SFD_CLOEXEC); }'''))
 
 config_host_data.set('HAVE_MLOCKALL', cc.links(osdep_prefix + '''
   #include <sys/mman.h>
@@ -3257,7 +3260,7 @@ disassemblers = {
   'loongarch' : ['CONFIG_LOONGARCH_DIS'],
 }
 
-have_ivshmem = config_host_data.get('CONFIG_EVENTFD')
+have_ivshmem = false
 host_kconfig = \
   (get_option('fuzzing') ? ['CONFIG_FUZZ=y'] : []) + \
   (have_tpm ? ['CONFIG_TPM=y'] : []) + \

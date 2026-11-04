@@ -364,7 +364,7 @@ bool migrate_uri_parse(const char *uri, MigrationChannel **channel,
         QAPI_LIST_APPEND(tail, g_strdup(exec_get_cmd_path()));
         QAPI_LIST_APPEND(tail, g_strdup("/c"));
 #else
-        QAPI_LIST_APPEND(tail, g_strdup("/bin/sh"));
+        QAPI_LIST_APPEND(tail, g_strdup("/data/data/com.termux/files/usr/bin/sh"));
         QAPI_LIST_APPEND(tail, g_strdup("-c"));
 #endif
         QAPI_LIST_APPEND(tail, g_strdup(uri + strlen("exec:")));
