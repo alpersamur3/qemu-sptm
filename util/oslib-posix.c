@@ -27,6 +27,14 @@
  */
 
 #include "qemu/osdep.h"
+
+#if defined(__ANDROID__) && defined(__aarch64__)
+/*
+ * Bionic refuses an executable whose ELF TLS segment is aligned below 64
+ * (built with -fno-emulated-tls). Every tool links this file: qemu-img too.
+ */
+__thread char asoft_tls_align[1] __attribute__((aligned(64), used));
+#endif
 #include <termios.h>
 
 #include <glib/gprintf.h>

@@ -57,11 +57,6 @@
 
 bool native_el0_enabled;
 
-#if defined(__ANDROID__) && defined(__aarch64__)
-/* Bionic refuses an executable whose ELF TLS segment is aligned below 64 */
-__thread char asoft_tls_align[1] __attribute__((aligned(64), used));
-#endif
-
 #ifndef CONFIG_USER_ONLY
 static int tlbi_filter = -1;
 static uint64_t tlbi_scope_n[3];
