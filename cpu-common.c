@@ -368,15 +368,37 @@ void process_queued_cpu_work(CPUState *cpu)
              * CPU is running; 2) cpu_exec in the other CPU tries to takes the
              * BQL, so it goes to sleep; start_exclusive() is sleeping too, so
              * neither CPU can proceed.
+             *
+             * Consecutive exclusive items share one exclusive section: a
+             * guest that invalidates a page per TLBI queues one item per
+             * page, and each start_exclusive() stops every other vCPU.
              */
+            int batch = 0;
             bql_unlock();
             start_exclusive();
-            wi->func(cpu, wi->data);
+            for (;;) {
+                wi->func(cpu, wi->data);
+                qemu_mutex_lock(&cpu->work_mutex);
+                if (wi->free) {
+                    g_free(wi);
+                } else {
+                    qatomic_store_release(&wi->done, true);
+                }
+                wi = QSIMPLEQ_FIRST(&cpu->work_list);
+                if (wi && wi->exclusive && ++batch < 256) {
+                    QSIMPLEQ_REMOVE_HEAD(&cpu->work_list, node);
+                    qemu_mutex_unlock(&cpu->work_mutex);
+                    continue;
+                }
+                qemu_mutex_unlock(&cpu->work_mutex);
+                break;
+            }
             end_exclusive();
             bql_lock();
-        } else {
-            wi->func(cpu, wi->data);
+            qemu_mutex_lock(&cpu->work_mutex);
+            continue;
         }
+        wi->func(cpu, wi->data);
         qemu_mutex_lock(&cpu->work_mutex);
         if (wi->free) {
             g_free(wi);
