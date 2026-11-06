@@ -400,12 +400,38 @@ static bool raw_is_io_aligned(int fd, void *buf, size_t len)
     /* The Linux kernel returns EINVAL for misaligned O_DIRECT reads.  Ignore
      * other errors (e.g. real I/O error), which could happen on a failed
      * drive, since we only care about probing alignment.
+     *
+     * Except EIO: with inline encryption (blk-crypto, Android's f2fs) a
+     * buffer that is not aligned to the crypto data unit fails the bio with
+     * EIO, not EINVAL. Taking that for "aligned" made buf_align 512 where the
+     * file needs 4096, and the guest's misaligned requests then failed.
      */
-    if (errno != EINVAL) {
+    if (errno != EINVAL && errno != EIO) {
         return true;
     }
 #endif
 
+    return false;
+}
+
+/*
+ * The kernel's own O_DIRECT alignment for @fd (Linux 6.1+, STATX_DIOALIGN), through the
+ * system call: Bionic has no statx() before API level 30.
+ */
+static bool raw_probe_dioalign(int fd, uint32_t *mem_align, uint32_t *offset_align)
+{
+#if defined(__linux__) && defined(STATX_DIOALIGN) && defined(__NR_statx)
+    struct statx stx;
+
+    memset(&stx, 0, sizeof(stx));
+    if (syscall(__NR_statx, fd, "", AT_EMPTY_PATH, STATX_DIOALIGN, &stx) == 0 &&
+        (stx.stx_mask & STATX_DIOALIGN) &&
+        stx.stx_dio_mem_align && stx.stx_dio_offset_align) {
+        *mem_align = stx.stx_dio_mem_align;
+        *offset_align = stx.stx_dio_offset_align;
+        return true;
+    }
+#endif
     return false;
 }
 
@@ -448,6 +474,15 @@ static void raw_probe_alignment(BlockDriverState *bs, int fd, Error **errp)
         /* s->buf_align = da.d_mem; */
     }
 #endif
+
+    {
+        uint32_t mem_align, offset_align;
+
+        if (raw_probe_dioalign(fd, &mem_align, &offset_align)) {
+            bs->bl.request_alignment = MAX(bs->bl.request_alignment, offset_align);
+            s->buf_align = mem_align;
+        }
+    }
 
     /*
      * If we could not get the sizes so far, we can only guess them. First try
