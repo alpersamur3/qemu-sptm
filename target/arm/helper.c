@@ -9533,6 +9533,8 @@ static bool syndrome_is_sync_extabt(uint32_t syndrome)
     }
 }
 
+void asoft_who_syscall(uint16_t asid, int64_t num);     /* tcg/native-el0.c */
+
 /* Handle exception entry to a target EL which is using AArch64 */
 static void asoft_exc_trace(CPUState *cs, CPUARMState *env)
 {
@@ -9621,6 +9623,10 @@ static void arm_cpu_do_interrupt_aarch64(CPUState *cs)
     if (cur_el == 0) {
         asoft_exc_trace(cs, env);
         asoft_malloc_globals(cs, env);
+        if (cs->exception_index == EXCP_SWI) {
+            /* ASOFT_WHO: syscalls by process (native-el0.c's sampler reports them) */
+            asoft_who_syscall(extract64(env->cp15.ttbr0_el[1], 48, 16), (int64_t)env->xregs[16]);
+        }
     }
     int rt;
 

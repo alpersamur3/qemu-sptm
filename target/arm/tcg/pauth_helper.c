@@ -591,10 +591,29 @@ uint64_t HELPER(pacdb)(CPUARMState *env, uint64_t x, uint64_t y)
     return pauth_addpac(env, x, y, &env->keys.apdb, true);
 }
 
+/*
+ * PACGA with EL0 pointer authentication off (x-el0-pac-off with the native EL0
+ * engine): a plain mix of both operands, low 32 bits zero as PACGA's are. The
+ * same formula is in native-el0.c and pauth_helper.c: keep them equal.
+ */
+static inline uint64_t pauth_pacga_off(uint64_t x, uint64_t y)
+{
+    uint64_t v = (x ^ y) * 0x9e3779b97f4a7c15ull;
+    return (v ^ (v << 32)) & 0xffffffff00000000ull;
+}
+
 uint64_t HELPER(pacga)(CPUARMState *env, uint64_t x, uint64_t y)
 {
     uint64_t pac;
 
+    if (arm_current_el(env) == 0 && env_archcpu(env)->el0_pac_off) {
+        /*
+         * x-el0-pac-off: the native EL0 engine cannot turn the host's GA key
+         * off, so it emulates PACGA with pauth_pacga_off(); give EL0 the same
+         * value here (native-el0.c, is_pacga).
+         */
+        return pauth_pacga_off(x, y);
+    }
     pauth_check_trap(env, arm_current_el(env), GETPC());
     pac = pauth_computepac(env, x, y, env->keys.apga);
 

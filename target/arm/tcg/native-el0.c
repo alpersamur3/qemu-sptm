@@ -166,6 +166,8 @@ typedef struct NativeCtx {
     int in_guest;               /* guest state is live natively (or a stub runs it) */
     int kick_pending;
     int tcg_until_el1;          /* something native cannot do: TCG until EL1 */
+    int last_deny;              /* why the last try declined (DR_*), DR_N once it ran */
+    uint64_t deny_t;            /* cntvct at that refusal, 0 once the next try saw it */
     int guard_active;           /* a host read of mirror memory is in progress */
     sigjmp_buf guard;
     /* stub mode: the stub this vCPU drives right now */
@@ -192,7 +194,10 @@ static int sig_kick, sig_enter, sig_inval;
 static int trace_left;
 static bool stats_on;
 static bool pac_off;        /* ASOFT_NATIVE_EL0_PAC=off: EL0 keys disabled natively */
+static bool sysreg_tcg = true;  /* ASOFT_NATIVE_EL0_ILL_TCG=0: a host SIGILL is the guest's UDEF at once */
 static bool tpidrro_mode;   /* ASOFT_NATIVE_EL0_TPIDRRO=1: code pages read TPIDR_EL0 instead */
+static bool host_counter_native;    /* -cpu x-host-counter=on: counter reads run natively */
+static bool host_counter_decided;   /* ... known at the first native entry (no offset from a load) */
 static uint64_t tpidrro_patched;
 static bool perm_fallback;  /* ASOFT_NATIVE_EL0_PERMFALLBACK=1 */
 static bool patch_log;      /* ASOFT_NATIVE_EL0_PATCHLOG=1: every rewritten word with its neighbours */
@@ -247,6 +252,111 @@ static inline uint64_t cntvct(void)
 
 static uint64_t cntfrq = 19200000;
 static int sampler_period;      /* ASOFT_EL_SAMPLER=N: EL sampler report every N s */
+/*
+ * ASOFT_WHO=1 (with ASOFT_EL_SAMPLER): who keeps the vCPUs busy? Each 1 kHz sample of a running vCPU is
+ * counted by the ASID in TTBR0_EL1 (the user process; XNU's kernel threads run with ASID 0), EL0 and EL1
+ * apart, and the PCs of the EL1 samples in a small table; helper.c counts the syscalls from EL0 by ASID and
+ * number (asoft_who_syscall). Every report prints the busiest ASIDs, kernel PCs and syscalls, then forgets.
+ */
+static bool who_on;
+static uint32_t who_el0[65536], who_el1[65536];
+#define WHO_PCS 4096
+static struct { uint64_t pc; uint32_t n; } who_pc[WHO_PCS];
+#define WHO_SYS 4096
+static struct { uint32_t key; uint32_t n; } who_sys[WHO_SYS];   /* key: asid << 16 | (uint16_t)x16 */
+
+static void who_pc_add(uint64_t pc)
+{
+    uint32_t h = (uint32_t)((pc >> 2) * 0x9E3779B1u) & (WHO_PCS - 1);
+    for (int k = 0; k < 16; k++, h = (h + 1) & (WHO_PCS - 1)) {
+        if (who_pc[h].pc == pc || who_pc[h].n == 0) {
+            who_pc[h].pc = pc;
+            who_pc[h].n++;
+            return;
+        }
+    }
+}
+
+void asoft_who_syscall(uint16_t asid, int64_t num)
+{
+    if (!who_on) {
+        return;
+    }
+    uint32_t key = (uint32_t)asid << 16 | (uint16_t)num;
+    uint32_t h = (key * 0x9E3779B1u) & (WHO_SYS - 1);
+    for (int k = 0; k < 16; k++, h = (h + 1) & (WHO_SYS - 1)) {
+        uint32_t cur = qatomic_read(&who_sys[h].key);
+        if (cur == key && qatomic_read(&who_sys[h].n)) {
+            qatomic_inc(&who_sys[h].n);
+            return;
+        }
+        if (qatomic_read(&who_sys[h].n) == 0 && qatomic_cmpxchg(&who_sys[h].key, cur, key) == cur) {
+            qatomic_inc(&who_sys[h].n);
+            return;
+        }
+    }
+}
+
+static void who_report(int64_t t)
+{
+    /* the busiest ASIDs: EL0 + EL1 samples */
+    char line[1024];
+    int len = snprintf(line, sizeof(line), "el-sample t=%" PRId64 "s who (asid:el0/el1):", t);
+    for (int k = 0; k < 10; k++) {
+        uint32_t best = 0, bn = 0;
+        for (uint32_t a = 0; a < 65536; a++) {
+            uint32_t n = who_el0[a] + who_el1[a];
+            if (n > bn) {
+                bn = n;
+                best = a;
+            }
+        }
+        if (!bn) {
+            break;
+        }
+        len += snprintf(line + len, sizeof(line) - len, " %u:%u/%u", best, who_el0[best], who_el1[best]);
+        who_el0[best] = who_el1[best] = 0;
+    }
+    fprintf(stderr, "%s\n", line);
+    memset(who_el0, 0, sizeof(who_el0));
+    memset(who_el1, 0, sizeof(who_el1));
+    len = snprintf(line, sizeof(line), "el-sample t=%" PRId64 "s el1-pcs:", t);
+    for (int k = 0; k < 12; k++) {
+        int best = -1;
+        for (int i = 0; i < WHO_PCS; i++) {
+            if (who_pc[i].n && (best < 0 || who_pc[i].n > who_pc[best].n)) {
+                best = i;
+            }
+        }
+        if (best < 0) {
+            break;
+        }
+        len += snprintf(line + len, sizeof(line) - len, " %#" PRIx64 ":%u", who_pc[best].pc, who_pc[best].n);
+        who_pc[best].n = 0;
+    }
+    fprintf(stderr, "%s\n", line);
+    memset(who_pc, 0, sizeof(who_pc));
+    len = snprintf(line, sizeof(line), "el-sample t=%" PRId64 "s syscalls (asid/num:count):", t);
+    for (int k = 0; k < 14; k++) {
+        int best = -1;
+        for (int i = 0; i < WHO_SYS; i++) {
+            if (qatomic_read(&who_sys[i].n) && (best < 0 || who_sys[i].n > who_sys[best].n)) {
+                best = i;
+            }
+        }
+        if (best < 0) {
+            break;
+        }
+        len += snprintf(line + len, sizeof(line) - len, " %u/%d:%u", who_sys[best].key >> 16,
+                        (int16_t)(who_sys[best].key & 0xffff), who_sys[best].n);
+        who_sys[best].n = 0;
+    }
+    fprintf(stderr, "%s\n", line);
+    for (int i = 0; i < WHO_SYS; i++) {
+        qatomic_set(&who_sys[i].n, 0);
+    }
+}
+
 struct el_samples { uint64_t halted, el1, el0_tcg, el0_nat; };
 static struct el_samples samples[MAX_CTX];
 
@@ -346,6 +456,7 @@ typedef struct StubShm {
     uint32_t nvcpus;
     int32_t ram_fd[8];          /* guest RAM fds as the factory (and so the stubs) sees them */
     int32_t nram;
+    uint32_t host_counter;      /* set by QEMU once the CPU property is known */
     StubCtl ctl[STUB_MAX];
     StubSlot slot[STUB_MAX][STUB_VCPUS];
 } StubShm;
@@ -369,6 +480,28 @@ static int asid_max_seen;
 static uint64_t asid_root_changes, asid_root_concurrent;
 static uint64_t asid_last_root[65536];
 static uint64_t stub_denials;       /* EL0 slices left to TCG: no stub to spare */
+enum { DR_UNTIL, DR_OFF, DR_MMU, DR_FPEN, DR_SS, DR_SVE, DR_DELAY, DR_WINDOW, DR_READY, DR_POOL, DR_RAM, DR_EXIT, DR_N };
+static uint64_t deny_reason[DR_N];  /* try_native declined, per reason (loop rounds, not TBs) */
+static uint64_t deny_ticks[DR_N];   /* host ticks TCG ran after a refusal, until the next try */
+static uint64_t el0tcg_reason[DR_N + 1];    /* sampler: EL0-TCG samples by the pending refusal */
+static uint64_t el0tcg_pc[5];       /* sampler: EL0-TCG samples by pc region */
+enum { MK_TPRO_W, MK_TPRO_R, MK_TPIDRRO, MK_CNT, MK_ACNT, MK_N };
+static uint64_t mrs_kind[MK_N];     /* emulated MRS/MSR by register */
+#define TPRO_SITES 256
+static uint64_t tpro_site_pc[TPRO_SITES];
+static uint64_t tpro_site_n[TPRO_SITES];
+static void tpro_site_hit(uint64_t pc)
+{
+    unsigned i = (unsigned)((pc >> 2) * 0x9e3779b97f4a7c15ULL >> 56) % TPRO_SITES;
+    for (unsigned k = 0; k < 8; k++, i = (i + 1) % TPRO_SITES) {
+        uint64_t have = qatomic_read(&tpro_site_pc[i]);
+        if (have == pc || (have == 0 && qatomic_cmpxchg(&tpro_site_pc[i], 0, pc) == 0)) {
+            qatomic_inc(&tpro_site_n[i]);
+            return;
+        }
+    }
+}
+static int window_log_left = 8;
 enum { TL_ALL, TL_ASID, TL_PAGE_ASID, TL_PAGE_ANY, TL_RANGE, TL_KINDS };
 static uint64_t tlbi_kind[TL_KINDS];
 
@@ -553,6 +686,15 @@ static void *sampler_main(void *arg)
             if (prof_dir && off_tick & 1 && cs->thread_id) {
                 syscall(SYS_tgkill, getpid(), cs->thread_id, SIGPROF);
             }
+            if (who_on && !qatomic_read(&cs->halted)) {
+                uint16_t asid = extract64(env->cp15.ttbr0_el[1], 48, 16);
+                if (extract32(env->pstate, 2, 2) != 0) {
+                    who_el1[asid]++;
+                    who_pc_add(env->pc);
+                } else {
+                    who_el0[asid]++;
+                }
+            }
             if (qatomic_read(&cs->halted)) {
                 samples[i].halted++;
             } else if (extract32(env->pstate, 2, 2) != 0) {
@@ -561,6 +703,10 @@ static void *sampler_main(void *arg)
                 samples[i].el0_nat++;
             } else {
                 samples[i].el0_tcg++;
+                NativeCtx *nc = ctx_by_index[i];
+                el0tcg_reason[nc && nc->deny_t ? nc->last_deny : DR_N]++;
+                uint64_t pc = env->pc;
+                el0tcg_pc[pc < WIN_LO ? 0 : pc < WIN_HI ? 1 : pc < GUARD_HI ? 2 : pc < (1ULL << 48) ? 3 : 4]++;
             }
         }
         rcu_read_unlock();
@@ -604,7 +750,54 @@ static void *sampler_main(void *arg)
                     enters - lenter, fills - lfill, mrs - lmrs,
                     stub_mode ? "evictions" : "steals", steals - lsteal);
             lsteal = steals;
+            {
+                static uint64_t lr[DR_N + 1], lt[DR_N], lp[5], lm[MK_N];
+                int shown_site[6];
+                fprintf(stderr, "el-sample t=%" PRId64 "s el0-tcg: samples none/until/off/mmu/fpen/ss/sve/delay/window/ready/pool/ram/exit", (now - t0) / 1000000000LL);
+                for (int k = 0; k <= DR_N; k++) {
+                    int j = k == 0 ? DR_N : k - 1;      /* none first */
+                    fprintf(stderr, "%s%" PRIu64, k ? "/" : " ", el0tcg_reason[j] - lr[j]); lr[j] = el0tcg_reason[j];
+                }
+                fprintf(stderr, " tcg-ms until/off/mmu/fpen/ss/sve/delay/window/ready/pool/ram/exit");
+                for (int k = 0; k < DR_N; k++) {
+                    fprintf(stderr, "%s%" PRIu64, k ? "/" : " ", ticks_ms(deny_ticks[k] - lt[k])); lt[k] = deny_ticks[k];
+                }
+                fprintf(stderr, " pc <4G/window/<320G/<2^48/kernel");
+                for (int k = 0; k < 5; k++) {
+                    fprintf(stderr, "%s%" PRIu64, k ? "/" : " ", el0tcg_pc[k] - lp[k]); lp[k] = el0tcg_pc[k];
+                }
+                fprintf(stderr, " | mrs tpro-w/tpro-r/tpidrro/cnt/acnt");
+                for (int k = 0; k < MK_N; k++) {
+                    uint64_t v = qatomic_read(&mrs_kind[k]);
+                    fprintf(stderr, "%s%" PRIu64, k ? "/" : " ", v - lm[k]); lm[k] = v;
+                }
+                fprintf(stderr, "\n");
+                fprintf(stderr, "el-sample t=%" PRId64 "s tpro-read sites:", (now - t0) / 1000000000LL);
+                for (int top = 0; top < 6; top++) {
+                    int best = -1;
+                    for (int i = 0; i < TPRO_SITES; i++) {
+                        if (tpro_site_pc[i] && (best < 0 || tpro_site_n[i] > tpro_site_n[best])) {
+                            bool shown = false;
+                            for (int j = 0; j < top; j++) {
+                                shown |= shown_site[j] == i;
+                            }
+                            if (!shown) {
+                                best = i;
+                            }
+                        }
+                    }
+                    if (best < 0) {
+                        break;
+                    }
+                    shown_site[top] = best;
+                    fprintf(stderr, " %#" PRIx64 ":%" PRIu64, tpro_site_pc[best], tpro_site_n[best]);
+                }
+                fprintf(stderr, "\n");
+            }
             if (tlbi_filter > 0) {
+                if (who_on) {
+                    who_report((now - t0) / 1000000000LL);
+                }
                 fprintf(stderr, "el-sample t=%" PRId64 "s tlbi-scope: all %" PRIu64 " self %" PRIu64 " none %" PRIu64 "\n",
                         (now - t0) / 1000000000LL, tlbi_scope_n[TLBI_SCOPE_ALL],
                         tlbi_scope_n[TLBI_SCOPE_SELF], tlbi_scope_n[TLBI_SCOPE_NONE]);
@@ -627,11 +820,14 @@ static void *sampler_main(void *arg)
                         " timeouts %" PRIu64 " spawned %" PRIu64 " tlbi-asid hit %" PRIu64 " miss %" PRIu64
                         " asid-max %d root-changes %" PRIu64 " concurrent %" PRIu64 " denials %" PRIu64
                         " tlbi all/asid/page-asid/page-any/range %" PRIu64 "/%" PRIu64 "/%" PRIu64
-                        "/%" PRIu64 "/%" PRIu64 "\n",
+                        "/%" PRIu64 "/%" PRIu64 " deny until/off/mmu/fpen/ss/sve/delay/window/ready %" PRIu64
+                        "/%" PRIu64 "/%" PRIu64 "/%" PRIu64 "/%" PRIu64 "/%" PRIu64 "/%" PRIu64 "/%" PRIu64 "/%" PRIu64 "\n",
                         (now - t0) / 1000000000LL, inval_waits, inval_slow, inval_timeouts, stub_spawns,
                         tlbi_asid_hits, tlbi_asid_misses, asid_max_seen, asid_root_changes, asid_root_concurrent,
                         stub_denials, tlbi_kind[TL_ALL], tlbi_kind[TL_ASID], tlbi_kind[TL_PAGE_ASID],
-                        tlbi_kind[TL_PAGE_ANY], tlbi_kind[TL_RANGE]);
+                        tlbi_kind[TL_PAGE_ANY], tlbi_kind[TL_RANGE], deny_reason[DR_UNTIL], deny_reason[DR_OFF],
+                        deny_reason[DR_MMU], deny_reason[DR_FPEN], deny_reason[DR_SS], deny_reason[DR_SVE],
+                        deny_reason[DR_DELAY], deny_reason[DR_WINDOW], deny_reason[DR_READY]);
             }
         }
         lnat = nat; lhand = hand; lent = ent; lenter = enters; lfill = fills; lmrs = mrs;
@@ -644,6 +840,8 @@ static void sampler_start(void)
     const char *e = getenv("ASOFT_EL_SAMPLER");
     sampler_period = e ? atoi(e) : 0;
     prof_dir = getenv("ASOFT_PC_SAMPLER");
+    e = getenv("ASOFT_WHO");
+    who_on = sampler_period > 0 && e && *e == '1';
 }
 
 static int sampler_launched;
@@ -701,6 +899,8 @@ static void __attribute__((constructor)) native_el0_setup(void)
     trace_left = e ? atoi(e) : 0;
     e = getenv("ASOFT_NATIVE_EL0_STATS");
     stats_on = e && *e && *e != '0';
+    e = getenv("ASOFT_NATIVE_EL0_ILL_TCG");
+    sysreg_tcg = !e || *e != '0';
     e = getenv("ASOFT_NATIVE_EL0_PAC");
     pac_off = e && !strcmp(e, "off");
     e = getenv("ASOFT_NATIVE_EL0_TPIDRRO");
@@ -929,13 +1129,60 @@ static NativeCtx *ctx_from_stack(void *stack_local)
  * becomes TPIDRRO_EL0 (host: 0 = cpu 0, a valid hint); the counter reads
  * become CVAL encodings, which trap and are emulated with the guest counter.
  */
+/*
+ * PACGA with EL0 pointer authentication off (x-el0-pac-off with the native EL0
+ * engine): a plain mix of both operands, low 32 bits zero as PACGA's are. The
+ * same formula is in native-el0.c and pauth_helper.c: keep them equal.
+ */
+static inline uint64_t pauth_pacga_off(uint64_t x, uint64_t y)
+{
+    uint64_t v = (x ^ y) * 0x9e3779b97f4a7c15ull;
+    return (v ^ (v << 32)) & 0xffffffff00000000ull;
+}
+
+/*
+ * With EL0 pointer authentication off (ASOFT_NATIVE_EL0_PAC=off, TCG's
+ * x-el0-pac-off), PACGA is the one PAC instruction the host cannot turn off:
+ * it MACs with the host's GA key here and the guest's under TCG, and libobjc
+ * checks a class cache's PACGA (cache_t::maybeConvertToPreoptimized, brk #1).
+ * Both sides compute pacga_off() instead, its low 32 bits zero as PACGA's are
+ * (libobjc folds both halves): TCG's helper, and here a UDF in place of each
+ * PACGA that the SIGILL handler emulates.
+ */
+static inline bool is_pacga(uint32_t w)
+{
+    return (w & 0xffe0fc00u) == 0x9ac03000u;
+}
+
+static inline bool host_counter_on(void)
+{
+    return shm ? qatomic_read(&shm->host_counter) != 0 : host_counter_native;
+}
+
+static int tpro_const = -1;
+static inline bool tpro_const_on(void)
+{
+    if (unlikely(tpro_const < 0)) {
+        const char *e = getenv("ASOFT_NATIVE_EL0_TPRO_CONST");
+        tpro_const = e && *e == '1';    /* off: launchd aborts with the constant (a TPRO state check), 2026-11-05 */
+    }
+    return tpro_const;
+}
+
 static inline bool is_patch_word(uint32_t w)
 {
+    if (pac_off && is_pacga(w)) {
+        return true;
+    }
     switch (w & 0xffffffe0u) {
     case 0xd53bd060u: case 0xd53bd040u:
+        return true;
     case 0xd53be040u: case 0xd53be0c0u:
+        return !host_counter_on();          /* CNTVCT[SS]: native when the host counter is the guest's */
     case 0xd53be020u: case 0xd53be0a0u:
         return true;
+    case 0xd53ef1a0u:                   /* mrs Xt, SPRR_UPERM_EL0 (TPRO) */
+        return tpro_const_on();
     default:
         return false;
     }
@@ -945,6 +1192,9 @@ static inline bool is_patch_word(uint32_t w)
 static inline uint32_t patched_word(uint32_t w)
 {
     uint32_t rt = w & 31;
+    if (pac_off && is_pacga(w)) {
+        return 0x00009ac3u;         /* udf: emulated, see is_pacga() */
+    }
     switch (w & 0xffffffe0u) {
     case 0xd53bd060u:   /* mrs Xt, TPIDRRO_EL0 -> TPIDR_EL0 */
         return 0xd53bd040u | rt;
@@ -952,10 +1202,12 @@ static inline uint32_t patched_word(uint32_t w)
         return 0xd53bd060u | rt;
     case 0xd53be040u:   /* mrs Xt, CNTVCT_EL0   -> CNTV_CVAL_EL0 (traps) */
     case 0xd53be0c0u:   /* mrs Xt, CNTVCTSS_EL0 */
-        return 0xd53be340u | rt;
-    case 0xd53be020u:   /* mrs Xt, CNTPCT_EL0   -> CNTP_CVAL_EL0 (traps) */
+        return host_counter_on() ? w : (0xd53be340u | rt);
+    case 0xd53be020u:   /* mrs Xt, CNTPCT_EL0   -> CNTP_CVAL_EL0 (traps), or CNTVCT_EL0 natively */
     case 0xd53be0a0u:   /* mrs Xt, CNTPCTSS_EL0 */
-        return 0xd53be240u | rt;
+        return host_counter_on() ? (0xd53be040u | rt) : (0xd53be240u | rt);
+    case 0xd53ef1a0u:   /* mrs Xt, SPRR_UPERM_EL0 -> movz Xt, #0x10, lsl #32 (bit 36: writable) */
+        return 0xd2c00200u | rt;
     default:
         return w;
     }
@@ -1033,9 +1285,16 @@ static bool cc_create(void)
 static int cc_scan(const uint32_t *w, uint16_t *idx)
 {
     const uint32x4_t mask = vdupq_n_u32(0xffff0000u), want = vdupq_n_u32(0xd53b0000u);
+    const uint32x4_t want2 = vdupq_n_u32(0xd53e0000u);     /* Apple sysregs (op1 = 6): TPRO */
+    /* PACGA (is_pacga) only with EL0 PAC off; otherwise a mask that never matches */
+    const uint32x4_t gmask = vdupq_n_u32(pac_off ? 0xffe0fc00u : 0u);
+    const uint32x4_t gwant = vdupq_n_u32(pac_off ? 0x9ac03000u : 1u);
     int n = 0;
     for (unsigned i = 0; i < CC_WORDS; i += 4) {
-        if (vmaxvq_u32(vceqq_u32(vandq_u32(vld1q_u32(w + i), mask), want))) {
+        uint32x4_t v = vld1q_u32(w + i);
+        uint32x4_t m = vandq_u32(v, mask);
+        if (vmaxvq_u32(vorrq_u32(vorrq_u32(vceqq_u32(m, want), vceqq_u32(m, want2)),
+                                 vceqq_u32(vandq_u32(v, gmask), gwant)))) {
             for (unsigned j = i; j < i + 4; j++) {
                 if (is_patch_word(w[j])) {
                     if (n == CC_MAXP) {
@@ -2654,11 +2913,12 @@ static void nat_trace(NativeCtx *nc, const char *what, uint64_t pc, uint64_t a)
     }
 }
 
-/* MRS of a register the host does not let EL0 read: emulate the few the
- * guest uses, else let the guest see UNDEF. Returns true when handled. */
+/* MRS (or MSR) of a register the host does not let EL0 reach: emulate the
+ * few the guest uses. Returns true when handled. */
 static bool emulate_mrs(NativeCtx *nc, ucontext_t *uc, uint32_t insn)
 {
-    if ((insn & 0xfff00000) != 0xd5300000) {
+    bool msr = (insn & 0xfff00000) == 0xd5100000;
+    if ((insn & 0xfff00000) != 0xd5300000 && !msr) {
         return false;
     }
     CPUARMState *env = cpu_env(nc->cs);
@@ -2666,14 +2926,36 @@ static bool emulate_mrs(NativeCtx *nc, ucontext_t *uc, uint32_t insn)
     unsigned op1 = (insn >> 16) & 7, crn = (insn >> 12) & 15,
              crm = (insn >> 8) & 15, op2 = (insn >> 5) & 7;
     uint64_t v;
-    if (op1 == 3 && crn == 13 && crm == 0 && op2 == 3) {        /* TPIDRRO_EL0 */
+    if (op1 == 6 && crn == 15 && crm == 1 && op2 == 5) {
+        /*
+         * Apple's SPRR_UPERM_EL0 (iOS 17+ TPRO: libsystem toggles a thread's
+         * user permissions through it). TCG keeps it as plain state
+         * (apple_regs_autogen.h), so do the same here, read and write.
+         */
+        if (msr) {
+            env->sprr_uperm_el0 = rt == 31 ? 0 : uc->uc_mcontext.regs[rt];
+            uc->uc_mcontext.pc += 4;
+            nc->emul_mrs++;
+            qatomic_inc(&mrs_kind[MK_TPRO_W]);
+            return true;
+        }
+        v = env->sprr_uperm_el0;
+        qatomic_inc(&mrs_kind[MK_TPRO_R]);
+        tpro_site_hit(uc->uc_mcontext.pc);
+    } else if (msr) {
+        return false;
+    } else if (op1 == 3 && crn == 13 && crm == 0 && op2 == 3) {        /* TPIDRRO_EL0 */
         v = env->cp15.tpidrro_el[0];
+        qatomic_inc(&mrs_kind[MK_TPIDRRO]);
     } else if (op1 == 3 && crn == 14 && crm == 0 && (op2 == 1 || op2 == 2)) {
         v = gt_get_countervalue(env);                       /* CNTPCT/CNTVCT */
+        qatomic_inc(&mrs_kind[MK_CNT]);
     } else if (op1 == 3 && crn == 14 && (crm == 2 || crm == 3) && op2 == 2) {
         v = gt_get_countervalue(env);   /* rewritten CNT[PV]CT: CVAL encodings */
+        qatomic_inc(&mrs_kind[MK_CNT]);
     } else if (op1 == 4 && crn == 15 && crm == 10 && (op2 == 5 || op2 == 6)) {
         v = gt_get_countervalue(env);   /* Apple ACNTPCT_EL0 / ACNTVCT_EL0 */
+        qatomic_inc(&mrs_kind[MK_ACNT]);
     } else {
         return false;
     }
@@ -2837,12 +3119,45 @@ static void handle_trap(NativeCtx *nc, int sig, int si_code, uint64_t fault_addr
     case SIGILL:
     case SIGFPE: {
         uint32_t insn = fetch_insn(nc, pc);
+        if (sig == SIGILL && pac_off && is_pacga(insn)) {
+            /* the UDF a PACGA became (is_pacga): what TCG computes with EL0 PAC off */
+            unsigned rd = insn & 31, rn = (insn >> 5) & 31, rm = (insn >> 16) & 31;
+            uint64_t xn = rn == 31 ? 0 : uc->uc_mcontext.regs[rn];
+            uint64_t xm = rm == 31 ? uc->uc_mcontext.sp : uc->uc_mcontext.regs[rm];
+            if (rd != 31) {
+                uc->uc_mcontext.regs[rd] = pauth_pacga_off(xn, xm);
+            }
+            uc->uc_mcontext.pc += 4;
+            resume_guest(nc, uc, tp);
+            return;
+        }
         if (sig == SIGILL && emulate_mrs(nc, uc, insn)) {
             nat_trace(nc, "mrs", pc, insn);
             resume_guest(nc, uc, tp);
             return;
         }
         nat_trace(nc, "undef", pc, insn);
+        if (sig == SIGILL && sysreg_tcg) {
+            /*
+             * An instruction this CPU lacks but the guest's CPU may have (an
+             * Apple register, a feature the host has not): TCG runs the
+             * guest from here to its next EL1 entry and decides, UNDEF
+             * included, as it would without the engine.
+             */
+            frame_to_state(nc, uc, tp);
+            nc->unsupported++;
+            nc->tcg_until_el1 = 1;
+            leave_native(nc), cpu_loop_exit(nc->cs);
+        }
+        {
+            /* the first ones always: an instruction the host lacks shows here as the guest's UDEF */
+            static int told;
+            if (qatomic_fetch_inc(&told) < 64) {
+                fprintf(stderr, "native-el0[%d]: %s pc=%#" PRIx64 " insn=%#010x ttbr0=%#" PRIx64 "\n",
+                        nc->cs->cpu_index, sig == SIGILL ? "SIGILL" : "SIGFPE", pc, insn,
+                        (uint64_t)env->cp15.ttbr0_el[1]);
+            }
+        }
         frame_to_state(nc, uc, tp);
         nc->ills++;
         leave_native(nc), raise_exception(env, EXCP_UDEF, syn_uncategorized(), 1);
@@ -2850,6 +3165,21 @@ static void handle_trap(NativeCtx *nc, int sig, int si_code, uint64_t fault_addr
     case SIGTRAP: {
         uint32_t insn = fetch_insn(nc, pc);
         nat_trace(nc, "brk", pc, insn);
+        {
+            /* the first ones always, with the code before: a failed pointer check ends in brk #0xc47x */
+            static int told;
+            if (qatomic_fetch_inc(&told) < 24) {
+                fprintf(stderr, "native-el0[%d]: SIGTRAP pc=%#" PRIx64 " insn=%#010x lr=%#" PRIx64 " x16=%#" PRIx64
+                        " x17=%#" PRIx64 " x0=%#" PRIx64 " x1=%#" PRIx64 " before:", nc->cs->cpu_index, pc, insn,
+                        (uint64_t)uc->uc_mcontext.regs[30], (uint64_t)uc->uc_mcontext.regs[16],
+                        (uint64_t)uc->uc_mcontext.regs[17], (uint64_t)uc->uc_mcontext.regs[0],
+                        (uint64_t)uc->uc_mcontext.regs[1]);
+                for (int i = 8; i >= 1; i--) {
+                    fprintf(stderr, " %08x", fetch_insn(nc, pc - 4 * i));
+                }
+                fputc('\n', stderr);
+            }
+        }
         frame_to_state(nc, uc, tp);
         nc->brks++;
         if ((insn & 0xffe0001f) == 0xd4200000) {
@@ -3147,6 +3477,21 @@ bool native_el0_try(CPUState *cs)
     if (unlikely(sampler_period > 0 && !qatomic_read(&sampler_launched))) {
         sampler_launch();
     }
+    if (unlikely(!host_counter_decided) && ARM_CPU(cs)->host_counter) {
+        /* decided before any EL0 code is patched; -loadvm has run by then */
+        host_counter_decided = true;
+        if (arm_host_counter_native_ok()) {
+            host_counter_native = true;
+            if (shm) {
+                qatomic_set(&shm->host_counter, 1);
+            }
+            fprintf(stderr, "native-el0: host counter: CNT[PV]CT reads run natively\n");
+        } else {
+            /* a loaded snapshot that needed an offset (the host restarted since) */
+            fprintf(stderr, "native-el0: host counter with offset %" PRId64 ": CNT[PV]CT reads trap\n",
+                    arm_host_counter_offset);
+        }
+    }
     if (unlikely(prof_dir && !prof_thread_ready)) {
         prof_thread_init();
     }
@@ -3157,6 +3502,10 @@ bool native_el0_try(CPUState *cs)
     CPUARMState *env = &cpu->env;
     int idx = cs->cpu_index;
     NativeCtx *nc = (idx >= 0 && idx < MAX_CTX) ? ctx_by_index[idx] : NULL;
+    if (nc && nc->deny_t) {
+        deny_ticks[nc->last_deny] += cntvct() - nc->deny_t;
+        nc->deny_t = 0;
+    }
 
     if (!is_a64(env) || arm_current_el(env) != 0) {
         if (nc) {
@@ -3178,29 +3527,60 @@ bool native_el0_try(CPUState *cs)
             return false;
         }
     }
-    if (nc->tcg_until_el1 || qatomic_read(&native_off) || cpu_single_stepping(cs) ||
-        !QTAILQ_EMPTY(&cs->breakpoints) || !QTAILQ_EMPTY(&cs->watchpoints) ||
-        icount_enabled()) {
+    if (nc->tcg_until_el1) {
+        deny_reason[DR_UNTIL]++;
+        nc->last_deny = DR_UNTIL; nc->deny_t = cntvct();
         return false;
     }
-    if (!(env->cp15.sctlr_el[1] & SCTLR_M) ||
-        ((env->cp15.cpacr_el1 >> 20) & 3) != 3 ||            /* FPEN */
-        (env->pstate & PSTATE_SS)) {
+    if (qatomic_read(&native_off) || cpu_single_stepping(cs) ||
+        !QTAILQ_EMPTY(&cs->breakpoints) || !QTAILQ_EMPTY(&cs->watchpoints) ||
+        icount_enabled()) {
+        deny_reason[DR_OFF]++;
+        nc->last_deny = DR_OFF; nc->deny_t = cntvct();
+        return false;
+    }
+    if (!(env->cp15.sctlr_el[1] & SCTLR_M)) {
+        deny_reason[DR_MMU]++;
+        nc->last_deny = DR_MMU; nc->deny_t = cntvct();
+        return false;
+    }
+    if (((env->cp15.cpacr_el1 >> 20) & 3) != 3) {            /* FPEN */
+        deny_reason[DR_FPEN]++;
+        nc->last_deny = DR_FPEN; nc->deny_t = cntvct();
+        return false;
+    }
+    if (env->pstate & PSTATE_SS) {
+        deny_reason[DR_SS]++;
+        nc->last_deny = DR_SS; nc->deny_t = cntvct();
         return false;
     }
     if (cpu_isar_feature(aa64_sve, cpu) &&
         ((env->cp15.cpacr_el1 >> 16) & 3) == 3) {            /* ZEN: SVE live */
+        deny_reason[DR_SVE]++;
+        nc->last_deny = DR_SVE; nc->deny_t = cntvct();
         return false;
     }
     if (delay_ns && mono_ns() - trace_t0 < delay_ns) {
+        deny_reason[DR_DELAY]++;
+        nc->last_deny = DR_DELAY; nc->deny_t = cntvct();
         return false;
     }
     if (!in_window(env->pc)) {
+        deny_reason[DR_WINDOW]++;
+        nc->last_deny = DR_WINDOW; nc->deny_t = cntvct();
+        if (window_log_left > 0) {
+            window_log_left--;
+            fprintf(stderr, "native-el0: EL0 pc outside the window: pc=%#" PRIx64 " sp=%#" PRIx64
+                    " lr=%#" PRIx64 " asid=%u pstate=%#x g=%" PRIu64 "\n", (uint64_t)env->pc, (uint64_t)env->xregs[31],
+                    (uint64_t)env->xregs[30], cur_asid(env), env->pstate, env->currentg);
+        }
         return false;
     }
 
     if (stub_mode) {
         if (idx >= STUB_VCPUS || !stub_ram_ready(env)) {
+            deny_reason[DR_RAM]++;
+            nc->last_deny = DR_RAM; nc->deny_t = cntvct();
             return false;
         }
         int s = stub_acquire(cur_asid(env));
@@ -3208,6 +3588,8 @@ bool native_el0_try(CPUState *cs)
             /* no stub to spare: TCG for this slice, not a pool_lock round per TB */
             nc->tcg_until_el1 = 1;
             stub_denials++;
+            deny_reason[DR_POOL]++;
+            nc->last_deny = DR_POOL; nc->deny_t = cntvct();
             if (evict_heat) {
                 nc->deny_asid = cur_asid(env);
                 nc->deny_tick = cntvct();
@@ -3219,10 +3601,13 @@ bool native_el0_try(CPUState *cs)
         nc->stub = s;
         StubSlot *sl = &shm->slot[s][idx];
         if (!qatomic_read(&sl->ready)) {
+            deny_reason[DR_READY]++;
+        nc->last_deny = DR_READY; nc->deny_t = cntvct();
             stub_release(nc);
             return false;
         }
         nc->slot = sl;
+        nc->last_deny = DR_N;
         state_to_frame(nc, &sl->uc);
         sl->tpidr = nc->guest_tpidr;
         qatomic_set(&sl->kick_pending, 0);
@@ -3232,6 +3617,8 @@ bool native_el0_try(CPUState *cs)
         if (qatomic_read(&cs->exit_request)) {
             qatomic_set(&nc->in_guest, 0);
             stub_release(nc);
+            deny_reason[DR_EXIT]++;
+            nc->last_deny = DR_EXIT; nc->deny_t = cntvct();
             return false;
         }
         nc->enters++;
