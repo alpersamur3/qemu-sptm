@@ -182,6 +182,16 @@ struct TCGCPUOps {
     void (*do_interrupt)(CPUState *cpu);
     /** @cpu_exec_interrupt: Callback for processing interrupts in cpu_exec */
     bool (*cpu_exec_interrupt)(CPUState *cpu, int interrupt_request);
+    /**
+     * @cpu_exec_interrupt_idle: (ASOFT_BQL_LITE) true when cpu_exec_interrupt would take none of
+     * @interrupt_request's bits now, with no side effect: cpu_exec then checks them without the BQL.
+     */
+    bool (*cpu_exec_interrupt_idle)(CPUState *cpu, int interrupt_request);
+    /**
+     * @do_interrupt_nobql: (ASOFT_BQL_LITE) true when do_interrupt for cpu->exception_index
+     * touches only the CPU's own state, so cpu_exec runs it without the BQL.
+     */
+    bool (*do_interrupt_nobql)(CPUState *cpu);
     /** @cpu_exec_reset: Callback for reset in cpu_exec.  */
     void (*cpu_exec_reset)(CPUState *cpu);
     /**

@@ -26,6 +26,7 @@
 #include "qemu/osdep.h"
 #include "exec/cpu-common.h"
 #include "system/tcg.h"
+#include "system/cpus.h"
 #include "system/replay.h"
 #include "exec/icount.h"
 #include "qemu/main-loop.h"
@@ -89,6 +90,31 @@ static void asoft_vcpu_affinity(void)
 #endif
 
 /*
+ * ASOFT_BQL_LITE=1: when cpu_exec returns only because the thread was kicked and nothing waits for
+ * it (no queued work, no stop, not halted), run again without taking the BQL; anything else goes
+ * through qemu_process_cpu_events with the BQL. Clearing exit_request first means a kick that
+ * comes after the check makes the next cpu_exec return at once. (An iOS 26 boot on the S25 took
+ * the BQL here 1.65 M times and waited 22 s for it.)
+ */
+static bool asoft_mttcg_again(CPUState *cpu)
+{
+    static int on = -1;
+
+    if (on < 0) {
+        const char *e = getenv("ASOFT_BQL_LITE");
+
+        on = e && *e == '1';
+    }
+    if (!on) {
+        return false;
+    }
+    qatomic_set_mb(&cpu->exit_request, false);
+    qatomic_set_mb(&cpu->thread_kicked, false);
+    return !qatomic_read(&cpu->stop) && !qatomic_read(&cpu->unplug) &&
+           !qatomic_read(&cpu->halted) && cpu_work_list_empty(cpu) && cpu_can_run(cpu);
+}
+
+/*
  * In the multi-threaded case each vCPU has its own thread. The TLS
  * variable current_cpu can be used deep in the code to find the
  * current CPUState for a given thread.
@@ -127,6 +153,9 @@ static void *mttcg_cpu_thread_fn(void *arg)
             int r;
             bql_unlock();
             r = tcg_cpu_exec(cpu);
+            while (r == EXCP_INTERRUPT && asoft_mttcg_again(cpu)) {
+                r = tcg_cpu_exec(cpu);
+            }
             bql_lock();
             switch (r) {
             case EXCP_DEBUG:

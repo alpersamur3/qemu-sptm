@@ -3194,8 +3194,17 @@ void gicv3_init_cpuif(GICv3State *s, Error **errp)
              * We can only trap EL changes with TCG. However the GIC interrupt
              * state only changes on EL changes involving EL2 or EL3, so for
              * the non-TCG case this is OK, as EL2 and EL3 can't exist.
+             * ASOFT_BQL_LITE=1: nor does a TCG CPU without EL2 and EL3 need
+             * the hook, which costs a BQL round trip at every exception
+             * entry and return.
              */
-            arm_register_el_change_hook(cpu, gicv3_cpuif_el_change_hook, cs);
+            const char *lite = getenv("ASOFT_BQL_LITE");
+
+            if (!(lite && *lite == '1' &&
+                  !arm_feature(&cpu->env, ARM_FEATURE_EL2) &&
+                  !arm_feature(&cpu->env, ARM_FEATURE_EL3))) {
+                arm_register_el_change_hook(cpu, gicv3_cpuif_el_change_hook, cs);
+            }
         } else {
             assert(!arm_feature(&cpu->env, ARM_FEATURE_EL2));
             assert(!arm_feature(&cpu->env, ARM_FEATURE_EL3));

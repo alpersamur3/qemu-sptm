@@ -169,7 +169,12 @@ static inline bool arm_excp_unmasked(CPUState *cs, unsigned int excp_idx,
     return unmasked || pstate_unmasked;
 }
 
-bool arm_cpu_exec_interrupt(CPUState *cs, int interrupt_request)
+/*
+ * Which interrupt of @interrupt_request the CPU takes now: true with *pexcp and *ptarget set.
+ * No side effect (arm_cpu_exec_interrupt applies the VSERR one).
+ */
+static bool arm_pick_interrupt(CPUState *cs, int interrupt_request,
+                               uint32_t *pexcp, uint32_t *ptarget)
 {
     CPUARMState *env = cpu_env(cs);
     uint32_t cur_el = arm_current_el(env);
@@ -259,19 +264,72 @@ bool arm_cpu_exec_interrupt(CPUState *cs, int interrupt_request)
         target_el = 1;
         if (arm_excp_unmasked(cs, excp_idx, target_el,
                               cur_el, secure, hcr_el2)) {
-            /* Taking a virtual abort clears HCR_EL2.VSE */
-            env->cp15.hcr_el2 &= ~HCR_VSE;
-            cpu_reset_interrupt(cs, CPU_INTERRUPT_VSERR);
             goto found;
         }
     }
     return false;
 
  found:
+    *pexcp = excp_idx;
+    *ptarget = target_el;
+    return true;
+}
+
+bool arm_cpu_exec_interrupt(CPUState *cs, int interrupt_request)
+{
+    CPUARMState *env = cpu_env(cs);
+    uint32_t excp_idx, target_el;
+
+    if (!arm_pick_interrupt(cs, interrupt_request, &excp_idx, &target_el)) {
+        return false;
+    }
+    if (excp_idx == EXCP_VSERR) {
+        /* Taking a virtual abort clears HCR_EL2.VSE */
+        env->cp15.hcr_el2 &= ~HCR_VSE;
+        cpu_reset_interrupt(cs, CPU_INTERRUPT_VSERR);
+    }
     cs->exception_index = excp_idx;
     env->exception.target_el = target_el;
     cs->cc->tcg_ops->do_interrupt(cs);
     return true;
+}
+
+#define ARM_CPU_INTERRUPT_LINES (CPU_INTERRUPT_HARD | CPU_INTERRUPT_FIQ | CPU_INTERRUPT_VIRQ | \
+                                 CPU_INTERRUPT_VFIQ | CPU_INTERRUPT_VSERR | CPU_INTERRUPT_NMI | \
+                                 CPU_INTERRUPT_VINMI | CPU_INTERRUPT_VFNMI)
+
+/* ASOFT_BQL_LITE: only interrupt lines, and the CPU would take none of them now */
+bool arm_cpu_exec_interrupt_idle(CPUState *cs, int interrupt_request)
+{
+    uint32_t excp_idx, target_el;
+
+    if (interrupt_request & ~ARM_CPU_INTERRUPT_LINES) {
+        return false;
+    }
+    return !arm_pick_interrupt(cs, interrupt_request, &excp_idx, &target_el);
+}
+
+/*
+ * ASOFT_BQL_LITE: a synchronous exception's entry writes only this CPU's registers when no EL
+ * change hook is registered (the PMU's go with pmu=off); PSCI (HVC, SMC) and semihosting are
+ * left to the BQL path.
+ */
+bool arm_cpu_do_interrupt_nobql(CPUState *cs)
+{
+    ARMCPU *cpu = ARM_CPU(cs);
+
+    switch (cs->exception_index) {
+    case EXCP_UDEF:
+    case EXCP_SWI:
+    case EXCP_PREFETCH_ABORT:
+    case EXCP_DATA_ABORT:
+    case EXCP_BKPT:
+    case EXCP_GENTER:
+        break;
+    default:
+        return false;
+    }
+    return QLIST_EMPTY(&cpu->pre_el_change_hooks) && QLIST_EMPTY(&cpu->el_change_hooks);
 }
 #endif /* CONFIG_TCG */
 

@@ -697,9 +697,11 @@ void HELPER(exception_return)(CPUARMState *env, uint64_t new_pc)
         goto illegal_return;
     }
 
-    bql_lock();
-    arm_call_pre_el_change_hook(cpu);
-    bql_unlock();
+    if (!QLIST_EMPTY(&cpu->pre_el_change_hooks)) {     /* no hooks (vresearch: AIC, no GICv3): no BQL round trip per ERET */
+        bql_lock();
+        arm_call_pre_el_change_hook(cpu);
+        bql_unlock();
+    }
 
     if (!return_to_aa64) {
         assert(!arm_apple_is_gl(env));
@@ -765,9 +767,11 @@ void HELPER(exception_return)(CPUARMState *env, uint64_t new_pc)
      */
     aarch64_sve_change_el(env, cur_el, new_el, return_to_aa64);
 
-    bql_lock();
-    arm_call_el_change_hook(cpu);
-    bql_unlock();
+    if (!QLIST_EMPTY(&cpu->el_change_hooks)) {
+        bql_lock();
+        arm_call_el_change_hook(cpu);
+        bql_unlock();
+    }
 
     return;
 

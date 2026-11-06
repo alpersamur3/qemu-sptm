@@ -723,6 +723,50 @@ static inline void cpu_handle_debug_exception(CPUState *cpu)
     }
 }
 
+#ifndef CONFIG_USER_ONLY
+/*
+ * ASOFT_BQL_LITE=1: take the BQL in cpu_exec only for what needs it. A TCG exception on Arm sets
+ * CPU_INTERRUPT_EXITTB, and an interrupt the guest has masked stays pending, so every pass of the
+ * loop took the BQL to clear one bit or to find nothing to take (8.5 M times in an iOS 26 boot on
+ * the S25); the bits are atomic (cpu_set_interrupt, cpu_reset_interrupt). Likewise a synchronous
+ * exception whose entry touches only the CPU's own state (the target's do_interrupt_nobql).
+ */
+static int asoft_bql_lite_on = -1;
+
+static inline bool asoft_bql_lite(void)
+{
+    if (unlikely(asoft_bql_lite_on < 0)) {
+        const char *e = getenv("ASOFT_BQL_LITE");
+
+        asoft_bql_lite_on = e && *e == '1';
+    }
+    return asoft_bql_lite_on;
+}
+
+/* The pending bits need no BQL: EXITTB cleared here, the rest masked. True when done. */
+static inline bool asoft_interrupt_nobql(CPUState *cpu, TranslationBlock **last_tb)
+{
+    const TCGCPUOps *tcg_ops = cpu->cc->tcg_ops;
+    int req, ext;
+
+    if (!asoft_bql_lite() || replay_mode != REPLAY_MODE_NONE || cpu_single_stepping(cpu)) {
+        return false;
+    }
+    req = qatomic_load_acquire(&cpu->interrupt_request);
+    ext = req & ~CPU_INTERRUPT_EXITTB;
+    if (ext && !(tcg_ops->cpu_exec_interrupt_idle &&
+                 tcg_ops->cpu_exec_interrupt_idle(cpu, ext))) {
+        return false;
+    }
+    if (req & CPU_INTERRUPT_EXITTB) {
+        cpu_reset_interrupt(cpu, CPU_INTERRUPT_EXITTB);
+        /* ensure that no TB jump will be modified as the program flow was changed */
+        *last_tb = NULL;
+    }
+    return true;
+}
+#endif
+
 static inline bool cpu_handle_exception(CPUState *cpu, int *ret)
 {
     if (cpu->exception_index < 0) {
@@ -763,9 +807,14 @@ static inline bool cpu_handle_exception(CPUState *cpu, int *ret)
     if (replay_exception()) {
         const TCGCPUOps *tcg_ops = cpu->cc->tcg_ops;
 
-        bql_lock();
-        tcg_ops->do_interrupt(cpu);
-        bql_unlock();
+        if (asoft_bql_lite() && tcg_ops->do_interrupt_nobql &&
+            tcg_ops->do_interrupt_nobql(cpu)) {
+            tcg_ops->do_interrupt(cpu);
+        } else {
+            bql_lock();
+            tcg_ops->do_interrupt(cpu);
+            bql_unlock();
+        }
         cpu->exception_index = -1;
 
         if (unlikely(cpu_single_stepping(cpu))) {
@@ -839,7 +888,7 @@ static inline bool cpu_handle_interrupt(CPUState *cpu,
 #ifdef CONFIG_USER_ONLY
     assert(!cpu_test_interrupt(cpu, ~0));
 #else
-    if (unlikely(cpu_test_interrupt(cpu, ~0))) {
+    if (unlikely(cpu_test_interrupt(cpu, ~0)) && !asoft_interrupt_nobql(cpu, last_tb)) {
         bql_lock();
         if (cpu_test_interrupt(cpu, CPU_INTERRUPT_DEBUG)) {
             cpu_reset_interrupt(cpu, CPU_INTERRUPT_DEBUG);
