@@ -17,6 +17,7 @@
  * License along with this library; if not, see <http://www.gnu.org/licenses/>.
  */
 #include "qemu/osdep.h"
+#include "qemu/bqlprof.h"
 #include "qemu/main-loop.h"
 #include "cpu.h"
 #include "exec/target_page.h"
@@ -1231,6 +1232,7 @@ void HELPER(set_cp_reg)(CPUARMState *env, const void *rip, uint32_t value)
 
     if (ri->type & ARM_CP_IO) {
         bql_lock();
+        bqlprof_tag(ri->name, 0);
         ri->writefn(env, ri, value);
         bql_unlock();
     } else {
@@ -1245,6 +1247,7 @@ uint32_t HELPER(get_cp_reg)(CPUARMState *env, const void *rip)
 
     if (ri->type & ARM_CP_IO) {
         bql_lock();
+        bqlprof_tag(ri->name, 0);
         res = ri->readfn(env, ri);
         bql_unlock();
     } else {
@@ -1263,6 +1266,7 @@ void HELPER(set_cp_reg64)(CPUARMState *env, const void *rip, uint64_t value)
 #endif // LOG_MSRS
     if (ri->type & ARM_CP_IO) {
         bql_lock();
+        bqlprof_tag(ri->name, 0);
         ri->writefn(env, ri, value);
         bql_unlock();
     } else {
@@ -1277,6 +1281,7 @@ uint64_t HELPER(get_cp_reg64)(CPUARMState *env, const void *rip)
 
     if (ri->type & ARM_CP_IO) {
         bql_lock();
+        bqlprof_tag(ri->name, 0);
         res = ri->readfn(env, ri);
         bql_unlock();
     } else {

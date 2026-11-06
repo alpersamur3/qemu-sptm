@@ -23,6 +23,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/bqlprof.h"
 #include "qapi/error.h"
 #include "qemu/cutils.h"
 #include "qemu/timer.h"
@@ -289,7 +290,11 @@ static void glib_pollfds_poll(void)
     GPollFD *pfds = &g_array_index(gpollfds, GPollFD, glib_pollfds_idx);
 
     if (g_main_context_check(context, max_priority, pfds, glib_n_poll_fds)) {
-        g_main_context_dispatch(context);
+        {
+            BqlProfTag bqlprof_prev = bqlprof_tag("glib dispatch", 0);
+            g_main_context_dispatch(context);
+            bqlprof_untag(bqlprof_prev);
+        }
     }
 }
 

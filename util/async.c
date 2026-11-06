@@ -24,6 +24,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/bqlprof.h"
 #include "qapi/error.h"
 #include "qemu/aio.h"
 #include "block/thread-pool.h"
@@ -170,7 +171,9 @@ void aio_bh_call(QEMUBH *bh)
         reentrancy_guard->engaged_in_io = true;
     }
 
+    BqlProfTag bqlprof_prev = bqlprof_tag(bh->name ? bh->name : "bh ?", 0);
     bh->cb(bh->opaque);
+    bqlprof_untag(bqlprof_prev);
 
     if (reentrancy_guard) {
         reentrancy_guard->engaged_in_io = last_engaged_in_io;

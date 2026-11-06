@@ -23,6 +23,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/bqlprof.h"
 #include "qemu/main-loop.h"
 #include "qemu/timer.h"
 #include "qemu/lockable.h"
@@ -590,7 +591,11 @@ bool timerlist_run_timers(QEMUTimerList *timer_list)
 
         /* run the callback (the timer list can be modified) */
         qemu_mutex_unlock(&timer_list->active_timers_lock);
-        cb(opaque);
+        {
+            BqlProfTag bqlprof_prev = bqlprof_tag((const void *)cb, -1);
+            cb(opaque);
+            bqlprof_untag(bqlprof_prev);
+        }
         qemu_mutex_lock(&timer_list->active_timers_lock);
 
         progress = true;

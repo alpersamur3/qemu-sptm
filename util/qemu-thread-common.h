@@ -16,6 +16,7 @@
 #include "qemu/thread.h"
 #include "qemu/main-loop.h"
 #include "trace.h"
+#include "qemu/bqlprof.h"
 
 static inline void qemu_mutex_post_init(QemuMutex *mutex)
 {
@@ -30,6 +31,9 @@ static inline void qemu_mutex_pre_lock(QemuMutex *mutex,
                                        const char *file, int line)
 {
     trace_qemu_mutex_lock(mutex, file, line);
+    if (bqlprof_on && mutex_is_bql(mutex)) {
+        bqlprof_pre_lock();
+    }
 }
 
 static inline void qemu_mutex_post_lock(QemuMutex *mutex,
@@ -42,6 +46,7 @@ static inline void qemu_mutex_post_lock(QemuMutex *mutex,
     trace_qemu_mutex_locked(mutex, file, line);
     if (mutex_is_bql(mutex)) {
         bql_update_status(true);
+        bqlprof_locked(file, line);
     }
 }
 
@@ -54,6 +59,7 @@ static inline void qemu_mutex_pre_unlock(QemuMutex *mutex,
 #endif
     trace_qemu_mutex_unlock(mutex, file, line);
     if (mutex_is_bql(mutex)) {
+        bqlprof_unlocking();
         bql_update_status(false);
     }
 }

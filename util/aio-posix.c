@@ -14,6 +14,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/bqlprof.h"
 #include "block/block.h"
 #include "block/thread-pool.h"
 #include "qapi/error.h"
@@ -341,7 +342,9 @@ static bool aio_dispatch_handler(AioContext *ctx, AioHandler *node)
     if (!QLIST_IS_INSERTED(node, node_deleted) &&
         (revents & (G_IO_IN | G_IO_HUP | G_IO_ERR)) &&
         node->io_read) {
+        BqlProfTag bqlprof_prev = bqlprof_tag((const void *)node->io_read, -1);
         node->io_read(node->opaque);
+        bqlprof_untag(bqlprof_prev);
 
         /* aio_notify() does not count as progress */
         if (node->opaque != &ctx->notifier) {

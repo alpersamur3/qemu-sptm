@@ -18,6 +18,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/bqlprof.h"
 #include "exec/page-vary.h"
 #include "qapi/error.h"
 
@@ -3192,6 +3193,7 @@ bool prepare_mmio_access(MemoryRegion *mr)
     if (!bql_locked() && !mr->lockless_io) {
         bql_lock();
         release_lock = true;
+        bqlprof_tag(memory_region_name(mr), 0);
     }
     if (mr->flush_coalesced_mmio) {
         qemu_flush_coalesced_mmio_buffer();
