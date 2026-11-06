@@ -57,6 +57,37 @@ static void mttcg_force_rcu(Notifier *notify, void *data)
     async_run_on_cpu(cpu, do_nothing, RUN_ON_CPU_NULL);
 }
 
+#ifdef __linux__
+/*
+ * ASOFT_VCPU_CPUS=a,b,...: every vCPU thread may run only on these host
+ * CPUs (a phone with few big cores keeps them off the small, in-order ones).
+ */
+static void asoft_vcpu_affinity(void)
+{
+    const char *e = getenv("ASOFT_VCPU_CPUS");
+    cpu_set_t set;
+
+    if (!e || !*e) {
+        return;
+    }
+    CPU_ZERO(&set);
+    for (const char *q = e; *q; ) {
+        char *end;
+        long c = strtol(q, &end, 10);
+        if (end == q) {
+            break;
+        }
+        if (c >= 0 && c < CPU_SETSIZE) {
+            CPU_SET(c, &set);
+        }
+        q = *end == ',' ? end + 1 : end;
+    }
+    if (CPU_COUNT(&set) && sched_setaffinity(0, sizeof(set), &set) != 0) {
+        perror("ASOFT_VCPU_CPUS: sched_setaffinity");
+    }
+}
+#endif
+
 /*
  * In the multi-threaded case each vCPU has its own thread. The TLS
  * variable current_cpu can be used deep in the code to find the
@@ -71,6 +102,9 @@ static void *mttcg_cpu_thread_fn(void *arg)
     assert(tcg_enabled());
     g_assert(!icount_enabled());
 
+#ifdef __linux__
+    asoft_vcpu_affinity();
+#endif
     rcu_register_thread();
     force_rcu.notifier.notify = mttcg_force_rcu;
     force_rcu.cpu = cpu;
