@@ -1174,7 +1174,9 @@ struct ArchCPU {
     /* TCG speed-ups for the vresearch guest (x-* properties, off by default) */
     bool keep_kernel_tlb;   /* ASID changes and TLBI ASIDE1 keep the upper half */
     bool el0_pac_off;       /* pointer authentication is a no-op at EL0 */
-    bool host_counter;      /* CNTPCT/CNTVCT are the host's CNTVCT_EL0 */
+    bool host_counter;      /* CNTPCT/CNTVCT are the host's CNTVCT_EL0 (+ arm_host_counter_offset) */
+    uint64_t host_counter_saved;    /* x-host-counter in a snapshot: the counter at the save, */
+    int64_t host_counter_saved_ns;  /* and the host's wall clock then (QEMU_CLOCK_HOST) */
     bool va_param_cache;    /* aa64_va_parameters() kept between hflags rebuilds */
     bool counter_nobql;     /* counter reads without the BQL or a TB end */
     bool hcr_cache;         /* arm_hcr_el2_eff() kept; PAC helpers take the regime from hflags */

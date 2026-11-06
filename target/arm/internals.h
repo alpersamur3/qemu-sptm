@@ -2007,6 +2007,15 @@ int delete_gdbstub_hw_watchpoint(vaddr addr, vaddr len, GdbBreakpointType type);
 /* Return the current value of the system counter in ticks */
 uint64_t gt_get_countervalue(CPUARMState *env);
 /*
+ * x-host-counter: the guest's counter is the host's CNTVCT_EL0 plus this offset. It is 0 after a
+ * boot; a loaded snapshot whose counter would go backwards (the host restarted since the save)
+ * gets the offset that carries it on, and counter reads at EL0 then trap instead of running
+ * natively (native_el0: arm_host_counter_native_ok()).
+ */
+extern int64_t arm_host_counter_offset;
+bool arm_host_counter_native_ok(void);
+void arm_host_counter_resume(uint64_t saved, int64_t saved_ns);
+/*
  * Return the currently applicable offset between the system counter
  * and the counter for the specified timer, as used for direct register
  * accesses.

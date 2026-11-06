@@ -379,6 +379,48 @@ static const VMStateDescription vmstate_wfxt_timer = {
     }
 };
 
+/* x-host-counter: the counter at the save, so a load can carry it on (arm_host_counter_resume) */
+static bool host_counter_needed(void *opaque)
+{
+    ARMCPU *cpu = opaque;
+
+    return cpu->host_counter;
+}
+
+static int host_counter_pre_save(void *opaque)
+{
+    ARMCPU *cpu = opaque;
+
+    cpu->host_counter_saved = gt_get_countervalue(&cpu->env);
+    cpu->host_counter_saved_ns = qemu_clock_get_ns(QEMU_CLOCK_HOST);
+    return 0;
+}
+
+static int host_counter_post_load(void *opaque, int version_id)
+{
+    ARMCPU *cpu = opaque;
+
+    /* one counter for all: the first vCPU's save decides */
+    if (CPU(cpu)->cpu_index == 0 && cpu->host_counter) {
+        arm_host_counter_resume(cpu->host_counter_saved, cpu->host_counter_saved_ns);
+    }
+    return 0;
+}
+
+static const VMStateDescription vmstate_host_counter = {
+    .name = "cpu/asoft-host-counter",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = host_counter_needed,
+    .pre_save = host_counter_pre_save,
+    .post_load = host_counter_post_load,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT64(host_counter_saved, ARMCPU),
+        VMSTATE_INT64(host_counter_saved_ns, ARMCPU),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
 static bool m_needed(void *opaque)
 {
     ARMCPU *cpu = opaque;
@@ -1343,6 +1385,7 @@ const VMStateDescription vmstate_arm_cpu = {
         &vmstate_pstate64,
         &vmstate_event,
         &vmstate_fpmr,
+        &vmstate_host_counter,
         NULL
     }
 };

@@ -1356,15 +1356,80 @@ static CPAccessResult gt_sel2timer_access(CPUARMState *env,
     }
 }
 
+int64_t arm_host_counter_offset;
+
+/*
+ * Tests only: ASOFT_HOST_COUNTER_TEST_BASE=<ticks> takes that much off the host's counter, as if
+ * the host had started later (a restart since a save); ASOFT_HOST_COUNTER_NO_RESUME=1 leaves a
+ * loaded snapshot's counter as it comes (the behaviour before the offset).
+ */
+static int64_t host_counter_test_base = -1;
+
+static uint64_t host_counter_raw(void)
+{
+    uint64_t v = 0;
+#if defined(__aarch64__) && defined(__linux__)
+    __asm__ volatile("isb; mrs %0, cntvct_el0" : "=r"(v));
+#endif
+    if (unlikely(host_counter_test_base < 0)) {
+        const char *e = getenv("ASOFT_HOST_COUNTER_TEST_BASE");
+        host_counter_test_base = e ? (int64_t)strtoull(e, NULL, 0) : 0;
+    }
+    return v - host_counter_test_base;
+}
+
+static uint64_t host_counter_freq(void)
+{
+    uint64_t f = 0;
+#if defined(__aarch64__) && defined(__linux__)
+    __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(f));
+#endif
+    return f ? f : 24000000;
+}
+
+bool arm_host_counter_native_ok(void)
+{
+    host_counter_raw();     /* reads the test base */
+    return arm_host_counter_offset == 0 && host_counter_test_base == 0;
+}
+
+/*
+ * A snapshot saved with x-host-counter carries the counter of its save. XNU keeps deadlines in
+ * counter ticks (sched_clutch asserts that a root bucket's deadline never goes back), so the
+ * counter must not be lower after the load than at the save: it is when the host restarted since
+ * (its counter started again near 0), and a load then panicked XNU (2026-11-05). Then the offset
+ * carries the counter on from the save plus the wall-clock time since. When the host's counter is
+ * already past the save it stays as it is (no offset: EL0 reads it natively), the time since the
+ * save as the host counted it.
+ */
+void arm_host_counter_resume(uint64_t saved, int64_t saved_ns)
+{
+    uint64_t now = host_counter_raw(), freq = host_counter_freq(), target = saved;
+    int64_t since_ns = qemu_clock_get_ns(QEMU_CLOCK_HOST) - saved_ns;
+    const char *no = getenv("ASOFT_HOST_COUNTER_NO_RESUME");
+
+    if (saved_ns > 0 && since_ns > 0) {
+        target += muldiv64(since_ns, freq, NANOSECONDS_PER_SECOND);
+    }
+    if (no && *no == '1') {
+        arm_host_counter_offset = 0;
+    } else if (now >= saved) {
+        arm_host_counter_offset = 0;
+    } else {
+        arm_host_counter_offset = (int64_t)(target - now);
+    }
+    fprintf(stderr, "host counter: saved %" PRIu64 ", host now %" PRIu64 " (%" PRIu64 " Hz), %.1f s since the save:"
+            " offset %" PRId64 "%s\n", saved, now, freq, since_ns / 1e9, arm_host_counter_offset,
+            arm_host_counter_offset ? " (EL0 counter reads trap)" : "");
+}
+
 uint64_t gt_get_countervalue(CPUARMState *env)
 {
     ARMCPU *cpu = env_archcpu(env);
 
 #if defined(__aarch64__) && defined(__linux__)
     if (cpu->host_counter) {
-        uint64_t v;
-        __asm__ volatile("isb; mrs %0, cntvct_el0" : "=r"(v));
-        return v;
+        return host_counter_raw() + arm_host_counter_offset;
     }
 #endif
     return qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) / gt_cntfrq_period_ns(cpu);
