@@ -58,6 +58,10 @@
 #include "ui/console.h"
 #include "hw/arm/vresearch_pvg.h"
 #include "reims_vgpu.h"
+#include "qemu/bqlprof.h"
+#ifndef _WIN32
+#include <sys/mman.h>
+#endif
 
 OBJECT_DECLARE_SIMPLE_TYPE(VResearchPVGReimsState, VRESEARCH_PVG_REIMS)
 
@@ -259,6 +263,19 @@ static void display_new_frame(void *ctx)
     uint64_t n = qatomic_fetch_inc(&s->frames) + 1;
 
     if (lat_on()) {
+#ifdef CLOCK_BOOTTIME
+        static bool clocks_said;
+
+        if (!clocks_said) {
+            struct timespec bt;
+
+            clocks_said = true;
+            clock_gettime(CLOCK_BOOTTIME, &bt);
+            /* the LAT stamps are CLOCK_MONOTONIC; adb's /proc/uptime is CLOCK_BOOTTIME */
+            fprintf(stderr, "LAT clocks mono %" PRId64 " boottime %" PRId64 "\n", get_clock(),
+                    (int64_t)bt.tv_sec * 1000000000LL + bt.tv_nsec);
+        }
+#endif
         fprintf(stderr, "LAT present %" PRId64 " n=%" PRIu64 "\n", get_clock(), n);
     }
     if (n <= 8 || n % 256 == 0) {
@@ -267,6 +284,29 @@ static void display_new_frame(void *ctx)
     }
     /* the frame thread reads it back; no waiting here */
     qemu_event_set(&s->frame_event);
+}
+
+/*
+ * ASOFT_LEDS_FILE=<path> (the Android app, which has no QEMU UI): the display's
+ * sleep as the file's first byte, QEMU_SCROLL_LOCK_LED while asleep, as the iOS 16
+ * kernel reports it through the keyboard's Scroll Lock (ui/input.c writes the same
+ * file); the app shows "Screen off" from it.
+ */
+static void asoft_sleep_file(bool asleep)
+{
+#ifndef _WIN32
+    static int fd = -2;
+    uint8_t b = asleep ? QEMU_SCROLL_LOCK_LED : 0;
+
+    if (fd == -2) {
+        const char *path = getenv("ASOFT_LEDS_FILE");
+
+        fd = path ? open(path, O_WRONLY | O_CREAT | O_CLOEXEC, 0600) : -1;
+    }
+    if (fd >= 0 && pwrite(fd, &b, 1, 0) != 1) {
+        /* nobody to tell */
+    }
+#endif
 }
 
 /*
@@ -279,6 +319,7 @@ static void display_sleep(void *ctx, bool asleep)
 
     s->guest_asleep = asleep;
     qemu_console_set_guest_asleep(asleep);
+    asoft_sleep_file(asleep);
 }
 
 /* --- the frame path (its own thread; no BQL, no library callback) --- */
@@ -393,6 +434,7 @@ static uint64_t gfx_read(void *opaque, hwaddr addr, unsigned size)
     if (!s->dev || addr >= RVG_DEVICE_MMIO_SIZE) {
         return 0;
     }
+    bqlprof_tag("pvg gfx read", reg);
     v = rvg_device_mmio_read(s->dev, addr);
     if (reg == 0x1014 || reg == 0x1018) {
         /*
@@ -430,6 +472,7 @@ static void gfx_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
     default:
         break;
     }
+    bqlprof_tag("pvg gfx write", reg);
     rvg_device_mmio_write(s->dev, addr, (uint32_t)val);
 }
 
@@ -450,6 +493,7 @@ static uint64_t iosfc_read(void *opaque, hwaddr addr, unsigned size)
     if (!s->iosfc) {
         return 0;
     }
+    bqlprof_tag("pvg iosfc read", (int)addr);
     return rvg_iosurface_device_mmio_read(s->iosfc, addr);
 }
 
@@ -465,6 +509,7 @@ static void iosfc_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
         qemu_log_mask(LOG_UNIMP, "pvg: iosfc write 0x%" HWADDR_PRIx " <- 0x%"
                       PRIx64 "\n", addr, val);
     }
+    bqlprof_tag("pvg iosfc write", (int)addr);
     rvg_iosurface_device_mmio_write(s->iosfc, addr, val);
 }
 
@@ -699,6 +744,7 @@ static void pvg_reims_reset_hold(Object *obj, ResetType type)
 
     /* a guest that restarts asleep starts awake */
     qemu_console_set_guest_asleep(false);
+    asoft_sleep_file(false);
     if (s->dev) {
         rvg_device_reset(s->dev);
     }
@@ -710,6 +756,39 @@ static void pvg_reims_reset_hold(Object *obj, ResetType type)
     qemu_set_irq(s->irq_gfx, 0);
     s->irq_reads = 0;
     s->log_budget = 64;
+}
+
+/*
+ * The console's surface, which the frame thread reads each frame back into.
+ * ASOFT_FRAME_FD=<n> (the Android app): a memfd of at least width x height x 4
+ * bytes the parent made and passed down; the surface lives in it, so the app maps
+ * the same pages and draws the guest's frames with no copy and no screendump.
+ */
+static uint32_t *frame_alloc(VResearchPVGReimsState *s)
+{
+    size_t len = (size_t)s->width * s->height * 4;
+#ifndef _WIN32
+    const char *env = getenv("ASOFT_FRAME_FD");
+
+    if (env) {
+        int fd = atoi(env);
+        struct stat st;
+        void *p;
+
+        if (fstat(fd, &st) == 0 && st.st_size >= (off_t)len) {
+            p = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+            if (p != MAP_FAILED) {
+                memset(p, 0, len);
+                info_report("vresearch-pvg-reims: frames in ASOFT_FRAME_FD %d (%zu bytes)",
+                            fd, len);
+                return p;
+            }
+        }
+        warn_report("vresearch-pvg-reims: ASOFT_FRAME_FD=%s is not a memfd of %zu bytes "
+                    "or more: frames in QEMU's own memory", env, len);
+    }
+#endif
+    return g_malloc0(len);
 }
 
 static void pvg_reims_realize(DeviceState *dev, Error **errp)
@@ -729,7 +808,7 @@ static void pvg_reims_realize(DeviceState *dev, Error **errp)
     /* Before the first library call; REIMS_VGPU_LOG's filter overrides the level. */
     rvg_log_set_handler(reims_log, s, RVG_LOG_INFO);
 
-    s->frame = g_new0(uint32_t, (size_t)s->width * s->height);
+    s->frame = frame_alloc(s);
     /* before the library exists: its display thread may call new_frame early */
     qemu_event_init(&s->frame_event, false);
     s->con = qemu_graphic_console_create(dev, 0, &pvg_reims_gfx_ops, s);
@@ -886,6 +965,7 @@ static int pvg_reims_post_load(void *opaque, int version_id)
 
     /* restore the screen-off cover the state was taken with */
     qemu_console_set_guest_asleep(s->guest_asleep);
+    asoft_sleep_file(s->guest_asleep);
     return ret;
 }
 
