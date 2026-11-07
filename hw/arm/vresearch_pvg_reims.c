@@ -75,6 +75,7 @@ struct VResearchPVGReimsState {
     qemu_irq irq_iosfc;
 
     uint32_t width, height;     /* the display's one mode */
+    uint32_t ppi;               /* its pixel density; 0: an iPhone's size */
 
     Notifier init_done;
 
@@ -604,6 +605,19 @@ static void pvg_reims_machine_done(Notifier *notifier, void *data)
     };
     RvgStatus st;
 
+    /*
+     * ppi=N: the size whose pixel density the guest reads as N. Its paravirt
+     * display reads a little over (measured at 352x430: a size made for 326
+     * or 325.75 reads 327, one for 325.6 reads 326), and MobileGestalt finds
+     * the screen class only for the exact pitch (352x430 @2x 326 -> 27, a 41
+     * mm watch; -1 makes watchOS lay out for 40 mm, with the Apple logo in a
+     * corner), so the size is made for N - 0.4.
+     */
+    if (s->ppi) {
+        dcfg.width_millimeters = s->width * 25.4 / (s->ppi - 0.4);
+        dcfg.height_millimeters = s->height * 25.4 / (s->ppi - 0.4);
+    }
+
     build_memory_map(&b);
     if (!b.ranges->len) {
         error_report("vresearch-pvg-reims: no RAM for the GPU's memory map");
@@ -735,6 +749,7 @@ static void pvg_reims_init(Object *obj)
 static const Property pvg_reims_properties[] = {
     DEFINE_PROP_UINT32("width", VResearchPVGReimsState, width, 1179),
     DEFINE_PROP_UINT32("height", VResearchPVGReimsState, height, 2556),
+    DEFINE_PROP_UINT32("ppi", VResearchPVGReimsState, ppi, 0),
 };
 
 /* --- save state: the reims device suspends to a blob and resumes from it --- */
