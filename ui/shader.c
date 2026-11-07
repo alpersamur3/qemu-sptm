@@ -25,6 +25,7 @@
  * THE SOFTWARE.
  */
 #include "qemu/osdep.h"
+#include <math.h>
 #include <epoxy/gl.h>
 #include "ui/shader.h"
 
@@ -39,6 +40,7 @@ struct QemuGLShader {
     bool sharp;
     GLint texture_blit_flip_prog;
     GLint texture_blit_vao;
+    float turn_c, turn_s, turn_aspect;  /* qemu_gl_set_turn */
 };
 
 /* ---------------------------------------------------------------------- */
@@ -79,12 +81,29 @@ void qemu_gl_set_sharp(QemuGLShader *gls, bool sharp)
     gls->sharp = sharp;
 }
 
+/*
+ * Turn the picture by @radians about the viewport's centre (the GTK watch swinging on its band); the
+ * viewport keeps the guest's aspect, @aspect is its height over its width. 0 draws it straight.
+ */
+void qemu_gl_set_turn(QemuGLShader *gls, float radians, float aspect)
+{
+    gls->turn_c = cosf(radians);
+    gls->turn_s = sinf(radians);
+    gls->turn_aspect = aspect > 0 ? aspect : 1;
+}
+
 void qemu_gl_run_texture_blit(QemuGLShader *gls, bool flip)
 {
-    glUseProgram(flip
+    GLint prog = flip
                  ? gls->texture_blit_flip_prog
                  : gls->sharp ? gls->texture_blit_sharp_prog
-                              : gls->texture_blit_prog);
+                              : gls->texture_blit_prog;
+
+    glUseProgram(prog);
+    if (!flip) {
+        glUniform3f(glGetUniformLocation(prog, "turn"),
+                    gls->turn_c ? gls->turn_c : 1, gls->turn_s, gls->turn_aspect ? gls->turn_aspect : 1);
+    }
     glBindVertexArray(gls->texture_blit_vao);
     glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
 }
