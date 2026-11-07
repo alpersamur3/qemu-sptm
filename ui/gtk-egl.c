@@ -117,6 +117,7 @@ void gd_egl_draw(VirtualConsole *vc)
                        vc->gfx.esurface, vc->gfx.ectx);
 
         surface_gl_setup_viewport(vc->gfx.gls, vc->gfx.ds, pw, ph);
+        qemu_gl_set_sharp(vc->gfx.gls, vc->s->sharp);
         surface_gl_render_texture(vc->gfx.gls, vc->gfx.ds);
 
         eglSwapBuffers(qemu_egl_display, vc->gfx.esurface);

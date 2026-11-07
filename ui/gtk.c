@@ -374,6 +374,11 @@ static void gd_fit_window(VirtualConsole *vc)
     if (!vc->window && s->sidebar && gtk_widget_get_visible(s->sidebar)) {
         gtk_widget_get_preferred_width(s->sidebar, &bar, NULL);
     }
+    if (!vc->window && s->watch_case) {
+        /* the watch case's margin, border and padding, and the crown */
+        bar += 92;
+        menu += 100;
+    }
     scale = MIN((area.height * WINDOW_FIT_SHARE - frame.height - menu) / height,
                 (area.width * WINDOW_FIT_SHARE - frame.width - bar) / width);
     if (scale <= VC_SCALE_MIN) {
@@ -887,6 +892,55 @@ static Object *gd_consumer(void)
     return object_resolve_path_type("", "usb-consumer", NULL);
 }
 
+/*
+ * A watch guest (ASoftware watchOS): the machine has a usb-crown. F1 is the
+ * Digital Crown's press, F2 the side button (usb-consumer power-usage=0x95),
+ * and the mouse wheel over the screen turns the crown.
+ */
+static Object *gd_crown(void)
+{
+    return object_resolve_path_type("", "usb-crown", NULL);
+}
+
+static bool gd_watch_guest(void)
+{
+    return gd_crown() != NULL;
+}
+
+/* Turn the crown by @detents: positive scrolls a list down (about 1.7 guest pixels each) */
+static void gd_crown_rotate(int detents)
+{
+    Object *crown = gd_crown();
+    Error *err = NULL;
+
+    if (crown && detents &&
+        !object_property_set_int(crown, "rotate", detents, &err)) {
+        error_report_err(err);
+    }
+}
+
+#define CROWN_PER_NOTCH 30      /* detents per mouse wheel notch */
+#define CROWN_PER_PRESS 90      /* detents per Crown up / down press */
+
+/* A wheel event as detents of the crown, smooth scrolling summed up */
+static void gd_crown_scroll(GtkDisplayState *s, GdkEventScroll *scroll)
+{
+    gdouble dx, dy;
+    int n = 0;
+
+    if (scroll->direction == GDK_SCROLL_UP) {
+        n = -CROWN_PER_NOTCH;
+    } else if (scroll->direction == GDK_SCROLL_DOWN) {
+        n = CROWN_PER_NOTCH;
+    } else if (scroll->direction == GDK_SCROLL_SMOOTH &&
+               gdk_event_get_scroll_deltas((GdkEvent *)scroll, &dx, &dy)) {
+        s->crown_pending += dy * CROWN_PER_NOTCH;
+        n = (int)s->crown_pending;
+        s->crown_pending -= n;
+    }
+    gd_crown_rotate(n);
+}
+
 /* Press and release a key, as QMP send-key does, or the usb-consumer button. */
 static void gd_sidebar_press(unsigned int key)
 {
@@ -942,6 +996,10 @@ static gboolean gd_guest_display_update(void *opaque)
         return G_SOURCE_REMOVE;
     }
     gtk_widget_set_visible(s->screen_off, cover);
+    if (s->watch) {
+        gd_sidebar_set_label(s->sidebar_lock, "Side button");
+        return G_SOURCE_REMOVE;
+    }
     gd_sidebar_set_label(s->sidebar_lock, cover ? "Wake" : "Lock");
     gtk_widget_set_tooltip_text(s->sidebar_lock,
                                 cover ? "Side button: wake (F2)"
@@ -969,7 +1027,10 @@ static void gd_guest_sleep(Notifier *notifier, void *data)
 static gboolean gd_screen_off_clicked(GtkWidget *widget, GdkEventButton *event,
                                       void *opaque)
 {
-    gd_sidebar_press(KEY_F2);
+    GtkDisplayState *s = opaque;
+
+    /* a watch wakes on the crown; its side button opens Control Center */
+    gd_sidebar_press(s->watch ? KEY_F1 : KEY_F2);
     return TRUE;
 }
 
@@ -1549,6 +1610,24 @@ static void gd_sidebar_paste(GtkButton *button, void *opaque)
                                gd_paste_received, opaque);
 }
 
+/* Sharpness: the window scales the guest's picture with the sharper filter */
+static void gd_sidebar_sharp(GtkButton *button, void *opaque)
+{
+    GtkDisplayState *s = opaque;
+    VirtualConsole *vc;
+    int i;
+
+    s->sharp = !s->sharp;
+    gd_sidebar_set_label(GTK_WIDGET(button),
+                         s->sharp ? "Sharpness: on" : "Sharpness: off");
+    for (i = 0; i < s->vcs->len; i++) {
+        vc = g_ptr_array_index(s->vcs, i);
+        if (vc->type == GD_VC_GFX && vc->gfx.drawing_area) {
+            gtk_widget_queue_draw(vc->gfx.drawing_area);
+        }
+    }
+}
+
 static void gd_sidebar_full_screen(GtkButton *button, void *opaque)
 {
     GtkDisplayState *s = opaque;
@@ -1954,6 +2033,80 @@ static GtkWidget *gd_sidebar_button(GtkDisplayState *s, GtkWidget *group,
     return button;
 }
 
+static void gd_sidebar_crown_up(GtkButton *button, void *opaque)
+{
+    gd_crown_rotate(-CROWN_PER_PRESS);
+}
+
+static void gd_sidebar_crown_down(GtkButton *button, void *opaque)
+{
+    gd_crown_rotate(CROWN_PER_PRESS);
+}
+
+static gboolean gd_watch_crown_scrolled(GtkWidget *widget, GdkEventScroll *scroll,
+                                        void *opaque)
+{
+    gd_crown_scroll(opaque, scroll);
+    return TRUE;
+}
+
+/*
+ * A watch guest's screen in a watch's case: rounded, with the Digital Crown
+ * (click: press; wheel: turn) and the side button on its right edge.
+ */
+static const char watch_case_css[] =
+    "#watch-case { background-color: #1c1c1e; border: 2px solid #48484a;"
+    "  border-radius: 66px; padding: 32px 26px; margin: 18px 0 18px 18px; }"
+    "#watch-crown { background-image: linear-gradient(to right, #636366, #d1d1d6 45%, #8e8e93);"
+    "  border: 1px solid #48484a; border-radius: 0 8px 8px 0; min-width: 15px;"
+    "  min-height: 70px; padding: 0; margin-top: 130px; box-shadow: none; }"
+    "#watch-side { background-image: none; background-color: #48484a; border: none;"
+    "  border-radius: 0 4px 4px 0; min-width: 8px; min-height: 100px; padding: 0;"
+    "  margin-top: 36px; box-shadow: none; }"
+    "#watch-crown:hover, #watch-side:hover { background-color: #0a84ff; }";
+
+static GtkWidget *gd_watch_button(GtkDisplayState *s, const char *name,
+                                  const char *tooltip, unsigned int key)
+{
+    GtkWidget *button = gtk_button_new();
+
+    gtk_widget_set_name(button, name);
+    gtk_widget_set_can_focus(button, FALSE);
+    gtk_widget_set_tooltip_text(button, tooltip);
+    gtk_widget_set_halign(button, GTK_ALIGN_START);
+    g_object_set_data(G_OBJECT(button), "key", GUINT_TO_POINTER(key));
+    g_signal_connect(button, "clicked", G_CALLBACK(gd_sidebar_key), s);
+    gtk_box_pack_start(GTK_BOX(s->watch_buttons), button, FALSE, FALSE, 0);
+    return button;
+}
+
+static void gd_create_watch_case(GtkDisplayState *s)
+{
+    GtkCssProvider *css = gtk_css_provider_new();
+    GtkWidget *crown;
+
+    gtk_css_provider_load_from_data(css, watch_case_css, -1, NULL);
+    gtk_style_context_add_provider_for_screen(gdk_screen_get_default(),
+        GTK_STYLE_PROVIDER(css), GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
+    g_object_unref(css);
+
+    s->watch_case = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
+    gtk_widget_set_name(s->watch_case, "watch-case");
+    gtk_box_pack_start(GTK_BOX(s->watch_case), s->overlay, TRUE, TRUE, 0);
+
+    s->watch_buttons = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+    gtk_widget_set_valign(s->watch_buttons, GTK_ALIGN_START);
+    crown = gd_watch_button(s, "watch-crown",
+                            "Digital Crown: click to press (F1), wheel to turn",
+                            KEY_F1);
+    gtk_widget_add_events(crown, GDK_SCROLL_MASK | GDK_SMOOTH_SCROLL_MASK);
+    g_signal_connect(crown, "scroll-event", G_CALLBACK(gd_watch_crown_scrolled), s);
+    gd_watch_button(s, "watch-side", "Side button: Control Center (F2)", KEY_F2);
+
+    gtk_box_pack_start(GTK_BOX(s->hbox), s->watch_case, TRUE, TRUE, 0);
+    gtk_box_pack_start(GTK_BOX(s->hbox), s->watch_buttons, FALSE, FALSE, 0);
+}
+
 static void gd_create_sidebar(GtkDisplayState *s)
 {
     const char *shots = g_getenv("ASOFT_SHOTS_DIR");
@@ -2003,6 +2156,22 @@ static void gd_create_sidebar(GtkDisplayState *s)
     gtk_box_pack_start(GTK_BOX(s->sidebar), header, FALSE, FALSE, 0);
 
     group = gd_sidebar_group(s, "BUTTONS");
+    if (s->watch) {
+        gd_sidebar_button(s, group, "Crown", "F1",
+                          "Press the Digital Crown (F1): the clock face, the apps",
+                          G_CALLBACK(gd_sidebar_key), KEY_F1);
+        s->sidebar_lock = gd_sidebar_button(s, group, "Side button", "F2",
+                                            "The side button (F2): Control Center",
+                                            G_CALLBACK(gd_sidebar_key), KEY_F2);
+        gd_sidebar_button(s, group, "Crown up", "Wheel",
+                          "Turn the Digital Crown up (the mouse wheel over the "
+                          "screen turns it too)",
+                          G_CALLBACK(gd_sidebar_crown_up), 0);
+        gd_sidebar_button(s, group, "Crown down", "Wheel",
+                          "Turn the Digital Crown down",
+                          G_CALLBACK(gd_sidebar_crown_down), 0);
+        goto screen;
+    }
     gd_sidebar_button(s, group, "Home", "F1", "Home (F1)",
                       G_CALLBACK(gd_sidebar_key), KEY_F1);
     s->sidebar_lock = gd_sidebar_button(s, group, "Lock", "F2",
@@ -2022,17 +2191,26 @@ static void gd_create_sidebar(GtkDisplayState *s)
     gd_sidebar_button(s, group, "Volume down", "F3", "Volume down (F3)",
                       G_CALLBACK(gd_sidebar_key), KEY_F3);
 
+screen:
     group = gd_sidebar_group(s, "SCREEN");
     gd_sidebar_button(s, group, "Screenshot", "Ctrl+S",
                       "Save the screen as a PNG (Ctrl+S)",
                       G_CALLBACK(gd_sidebar_screenshot), 0);
     gd_sidebar_button(s, group, "Full screen", "F11", "Full screen (F11)",
                       G_CALLBACK(gd_sidebar_full_screen), 0);
+    s->sharp = g_strcmp0(g_getenv("ASOFT_SHARP"), "0") != 0;
+    gd_sidebar_button(s, group, s->sharp ? "Sharpness: on" : "Sharpness: off", NULL,
+                      "Scale the screen with a sharper filter (off: the plain "
+                      "bilinear one)",
+                      G_CALLBACK(gd_sidebar_sharp), 0);
     gd_sidebar_button(s, group, "Screenshots folder", NULL,
                       "Open the folder the screenshots go to",
                       G_CALLBACK(gd_sidebar_open_shots), 0);
 
-    group = gd_sidebar_group(s, "APPS AND TEXT");
+    group = gd_sidebar_group(s, s->watch ? "TEXT" : "APPS AND TEXT");
+    if (s->watch) {
+        goto text;
+    }
     install = gd_sidebar_button(s, group, "Install .ipa…", NULL,
                                 "Copy .ipa files to the guest, which "
                                 "installs them",
@@ -2042,6 +2220,7 @@ static void gd_create_sidebar(GtkDisplayState *s)
         gtk_widget_set_sensitive(install, FALSE);
         gtk_widget_set_tooltip_text(install, "ASOFT_IPA_DIR is not set");
     }
+text:
     gd_sidebar_button(s, group, "Paste text", "Ctrl+V",
                       "Type the text on the PC's clipboard (Ctrl+V)",
                       G_CALLBACK(gd_sidebar_paste), 0);
@@ -2610,6 +2789,11 @@ static gboolean gd_scroll_event(GtkWidget *widget, GdkEventScroll *scroll,
     InputButton btn_horizontal;
     bool has_vertical = false;
     bool has_horizontal = false;
+
+    if (vc->s->watch) {
+        gd_crown_scroll(vc->s, scroll);
+        return TRUE;
+    }
 
     /* with the side bar the guest is a phone: the wheel swipes */
     if (vc->s->sidebar && qemu_input_is_absolute(vc->gfx.dcl.con)) {
@@ -4329,6 +4513,7 @@ static void gtk_display_init(DisplayState *ds, DisplayOptions *opts)
         g_idle_add(gd_quick_clear, s);
     }
     if (opts->u.gtk.has_sidebar && opts->u.gtk.sidebar) {
+        s->watch = gd_watch_guest();
         gd_create_sidebar(s);
         gd_create_screen_off(s);
         gd_create_busy(s);
@@ -4336,7 +4521,11 @@ static void gtk_display_init(DisplayState *ds, DisplayOptions *opts)
         gtk_container_add(GTK_CONTAINER(s->overlay), s->notebook);
         gtk_overlay_add_overlay(GTK_OVERLAY(s->overlay), s->screen_off);
         gtk_overlay_add_overlay(GTK_OVERLAY(s->overlay), s->busy);
-        gtk_box_pack_start(GTK_BOX(s->hbox), s->overlay, TRUE, TRUE, 0);
+        if (s->watch) {
+            gd_create_watch_case(s);
+        } else {
+            gtk_box_pack_start(GTK_BOX(s->hbox), s->overlay, TRUE, TRUE, 0);
+        }
         gtk_box_pack_end(GTK_BOX(s->hbox), s->sidebar, FALSE, FALSE, 0);
     } else {
         gtk_box_pack_start(GTK_BOX(s->hbox), s->notebook, TRUE, TRUE, 0);

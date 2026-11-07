@@ -135,6 +135,12 @@ struct GtkDisplayState {
     GtkWidget *sidebar_lock;
     unsigned int consumer_keys_down;  /* F1-F4 held, as usb-consumer buttons */
     GtkWidget *sidebar_power;
+    bool sharp;                 /* gl=on: scale the picture with the sharper filter */
+    /* a watch guest (usb-crown): the crown, a case around the screen */
+    bool watch;
+    GtkWidget *watch_case;      /* the overlay, in a watch's case */
+    GtkWidget *watch_buttons;   /* the crown and the side button beside it */
+    double crown_pending;       /* smooth scrolling short of a detent */
     /* the guest's display power, from its keyboard's Scroll Lock LED */
     GtkWidget *overlay;         /* the notebook, and screen_off over it */
     GtkWidget *screen_off;

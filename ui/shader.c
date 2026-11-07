@@ -31,9 +31,12 @@
 #include "ui/shader/texture-blit-vert.h"
 #include "ui/shader/texture-blit-flip-vert.h"
 #include "ui/shader/texture-blit-frag.h"
+#include "ui/shader/texture-blit-sharp-frag.h"
 
 struct QemuGLShader {
     GLint texture_blit_prog;
+    GLint texture_blit_sharp_prog;
+    bool sharp;
     GLint texture_blit_flip_prog;
     GLint texture_blit_vao;
 };
@@ -70,11 +73,18 @@ static GLuint qemu_gl_init_texture_blit(GLint texture_blit_prog)
     return vao;
 }
 
+/* The next blits (not the flipped ones) scale with the sharper filter */
+void qemu_gl_set_sharp(QemuGLShader *gls, bool sharp)
+{
+    gls->sharp = sharp;
+}
+
 void qemu_gl_run_texture_blit(QemuGLShader *gls, bool flip)
 {
     glUseProgram(flip
                  ? gls->texture_blit_flip_prog
-                 : gls->texture_blit_prog);
+                 : gls->sharp ? gls->texture_blit_sharp_prog
+                              : gls->texture_blit_prog);
     glBindVertexArray(gls->texture_blit_vao);
     glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
 }
@@ -158,7 +168,10 @@ QemuGLShader *qemu_gl_init_shader(void)
         (texture_blit_vert_src, texture_blit_frag_src);
     gls->texture_blit_flip_prog = qemu_gl_create_compile_link_program
         (texture_blit_flip_vert_src, texture_blit_frag_src);
-    if (!gls->texture_blit_prog || !gls->texture_blit_flip_prog) {
+    gls->texture_blit_sharp_prog = qemu_gl_create_compile_link_program
+        (texture_blit_vert_src, texture_blit_sharp_frag_src);
+    if (!gls->texture_blit_prog || !gls->texture_blit_flip_prog ||
+        !gls->texture_blit_sharp_prog) {
         exit(1);
     }
 
@@ -175,6 +188,7 @@ void qemu_gl_fini_shader(QemuGLShader *gls)
     }
     glDeleteProgram(gls->texture_blit_prog);
     glDeleteProgram(gls->texture_blit_flip_prog);
+    glDeleteProgram(gls->texture_blit_sharp_prog);
     glDeleteProgram(gls->texture_blit_vao);
     g_free(gls);
 }

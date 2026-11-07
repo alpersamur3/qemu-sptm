@@ -139,6 +139,7 @@ void gd_gl_area_draw(VirtualConsole *vc)
         gtk_gl_area_make_current(GTK_GL_AREA(vc->gfx.drawing_area));
 
         surface_gl_setup_viewport(vc->gfx.gls, vc->gfx.ds, pw, ph);
+        qemu_gl_set_sharp(vc->gfx.gls, vc->s->sharp);
         surface_gl_render_texture(vc->gfx.gls, vc->gfx.ds);
     }
 }
