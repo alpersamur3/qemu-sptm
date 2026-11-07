@@ -343,6 +343,15 @@ static void gd_update_geometry_hints(VirtualConsole *vc)
  */
 #define WINDOW_FIT_SHARE 0.92
 
+/* The drawn watch around a watch guest's screen (gd_create_watch_case), in logical pixels */
+#define WATCH_LEFT 26       /* room left of the case */
+#define WATCH_RIGHT 60      /* right of the case: the crown and the side button */
+#define WATCH_BEZEL 22      /* the case around the screen */
+#define WATCH_TOP 72        /* the upper strap, from the window's top edge to the case */
+#define WATCH_BOTTOM 130    /* the lower strap dangling below the case */
+#define WATCH_NOTCH 16.0    /* pixels of drag per crown notch */
+#define WATCH_HOLD_MS 550
+
 static void gd_fit_window(VirtualConsole *vc)
 {
     GtkDisplayState *s = vc->s;
@@ -375,9 +384,9 @@ static void gd_fit_window(VirtualConsole *vc)
         gtk_widget_get_preferred_width(s->sidebar, &bar, NULL);
     }
     if (!vc->window && s->watch_case) {
-        /* the watch case's margin, border and padding, and the crown */
-        bar += 92;
-        menu += 100;
+        /* the drawn watch around the screen: the case, the crown's room, the band */
+        bar += WATCH_LEFT + WATCH_RIGHT + 2 * WATCH_BEZEL;
+        menu += WATCH_TOP + WATCH_BOTTOM + 2 * WATCH_BEZEL;
     }
     scale = MIN((area.height * WINDOW_FIT_SHARE - frame.height - menu) / height,
                 (area.width * WINDOW_FIT_SHARE - frame.width - bar) / width);
@@ -907,6 +916,8 @@ static bool gd_watch_guest(void)
     return gd_crown() != NULL;
 }
 
+static GtkDisplayState *gd_watch_state;     /* for the crown's knurling to follow every turn */
+
 /* Turn the crown by @detents: positive scrolls a list down (about 1.7 guest pixels each) */
 static void gd_crown_rotate(int detents)
 {
@@ -916,6 +927,11 @@ static void gd_crown_rotate(int detents)
     if (crown && detents &&
         !object_property_set_int(crown, "rotate", detents, &err)) {
         error_report_err(err);
+    }
+    if (detents && gd_watch_state && gd_watch_state->watch_case) {
+        /* the drawn crown turns with it, whatever turned it (wheel, drag, Crown up/down) */
+        gd_watch_state->crown_phase -= detents / 30.0 * 9.0;
+        gtk_widget_queue_draw(gd_watch_state->watch_case);
     }
 }
 
@@ -2043,68 +2059,483 @@ static void gd_sidebar_crown_down(GtkButton *button, void *opaque)
     gd_crown_rotate(CROWN_PER_PRESS);
 }
 
-static gboolean gd_watch_crown_scrolled(GtkWidget *widget, GdkEventScroll *scroll,
-                                        void *opaque)
+/*
+ * A watch guest's screen in a drawn Apple Watch (the Android app's WatchCase, in cairo): a midnight
+ * aluminium case around the screen, the Digital Crown and the side button on its right, a sport band
+ * running off the top and the bottom of the window. The screen (s->overlay) is laid out with margins
+ * inside the case; the case is drawn under it, the screen's round corners over it. The drawn crown is
+ * real: drag it up or down to turn it (a notch per WATCH_NOTCH pixels), click to press it, hold it
+ * (Siri); the side button is held as long as the mouse button (a double press, the power menu). The
+ * wheel anywhere over the watch turns the crown, and the knurling follows every turn.
+ */
+typedef struct WatchGeometry {
+    double sx, sy, sw, sh, sr;          /* the screen at rest and its corners' radius */
+    double cx, cy, cw, ch, cr;          /* the case */
+    double kx, ky, kw, kh;              /* the crown */
+    double bx, by, bw, bh;              /* the side button */
+    double px, py;                      /* the band's pivot: the window's top edge above the case */
+} WatchGeometry;
+
+/* The watch at rest, in the event box's coordinates: the screen's swing offset is taken back out */
+static void gd_watch_geometry(GtkDisplayState *s, WatchGeometry *g)
+{
+    GtkAllocation o, w;
+
+    gtk_widget_get_allocation(s->overlay, &o);
+    gtk_widget_get_allocation(s->watch_case, &w);
+    g->sx = o.x - w.x - s->swing_dx;
+    g->sy = o.y - w.y - s->swing_dy;
+    g->sw = o.width;
+    g->sh = o.height;
+    g->sr = MIN(g->sw, g->sh) * 0.21;
+    g->cx = g->sx - WATCH_BEZEL;
+    g->cy = g->sy - WATCH_BEZEL;
+    g->cw = g->sw + 2 * WATCH_BEZEL;
+    g->ch = g->sh + 2 * WATCH_BEZEL;
+    g->cr = MIN(g->cw, g->ch) * 0.27;
+    /* a 41 mm watch: the crown ~16% of the case's height, out ~2.5 mm; the side button below it */
+    g->kh = g->ch * 0.16;
+    g->kw = 30;
+    g->kx = g->cx + g->cw - 10;
+    g->ky = g->cy + g->ch * 0.34 - g->kh / 2;
+    g->bh = g->ch * 0.27;
+    g->bw = 15;
+    g->bx = g->cx + g->cw - 5;
+    g->by = g->cy + g->ch * 0.60 - g->bh / 2;
+    g->px = g->cx + g->cw / 2;
+    g->py = 0;
+}
+
+static void gd_rounded(cairo_t *cr, double x, double y, double w, double h, double r)
+{
+    r = MIN(r, MIN(w, h) / 2);
+    cairo_new_sub_path(cr);
+    cairo_arc(cr, x + w - r, y + r, r, -G_PI / 2, 0);
+    cairo_arc(cr, x + w - r, y + h - r, r, 0, G_PI / 2);
+    cairo_arc(cr, x + r, y + h - r, r, G_PI / 2, G_PI);
+    cairo_arc(cr, x + r, y + r, r, G_PI, 3 * G_PI / 2);
+    cairo_close_path(cr);
+}
+
+/* The sport band the watch hangs by: the upper strap up to the window's top edge, the lower one dangling */
+static void gd_watch_draw_band(cairo_t *cr, WatchGeometry *g)
+{
+    double w = g->cw * 0.56, x = g->cx + (g->cw - w) / 2, hole, tip = g->cy + g->ch + WATCH_BOTTOM - 14;
+    cairo_pattern_t *p = cairo_pattern_create_linear(x, 0, x + w, 0);
+    int i;
+
+    cairo_pattern_add_color_stop_rgb(p, 0, 0x2b / 255.0, 0x4a / 255.0, 0x6e / 255.0);
+    cairo_pattern_add_color_stop_rgb(p, 0.5, 0x3d / 255.0, 0x66 / 255.0, 0x94 / 255.0);
+    cairo_pattern_add_color_stop_rgb(p, 1, 0x2b / 255.0, 0x4a / 255.0, 0x6e / 255.0);
+    cairo_set_source(cr, p);
+    gd_rounded(cr, x, -60, w, g->cy + 60 + 36, 26);
+    cairo_fill(cr);
+    gd_rounded(cr, x, g->cy + g->ch - 36, w, tip - (g->cy + g->ch) + 36, 26);
+    cairo_fill(cr);
+    cairo_pattern_destroy(p);
+    /* the pin the upper strap hangs by, the lower strap's holes and the one the pin would sit in */
+    cairo_set_source_rgb(cr, 0x9a / 255.0, 0x9c / 255.0, 0xa2 / 255.0);
+    gd_rounded(cr, x + 10, 10, w - 20, 5, 2.5);
+    cairo_fill(cr);
+    for (i = 0, hole = g->cy + g->ch + 22; i < 7 && hole + 12 < tip; i++, hole += 15) {
+        if (i == 2) {
+            cairo_set_source_rgb(cr, 0xd0 / 255.0, 0xd2 / 255.0, 0xd6 / 255.0);
+            cairo_arc(cr, g->px, hole, 3, 0, 2 * G_PI);
+        } else {
+            cairo_set_source_rgb(cr, 0x1d / 255.0, 0x35 / 255.0, 0x50 / 255.0);
+            cairo_arc(cr, g->px, hole, 4, 0, 2 * G_PI);
+        }
+        cairo_fill(cr);
+    }
+}
+
+/* The Digital Crown from the front: a knurled cylinder on its side, its ridges moving with the turn */
+static void gd_watch_draw_crown(GtkDisplayState *s, cairo_t *cr, WatchGeometry *g)
+{
+    double lit = s->crown_target == 1 ? -0.12 : s->crown_hover ? 0.10 : 0;
+    double gap = 4.2, y, start;
+    cairo_pattern_t *p = cairo_pattern_create_linear(0, g->ky, 0, g->ky + g->kh);
+
+    cairo_pattern_add_color_stop_rgb(p, 0.00, 0.19 + lit, 0.19 + lit, 0.21 + lit);
+    cairo_pattern_add_color_stop_rgb(p, 0.30, 0.49 + lit, 0.49 + lit, 0.52 + lit);
+    cairo_pattern_add_color_stop_rgb(p, 0.50, 0.60 + lit, 0.60 + lit, 0.64 + lit);
+    cairo_pattern_add_color_stop_rgb(p, 0.75, 0.42 + lit, 0.42 + lit, 0.45 + lit);
+    cairo_pattern_add_color_stop_rgb(p, 1.00, 0.16 + lit, 0.16 + lit, 0.19 + lit);
+    cairo_set_source(cr, p);
+    gd_rounded(cr, g->kx, g->ky, g->kw, g->kh, 6);
+    cairo_fill(cr);
+    cairo_pattern_destroy(p);
+    cairo_save(cr);
+    cairo_rectangle(cr, g->kx + 8, g->ky, g->kw - 11, g->kh);
+    cairo_clip(cr);
+    cairo_set_line_width(cr, 1.4);
+    start = g->ky + fmod(fmod(s->crown_phase, gap) + gap, gap);
+    for (y = start; y < g->ky + g->kh; y += gap) {
+        double edge = MIN(y - g->ky, g->ky + g->kh - y) / (g->kh / 2);
+        cairo_set_source_rgba(cr, 0, 0, 0, (40 + 150 * MIN(1, edge * 1.4)) / 255.0);
+        cairo_move_to(cr, g->kx, y);
+        cairo_line_to(cr, g->kx + g->kw, y);
+        cairo_stroke(cr);
+    }
+    cairo_restore(cr);
+    /* a touch of light on top, and the end cap's edge */
+    cairo_set_line_width(cr, 1);
+    cairo_set_source_rgba(cr, 1, 1, 1, 0.33);
+    cairo_move_to(cr, g->kx + 9, g->ky + 1);
+    cairo_line_to(cr, g->kx + g->kw - 4, g->ky + 1);
+    cairo_stroke(cr);
+    cairo_set_line_width(cr, 2);
+    cairo_set_source_rgba(cr, 0.78, 0.78, 0.82, 0.53);
+    cairo_move_to(cr, g->kx + g->kw - 2, g->ky + 6);
+    cairo_line_to(cr, g->kx + g->kw - 2, g->ky + g->kh - 6);
+    cairo_stroke(cr);
+}
+
+static void gd_watch_draw_side(GtkDisplayState *s, cairo_t *cr, WatchGeometry *g)
+{
+    double lit = s->crown_target == 2 ? -0.12 : 0;
+    cairo_pattern_t *p = cairo_pattern_create_linear(g->bx, 0, g->bx + g->bw, 0);
+
+    cairo_pattern_add_color_stop_rgb(p, 0, 0.23 + lit, 0.23 + lit, 0.25 + lit);
+    cairo_pattern_add_color_stop_rgb(p, 0.5, 0.54 + lit, 0.54 + lit, 0.57 + lit);
+    cairo_pattern_add_color_stop_rgb(p, 1, 0.29 + lit, 0.29 + lit, 0.31 + lit);
+    cairo_set_source(cr, p);
+    gd_rounded(cr, g->bx, g->by, g->bw, g->bh, 5);
+    cairo_fill(cr);
+    cairo_pattern_destroy(p);
+}
+
+/* The watch, turned about the band's pivot by the swing: band, crown, side button, case, glass */
+static void gd_watch_paint(GtkDisplayState *s, cairo_t *cr)
+{
+    WatchGeometry g;
+    cairo_pattern_t *p;
+
+    gd_watch_geometry(s, &g);
+    cairo_set_source_rgb(cr, 0.055, 0.055, 0.063);
+    cairo_paint(cr);
+    cairo_save(cr);
+    cairo_translate(cr, g.px, g.py);
+    cairo_rotate(cr, s->swing_angle);
+    cairo_translate(cr, -g.px, -g.py);
+    gd_watch_draw_band(cr, &g);
+    gd_watch_draw_crown(s, cr, &g);
+    gd_watch_draw_side(s, cr, &g);
+    p = cairo_pattern_create_linear(0, g.cy, 0, g.cy + g.ch);
+    cairo_pattern_add_color_stop_rgb(p, 0, 0x4b / 255.0, 0x4b / 255.0, 0x52 / 255.0);
+    cairo_pattern_add_color_stop_rgb(p, 0.5, 0x2a / 255.0, 0x2a / 255.0, 0x2f / 255.0);
+    cairo_pattern_add_color_stop_rgb(p, 1, 0x1b / 255.0, 0x1b / 255.0, 0x1f / 255.0);
+    cairo_set_source(cr, p);
+    gd_rounded(cr, g.cx, g.cy, g.cw, g.ch, g.cr);
+    cairo_fill(cr);
+    cairo_pattern_destroy(p);
+    cairo_set_line_width(cr, 1.5);
+    cairo_set_source_rgba(cr, 1, 1, 1, 0.4);
+    gd_rounded(cr, g.cx + 1, g.cy + 1, g.cw - 2, g.ch - 2, g.cr);
+    cairo_stroke(cr);
+    /* the glass: black to the screen's edge, a faint reflection along its rim */
+    cairo_set_source_rgb(cr, 0, 0, 0);
+    gd_rounded(cr, g.sx - 9, g.sy - 9, g.sw + 18, g.sh + 18, g.sr + 9);
+    cairo_fill(cr);
+    cairo_set_line_width(cr, 1);
+    cairo_set_source_rgba(cr, 1, 1, 1, 0.08);
+    gd_rounded(cr, g.sx - 8.5, g.sy - 8.5, g.sw + 17, g.sh + 17, g.sr + 8.5);
+    cairo_stroke(cr);
+    cairo_restore(cr);
+}
+
+/* Under the screen: the watch */
+static gboolean gd_watch_draw(GtkWidget *widget, cairo_t *cr, void *opaque)
+{
+    gd_watch_paint(opaque, cr);
+    return FALSE;       /* then the screen */
+}
+
+/*
+ * Over the screen (an overlay of its own: the picture's window is drawn after the case's, so a mask
+ * there would go under it): the screen's round corners, painted as the watch behind them, the rest clear.
+ * The picture turns with the swing about its own centre (qemu_gl_set_turn), so do the corners.
+ */
+static gboolean gd_watch_draw_corners(GtkWidget *widget, cairo_t *cr, void *opaque)
+{
+    GtkDisplayState *s = opaque;
+    WatchGeometry g;
+    GtkAllocation o, w;
+
+    gd_watch_geometry(s, &g);
+    gtk_widget_get_allocation(s->overlay, &o);
+    gtk_widget_get_allocation(s->watch_case, &w);
+    cairo_set_fill_rule(cr, CAIRO_FILL_RULE_EVEN_ODD);
+    cairo_rectangle(cr, 0, 0, g.sw, g.sh);
+    cairo_save(cr);
+    cairo_translate(cr, g.sw / 2, g.sh / 2);
+    cairo_rotate(cr, s->swing_angle);
+    cairo_translate(cr, -g.sw / 2, -g.sh / 2);
+    gd_rounded(cr, 0, 0, g.sw, g.sh, g.sr);
+    cairo_restore(cr);
+    cairo_clip(cr);
+    cairo_translate(cr, -(o.x - w.x), -(o.y - w.y));
+    gd_watch_paint(s, cr);
+    return TRUE;
+}
+
+/*
+ * The swing: a pendulum about the band's pivot (natural period ~1.4 s, lightly damped), kicked by the
+ * window's horizontal moves. Each tick turns the drawn watch and the picture (qemu_gl_set_turn) and moves
+ * the screen to where the swung case holds it; small angles, so the picture's corners stay in its window.
+ */
+#define SWING_W0 4.5            /* rad/s */
+#define SWING_ZETA 0.12
+#define SWING_KICK 0.0025       /* rad/s per pixel the window moved */
+#define SWING_MAX 0.10          /* rad, about 6 degrees */
+
+static void gd_swing_apply(GtkDisplayState *s)
+{
+    WatchGeometry g;
+    double len;
+    int dx, dy;
+    VirtualConsole *vc = gd_vc_find_current(s);
+
+    gd_watch_geometry(s, &g);
+    len = g.cy + g.ch / 2 - g.py;
+    dx = (int)lrint(len * sin(s->swing_angle));
+    dy = (int)lrint(-len * (1 - cos(s->swing_angle)));
+    if (dx != s->swing_dx || dy != s->swing_dy) {
+        s->swing_dx = dx;
+        s->swing_dy = dy;
+        gtk_widget_set_margin_start(s->overlay, WATCH_LEFT + WATCH_BEZEL + dx);
+        gtk_widget_set_margin_end(s->overlay, WATCH_RIGHT + WATCH_BEZEL - dx);
+        gtk_widget_set_margin_top(s->overlay, WATCH_TOP + WATCH_BEZEL + dy);
+        gtk_widget_set_margin_bottom(s->overlay, WATCH_BOTTOM + WATCH_BEZEL - dy);
+    }
+    gtk_widget_queue_draw(s->watch_case);
+    if (vc && vc->gfx.drawing_area) {
+        gtk_widget_queue_draw(vc->gfx.drawing_area);
+    }
+}
+
+static gboolean gd_swing_tick(void *opaque)
+{
+    GtkDisplayState *s = opaque;
+    gint64 now = g_get_monotonic_time();
+    double dt = MIN(0.05, (now - s->swing_t) / 1e6), acc;
+
+    s->swing_t = now;
+    acc = -SWING_W0 * SWING_W0 * sin(s->swing_angle) - 2 * SWING_ZETA * SWING_W0 * s->swing_vel;
+    s->swing_vel += acc * dt;
+    s->swing_angle += s->swing_vel * dt;
+    if (s->swing_angle > SWING_MAX) {
+        s->swing_angle = SWING_MAX;
+        s->swing_vel = MIN(s->swing_vel, 0);
+    } else if (s->swing_angle < -SWING_MAX) {
+        s->swing_angle = -SWING_MAX;
+        s->swing_vel = MAX(s->swing_vel, 0);
+    }
+    if (fabs(s->swing_angle) < 0.0008 && fabs(s->swing_vel) < 0.006) {
+        s->swing_angle = s->swing_vel = 0;
+        s->swing_tick_id = 0;
+        gd_swing_apply(s);
+        return G_SOURCE_REMOVE;
+    }
+    gd_swing_apply(s);
+    return G_SOURCE_CONTINUE;
+}
+
+/* The toplevel moved: kick the pendulum against the move (the watch lags behind the window) */
+static gboolean gd_watch_window_moved(GtkWidget *widget, GdkEventConfigure *e, void *opaque)
+{
+    GtkDisplayState *s = opaque;
+    int dx = e->x - s->win_x;
+
+    if (!s->win_pos_known || g_get_monotonic_time() - s->swing_born < 2 * G_USEC_PER_SEC) {
+        s->win_pos_known = true;        /* the first positions are the window's own fitting */
+    } else if (dx && !s->full_screen) {
+        s->swing_vel -= dx * SWING_KICK;
+        s->swing_vel = MAX(-3.0, MIN(3.0, s->swing_vel));
+        if (!s->swing_tick_id) {
+            s->swing_t = g_get_monotonic_time();
+            s->swing_tick_id = g_timeout_add(16, gd_swing_tick, s);
+        }
+    }
+    s->win_x = e->x;
+    s->win_y = e->y;
+    return FALSE;
+}
+
+static void gd_consumer_edge(const char *button, bool down)
+{
+    Object *consumer = gd_consumer();
+    Error *err = NULL;
+
+    if (consumer && !object_property_set_str(consumer, down ? "down" : "up", button, &err)) {
+        error_report_err(err);
+    }
+}
+
+static gboolean gd_watch_crown_hold(void *opaque)
+{
+    GtkDisplayState *s = opaque;
+
+    s->crown_hold_id = 0;
+    if (s->crown_target == 1 && !s->crown_moved) {
+        s->crown_holding = true;
+        gd_consumer_edge("home", true);
+    }
+    return G_SOURCE_REMOVE;
+}
+
+/* What is under the pointer: 1 the crown, 2 the side button; the point is turned back by the swing first */
+static int gd_watch_hit(GtkDisplayState *s, double x, double y)
+{
+    WatchGeometry g;
+    double c, sn, rx, ry;
+
+    gd_watch_geometry(s, &g);
+    c = cos(-s->swing_angle);
+    sn = sin(-s->swing_angle);
+    rx = g.px + (x - g.px) * c - (y - g.py) * sn;
+    ry = g.py + (x - g.px) * sn + (y - g.py) * c;
+    if (rx < g.cx + g.cw - 30 || rx > g.kx + g.kw + 30) {
+        return 0;
+    }
+    if (fabs(ry - (g.by + g.bh / 2)) < g.bh / 2 + 10) {
+        return 2;
+    }
+    if (fabs(ry - (g.ky + g.kh / 2)) < g.kh / 2 + 40) {
+        return 1;
+    }
+    return 0;
+}
+
+static gboolean gd_watch_button_press(GtkWidget *widget, GdkEventButton *e, void *opaque)
+{
+    GtkDisplayState *s = opaque;
+
+    if (e->type != GDK_BUTTON_PRESS || e->button != 1) {
+        return TRUE;
+    }
+    s->crown_target = gd_watch_hit(s, e->x, e->y);
+    if (s->crown_target == 2) {
+        gd_consumer_edge("power", true);
+    } else if (s->crown_target == 1) {
+        s->crown_down_y = s->crown_last_y = e->y;
+        s->crown_acc = 0;
+        s->crown_moved = s->crown_holding = false;
+        s->crown_hold_id = g_timeout_add(WATCH_HOLD_MS, gd_watch_crown_hold, s);
+    }
+    gtk_widget_queue_draw(widget);
+    return TRUE;
+}
+
+static gboolean gd_watch_motion(GtkWidget *widget, GdkEventMotion *e, void *opaque)
+{
+    GtkDisplayState *s = opaque;
+    bool hover = gd_watch_hit(s, e->x, e->y) == 1;
+
+    if (hover != s->crown_hover) {
+        s->crown_hover = hover;
+        gtk_widget_queue_draw(widget);
+    }
+    if (s->crown_target != 1) {
+        return TRUE;
+    }
+    if (!s->crown_moved && !s->crown_holding && fabs(e->y - s->crown_down_y) > 4) {
+        s->crown_moved = true;
+        if (s->crown_hold_id) {
+            g_source_remove(s->crown_hold_id);
+            s->crown_hold_id = 0;
+        }
+    }
+    if (s->crown_moved) {
+        /* the finger up: the list moves on down, as the wheel down */
+        s->crown_acc += s->crown_last_y - e->y;
+        while (s->crown_acc >= WATCH_NOTCH) {
+            s->crown_acc -= WATCH_NOTCH;
+            gd_crown_rotate(CROWN_PER_NOTCH);
+        }
+        while (s->crown_acc <= -WATCH_NOTCH) {
+            s->crown_acc += WATCH_NOTCH;
+            gd_crown_rotate(-CROWN_PER_NOTCH);
+        }
+    }
+    s->crown_last_y = e->y;
+    return TRUE;
+}
+
+static gboolean gd_watch_button_release(GtkWidget *widget, GdkEventButton *e, void *opaque)
+{
+    GtkDisplayState *s = opaque;
+
+    if (e->button != 1) {
+        return TRUE;
+    }
+    if (s->crown_hold_id) {
+        g_source_remove(s->crown_hold_id);
+        s->crown_hold_id = 0;
+    }
+    if (s->crown_target == 2) {
+        gd_consumer_edge("power", false);
+    } else if (s->crown_target == 1) {
+        if (s->crown_holding) {
+            gd_consumer_edge("home", false);
+        } else if (!s->crown_moved) {
+            gd_sidebar_press(KEY_F1);
+        }
+    }
+    s->crown_target = 0;
+    s->crown_holding = false;
+    gtk_widget_queue_draw(widget);
+    return TRUE;
+}
+
+static gboolean gd_watch_scrolled(GtkWidget *widget, GdkEventScroll *scroll, void *opaque)
 {
     gd_crown_scroll(opaque, scroll);
     return TRUE;
 }
 
-/*
- * A watch guest's screen in a watch's case: rounded, with the Digital Crown
- * (click: press; wheel: turn) and the side button on its right edge.
- */
-static const char watch_case_css[] =
-    "#watch-case { background-color: #1c1c1e; border: 2px solid #48484a;"
-    "  border-radius: 66px; padding: 32px 26px; margin: 18px 0 18px 18px; }"
-    "#watch-crown { background-image: linear-gradient(to right, #636366, #d1d1d6 45%, #8e8e93);"
-    "  border: 1px solid #48484a; border-radius: 0 8px 8px 0; min-width: 15px;"
-    "  min-height: 70px; padding: 0; margin-top: 130px; box-shadow: none; }"
-    "#watch-side { background-image: none; background-color: #48484a; border: none;"
-    "  border-radius: 0 4px 4px 0; min-width: 8px; min-height: 100px; padding: 0;"
-    "  margin-top: 36px; box-shadow: none; }"
-    "#watch-crown:hover, #watch-side:hover { background-color: #0a84ff; }";
-
-static GtkWidget *gd_watch_button(GtkDisplayState *s, const char *name,
-                                  const char *tooltip, unsigned int key)
+static gboolean gd_watch_leave(GtkWidget *widget, GdkEventCrossing *e, void *opaque)
 {
-    GtkWidget *button = gtk_button_new();
+    GtkDisplayState *s = opaque;
 
-    gtk_widget_set_name(button, name);
-    gtk_widget_set_can_focus(button, FALSE);
-    gtk_widget_set_tooltip_text(button, tooltip);
-    gtk_widget_set_halign(button, GTK_ALIGN_START);
-    g_object_set_data(G_OBJECT(button), "key", GUINT_TO_POINTER(key));
-    g_signal_connect(button, "clicked", G_CALLBACK(gd_sidebar_key), s);
-    gtk_box_pack_start(GTK_BOX(s->watch_buttons), button, FALSE, FALSE, 0);
-    return button;
+    if (s->crown_hover) {
+        s->crown_hover = false;
+        gtk_widget_queue_draw(widget);
+    }
+    return FALSE;
 }
 
 static void gd_create_watch_case(GtkDisplayState *s)
 {
-    GtkCssProvider *css = gtk_css_provider_new();
-    GtkWidget *crown;
+    GtkWidget *corners = gtk_drawing_area_new();
 
-    gtk_css_provider_load_from_data(css, watch_case_css, -1, NULL);
-    gtk_style_context_add_provider_for_screen(gdk_screen_get_default(),
-        GTK_STYLE_PROVIDER(css), GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
-    g_object_unref(css);
-
-    s->watch_case = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
-    gtk_widget_set_name(s->watch_case, "watch-case");
-    gtk_box_pack_start(GTK_BOX(s->watch_case), s->overlay, TRUE, TRUE, 0);
-
-    s->watch_buttons = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
-    gtk_widget_set_valign(s->watch_buttons, GTK_ALIGN_START);
-    crown = gd_watch_button(s, "watch-crown",
-                            "Digital Crown: click to press (F1), wheel to turn",
-                            KEY_F1);
-    gtk_widget_add_events(crown, GDK_SCROLL_MASK | GDK_SMOOTH_SCROLL_MASK);
-    g_signal_connect(crown, "scroll-event", G_CALLBACK(gd_watch_crown_scrolled), s);
-    gd_watch_button(s, "watch-side", "Side button: Control Center (F2)", KEY_F2);
-
+    gd_watch_state = s;
+    s->swing_born = g_get_monotonic_time();
+    s->watch_case = gtk_event_box_new();
+    gtk_event_box_set_visible_window(GTK_EVENT_BOX(s->watch_case), FALSE);
+    gtk_widget_set_app_paintable(s->watch_case, TRUE);
+    gtk_widget_add_events(s->watch_case, GDK_BUTTON_PRESS_MASK | GDK_BUTTON_RELEASE_MASK |
+                          GDK_POINTER_MOTION_MASK | GDK_LEAVE_NOTIFY_MASK |
+                          GDK_SCROLL_MASK | GDK_SMOOTH_SCROLL_MASK);
+    gtk_widget_set_tooltip_text(s->watch_case, "Digital Crown: drag or wheel to turn, click to press (F1), "
+                                "hold for Siri. Side button below it (F2). Move the window: the watch swings.");
+    gtk_widget_set_margin_start(s->overlay, WATCH_LEFT + WATCH_BEZEL);
+    gtk_widget_set_margin_end(s->overlay, WATCH_RIGHT + WATCH_BEZEL);
+    gtk_widget_set_margin_top(s->overlay, WATCH_TOP + WATCH_BEZEL);
+    gtk_widget_set_margin_bottom(s->overlay, WATCH_BOTTOM + WATCH_BEZEL);
+    gtk_container_add(GTK_CONTAINER(s->watch_case), s->overlay);
+    g_signal_connect(s->watch_case, "draw", G_CALLBACK(gd_watch_draw), s);
+    /* the corners over everything in the overlay (screen_off and busy too), clicks through to the screen */
+    gtk_overlay_add_overlay(GTK_OVERLAY(s->overlay), corners);
+    gtk_overlay_set_overlay_pass_through(GTK_OVERLAY(s->overlay), corners, TRUE);
+    g_signal_connect(corners, "draw", G_CALLBACK(gd_watch_draw_corners), s);
+    g_signal_connect(s->watch_case, "button-press-event", G_CALLBACK(gd_watch_button_press), s);
+    g_signal_connect(s->watch_case, "button-release-event", G_CALLBACK(gd_watch_button_release), s);
+    g_signal_connect(s->watch_case, "motion-notify-event", G_CALLBACK(gd_watch_motion), s);
+    g_signal_connect(s->watch_case, "leave-notify-event", G_CALLBACK(gd_watch_leave), s);
+    g_signal_connect(s->watch_case, "scroll-event", G_CALLBACK(gd_watch_scrolled), s);
+    g_signal_connect(s->window, "configure-event", G_CALLBACK(gd_watch_window_moved), s);
     gtk_box_pack_start(GTK_BOX(s->hbox), s->watch_case, TRUE, TRUE, 0);
-    gtk_box_pack_start(GTK_BOX(s->hbox), s->watch_buttons, FALSE, FALSE, 0);
 }
 
 static void gd_create_sidebar(GtkDisplayState *s)

@@ -140,6 +140,9 @@ void gd_gl_area_draw(VirtualConsole *vc)
 
         surface_gl_setup_viewport(vc->gfx.gls, vc->gfx.ds, pw, ph);
         qemu_gl_set_sharp(vc->gfx.gls, vc->s->sharp);
+        /* the watch swinging on its band: the picture turns with the case (cairo turns clockwise, GL not) */
+        qemu_gl_set_turn(vc->gfx.gls, vc->s->watch ? -vc->s->swing_angle : 0,
+                         (float)surface_height(vc->gfx.ds) / surface_width(vc->gfx.ds));
         surface_gl_render_texture(vc->gfx.gls, vc->gfx.ds);
     }
 }
