@@ -3654,6 +3654,7 @@ void native_el0_tlbi_all(void) { }
 void native_el0_tlbi_asid(uint16_t asid) { }
 void native_el0_tlbi_page(uint64_t va, int asid) { }
 void native_el0_tlbi_range(uint64_t base, uint64_t len, int asid) { }
+void asoft_who_syscall(uint16_t asid, int64_t num) { }      /* ASOFT_WHO is the native sampler's */
 
 #endif
 

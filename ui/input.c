@@ -143,6 +143,7 @@ qemu_input_find_handler(uint32_t mask, const QemuConsole *con)
  */
 static void asoft_leds_file(uint32_t leds_mask)
 {
+#ifndef _WIN32      /* the Windows window reads the LEDs itself (ui/gtk.c) */
     static int fd = -2;
     uint8_t b = leds_mask;
 
@@ -154,6 +155,7 @@ static void asoft_leds_file(uint32_t leds_mask)
     if (fd >= 0 && pwrite(fd, &b, 1, 0) != 1) {
         /* nobody to tell */
     }
+#endif
 }
 
 void qemu_input_handler_set_leds_mask(QemuInputHandlerState *s, uint32_t leds_mask)

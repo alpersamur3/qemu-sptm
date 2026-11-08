@@ -19,6 +19,19 @@ typedef struct BqlProfTag {
     int line;           /* >= 0: ptr is a string; -1: ptr is a code address */
 } BqlProfTag;
 
+#ifdef _WIN32
+/* util/bqlprof.c is POSIX (pthreads, built beside qemu-thread-posix.c): no profile here */
+#define bqlprof_on false
+static inline void bqlprof_pre_lock(void) {}
+static inline void bqlprof_locked(const char *file, int line) {}
+static inline void bqlprof_unlocking(void) {}
+static inline BqlProfTag bqlprof_retag(const void *ptr, int line)
+{
+    BqlProfTag none = { NULL, 0 };
+    return none;
+}
+static inline void bqlprof_restore(BqlProfTag prev) {}
+#else
 extern bool bqlprof_on;
 
 void bqlprof_pre_lock(void);
@@ -26,6 +39,7 @@ void bqlprof_locked(const char *file, int line);
 void bqlprof_unlocking(void);
 BqlProfTag bqlprof_retag(const void *ptr, int line);
 void bqlprof_restore(BqlProfTag prev);
+#endif
 
 /* retag the current hold, if this thread holds the BQL and profiling is on */
 static inline BqlProfTag bqlprof_tag(const void *ptr, int line)

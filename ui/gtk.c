@@ -887,6 +887,39 @@ static Object *gd_consumer(void)
     return object_resolve_path_type("", "usb-consumer", NULL);
 }
 
+/*
+ * Always On Display (ASOFT_AOD=1: the launcher booted the device tree with
+ * /arm-io/disp0 on a disk with the libMobileGestalt patch). The side button
+ * with the display on takes iOS 26 to it, the only way there (Auto-Lock is
+ * Never on such a disk), so the window knows when iOS is in it. A phone wakes
+ * from it at a tap (backboardd's tap-to-wake), an event QEMU's touchscreen
+ * cannot send: the first click or touch in it presses Home instead and does
+ * not reach iOS. The side button again, Home or the display going to sleep
+ * end it.
+ */
+static bool gd_aod, gd_aod_swallow;
+
+static bool gd_aod_machine(void)
+{
+    static int on = -1;
+
+    if (on < 0) {
+        const char *e = getenv("ASOFT_AOD");
+
+        on = e && *e == '1';
+    }
+    return on;
+}
+
+static void gd_aod_button(unsigned int key)
+{
+    if (key == KEY_F2) {
+        gd_aod = !gd_aod && !qemu_console_guest_asleep() && gd_aod_machine();
+    } else if (key == KEY_F1) {
+        gd_aod = false;
+    }
+}
+
 /* Press and release a key, as QMP send-key does, or the usb-consumer button. */
 static void gd_sidebar_press(unsigned int key)
 {
@@ -895,6 +928,7 @@ static void gd_sidebar_press(unsigned int key)
     Error *err = NULL;
 
     if (consumer && button >= 0) {
+        gd_aod_button(key);
         if (!object_property_set_str(consumer, "press",
                                      gd_consumer_buttons[button].button, &err)) {
             error_report_err(err);
@@ -938,6 +972,9 @@ static gboolean gd_guest_display_update(void *opaque)
         }
     }
     cover = (off && s->guest_display_armed) || qemu_console_guest_asleep();
+    if (qemu_console_guest_asleep()) {
+        gd_aod = false;     /* asleep, not in its Always On Display */
+    }
     if (cover == gtk_widget_get_visible(s->screen_off)) {
         return G_SOURCE_REMOVE;
     }
@@ -2566,6 +2603,17 @@ static gboolean gd_button_event(GtkWidget *widget, GdkEventButton *button,
         return TRUE;
     }
 
+    /* in the Always On Display the click wakes iOS (Home) and stays here */
+    if (btn == INPUT_BUTTON_LEFT && (gd_aod || gd_aod_swallow)) {
+        if (button->type == GDK_BUTTON_PRESS && gd_aod) {
+            gd_aod_swallow = true;
+            gd_sidebar_press(KEY_F1);
+        } else if (button->type == GDK_BUTTON_RELEASE) {
+            gd_aod_swallow = false;
+        }
+        return TRUE;
+    }
+
     if (btn == INPUT_BUTTON_LEFT) {
         /* a real touch ends any gesture the side bar is making */
         if (button->type == GDK_BUTTON_PRESS && (s->gesture_timer || s->gesture_down)) {
@@ -2706,6 +2754,17 @@ static gboolean gd_touch_event(GtkWidget *widget, GdkEventTouch *touch,
     default:
         warn_report("gtk: unexpected touch event type");
         return FALSE;
+    }
+
+    /* in the Always On Display the first touch wakes iOS (Home) and stays here */
+    if (gd_aod || gd_aod_swallow) {
+        if (type == INPUT_MULTI_TOUCH_TYPE_BEGIN && gd_aod) {
+            gd_aod_swallow = true;
+            gd_sidebar_press(KEY_F1);
+        } else if (type == INPUT_MULTI_TOUCH_TYPE_END) {
+            gd_aod_swallow = false;
+        }
+        return TRUE;
     }
 
     qemu_input_touch_event(vc->gfx.dcl.con, touch_slots,
