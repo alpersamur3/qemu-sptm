@@ -25,17 +25,22 @@
  * THE SOFTWARE.
  */
 #include "qemu/osdep.h"
+#include <math.h>
 #include <epoxy/gl.h>
 #include "ui/shader.h"
 
 #include "ui/shader/texture-blit-vert.h"
 #include "ui/shader/texture-blit-flip-vert.h"
 #include "ui/shader/texture-blit-frag.h"
+#include "ui/shader/texture-blit-sharp-frag.h"
 
 struct QemuGLShader {
     GLint texture_blit_prog;
+    GLint texture_blit_sharp_prog;
+    bool sharp;
     GLint texture_blit_flip_prog;
     GLint texture_blit_vao;
+    float turn_c, turn_s, turn_aspect;  /* qemu_gl_set_turn */
 };
 
 /* ---------------------------------------------------------------------- */
@@ -70,11 +75,35 @@ static GLuint qemu_gl_init_texture_blit(GLint texture_blit_prog)
     return vao;
 }
 
+/* The next blits (not the flipped ones) scale with the sharper filter */
+void qemu_gl_set_sharp(QemuGLShader *gls, bool sharp)
+{
+    gls->sharp = sharp;
+}
+
+/*
+ * Turn the picture by @radians about the viewport's centre (the GTK watch swinging on its band); the
+ * viewport keeps the guest's aspect, @aspect is its height over its width. 0 draws it straight.
+ */
+void qemu_gl_set_turn(QemuGLShader *gls, float radians, float aspect)
+{
+    gls->turn_c = cosf(radians);
+    gls->turn_s = sinf(radians);
+    gls->turn_aspect = aspect > 0 ? aspect : 1;
+}
+
 void qemu_gl_run_texture_blit(QemuGLShader *gls, bool flip)
 {
-    glUseProgram(flip
+    GLint prog = flip
                  ? gls->texture_blit_flip_prog
-                 : gls->texture_blit_prog);
+                 : gls->sharp ? gls->texture_blit_sharp_prog
+                              : gls->texture_blit_prog;
+
+    glUseProgram(prog);
+    if (!flip) {
+        glUniform3f(glGetUniformLocation(prog, "turn"),
+                    gls->turn_c ? gls->turn_c : 1, gls->turn_s, gls->turn_aspect ? gls->turn_aspect : 1);
+    }
     glBindVertexArray(gls->texture_blit_vao);
     glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
 }
@@ -158,7 +187,10 @@ QemuGLShader *qemu_gl_init_shader(void)
         (texture_blit_vert_src, texture_blit_frag_src);
     gls->texture_blit_flip_prog = qemu_gl_create_compile_link_program
         (texture_blit_flip_vert_src, texture_blit_frag_src);
-    if (!gls->texture_blit_prog || !gls->texture_blit_flip_prog) {
+    gls->texture_blit_sharp_prog = qemu_gl_create_compile_link_program
+        (texture_blit_vert_src, texture_blit_sharp_frag_src);
+    if (!gls->texture_blit_prog || !gls->texture_blit_flip_prog ||
+        !gls->texture_blit_sharp_prog) {
         exit(1);
     }
 
@@ -175,6 +207,7 @@ void qemu_gl_fini_shader(QemuGLShader *gls)
     }
     glDeleteProgram(gls->texture_blit_prog);
     glDeleteProgram(gls->texture_blit_flip_prog);
+    glDeleteProgram(gls->texture_blit_sharp_prog);
     glDeleteProgram(gls->texture_blit_vao);
     g_free(gls);
 }

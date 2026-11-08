@@ -22,6 +22,7 @@
 #include "qemu/osdep.h"
 #include "exec/target_page.h"
 #include "qapi/error.h"
+#include "qapi/visitor.h"
 #include "qemu/cutils.h"
 #include "qemu/error-report.h"
 #include "qemu/log.h"
@@ -175,6 +176,7 @@ struct VResearchState {
     struct xnu_boot_info   bootinfo;
     GMappedFile           *bootkc_m, *dtree_m, *sptm_m, *txm_m, *tc_m, *ramdisk_m;
     char                  *fb;
+    uint32_t               ppi;
     bool                   unauth_root;
     VResearchPVGMode       pvg;
     bool                   sep;
@@ -208,6 +210,18 @@ VRESEARCH_ARG(ramdisk)
 static char *fb_get(Object *obj, Error **errp)
 {
     return g_strdup(VRESEARCH_MACHINE(obj)->fb);
+}
+
+static void ppi_get(Object *obj, Visitor *v, const char *name, void *opaque,
+                    Error **errp)
+{
+    visit_type_uint32(v, name, &VRESEARCH_MACHINE(obj)->ppi, errp);
+}
+
+static void ppi_set(Object *obj, Visitor *v, const char *name, void *opaque,
+                    Error **errp)
+{
+    visit_type_uint32(v, name, &VRESEARCH_MACHINE(obj)->ppi, errp);
 }
 
 static void fb_set(Object *obj, const char *val, Error **errp)
@@ -648,6 +662,9 @@ static void create_pvg(VResearchState *s)
         qdev_prop_set_uint32(dev, "width", w);
         qdev_prop_set_uint32(dev, "height", h);
     }
+    if (s->ppi && s->pvg == VR_PVG_REIMS) {
+        qdev_prop_set_uint32(dev, "ppi", s->ppi);
+    }
     sysbus_realize_and_unref(sbd, &error_fatal);
     sysbus_mmio_map(sbd, 0, memmap[VR_APV_GFX].base);
     sysbus_mmio_map(sbd, 1, memmap[VR_APV_IOSFC].base);
@@ -987,6 +1004,10 @@ static void vresearch_machine_class_init(ObjectClass *oc, const void *data)
     object_class_property_add_str(oc, "tc", tc_get, tc_set);
     object_class_property_add_str(oc, "ramdisk", ramdisk_get, ramdisk_set);
     object_class_property_add_str(oc, "fb", fb_get, fb_set);
+    object_class_property_add(oc, "ppi", "uint32", ppi_get, ppi_set, NULL, NULL);
+    object_class_property_set_description(oc, "ppi",
+        "pvg=reims: the display's pixel density, which sets the physical size "
+        "the guest reads (a 41 mm Apple Watch: 326); default an iPhone's size");
     object_class_property_set_description(oc, "fb",
         "Boot framebuffer WxH (boot_args.Video, /vram), or off (default)");
     object_class_property_add_str(oc, "pvg", pvg_get, pvg_set);

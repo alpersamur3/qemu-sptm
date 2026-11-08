@@ -24,6 +24,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qapi/visitor.h"
 #include "ui/console.h"
 #include "hw/usb/usb.h"
 #include "migration/vmstate.h"
@@ -1179,6 +1180,10 @@ static const TypeInfo usb_keyboard_info = {
  * Each change of the buttons is queued until the guest reads it: a press and
  * its release both made before the guest's next poll reach it as two reports
  * (sent as the current state alone, the press would be lost).
+ *
+ * A watch guest: power-usage=0x95 makes the second button Consumer Help, the
+ * side button Carousel reads (watchOS takes Power 0x30 only as a display
+ * sleep/wake). The crown's rotation is usb-crown's, below.
  * ======================================================================= */
 
 #define USB_CONSUMER_QUEUE 16
@@ -1194,10 +1199,14 @@ struct USBConsumerState {
     uint8_t auto_release;  /* buttons "press" holds for hold-ms */
     uint8_t armed;         /* of those, the ones the guest has read down */
     QEMUTimer *timer;
+    uint8_t power_usage;   /* the second button's Consumer usage */
+    uint8_t rdesc[29];     /* this device's report descriptor */
 };
 
 #define TYPE_USB_CONSUMER "usb-consumer"
 OBJECT_DECLARE_SIMPLE_TYPE(USBConsumerState, USB_CONSUMER)
+
+#define CONSUMER_RDESC_POWER 17    /* the second usage's byte below */
 
 static const uint8_t qemu_consumer_hid_report_descriptor[] = {
     0x05, 0x0c,         /* Usage Page (Consumer) */
@@ -1346,9 +1355,8 @@ static void usb_consumer_handle_control(USBDevice *dev, USBPacket *p,
     switch (request) {
     case InterfaceRequest | USB_REQ_GET_DESCRIPTOR:
         if ((value >> 8) == 0x22) {
-            memcpy(data, qemu_consumer_hid_report_descriptor,
-                   sizeof(qemu_consumer_hid_report_descriptor));
-            p->actual_length = sizeof(qemu_consumer_hid_report_descriptor);
+            memcpy(data, us->rdesc, sizeof(us->rdesc));
+            p->actual_length = sizeof(us->rdesc);
         } else {
             goto fail;
         }
@@ -1455,6 +1463,10 @@ static void usb_consumer_realize(USBDevice *dev, Error **errp)
 {
     USBConsumerState *us = USB_CONSUMER(dev);
 
+    QEMU_BUILD_BUG_ON(sizeof(us->rdesc) !=
+                      sizeof(qemu_consumer_hid_report_descriptor));
+    memcpy(us->rdesc, qemu_consumer_hid_report_descriptor, sizeof(us->rdesc));
+    us->rdesc[CONSUMER_RDESC_POWER] = us->power_usage;
     dev->usb_desc = &desc_consumer;
     usb_desc_create_serial(dev);
     usb_desc_init(dev);
@@ -1504,6 +1516,7 @@ static const VMStateDescription vmstate_usb_consumer = {
 static const Property usb_consumer_properties[] = {
     DEFINE_PROP_UINT32("usb_version", USBConsumerState, usb_version, 2),
     DEFINE_PROP_UINT32("hold-ms", USBConsumerState, hold_ms, 100),
+    DEFINE_PROP_UINT8("power-usage", USBConsumerState, power_usage, 0x30),
 };
 
 static void usb_consumer_class_initfn(ObjectClass *klass, const void *data)
@@ -1530,6 +1543,148 @@ static const TypeInfo usb_consumer_info = {
     .class_init    = usb_consumer_class_initfn,
 };
 
+/* ======================================================================= *
+ * usb-crown: a watch's Digital Crown turning. watchOS takes a HID mouse's
+ * wheel as the crown (the app grid zooms, lists scroll); a wheel inside the
+ * Consumer collection it ignores. The report is a mouse's, and no QEMU input
+ * reaches this device: a usb-mouse would take the touch screen's clicks.
+ *   qom-set /machine/peripheral/<id> rotate -3    (detents; negative: down)
+ * ======================================================================= */
+
+struct USBCrownState {
+    USBDevice dev;
+    USBEndpoint *intr;
+    int32_t pending;    /* detents the guest has not read */
+};
+
+#define TYPE_USB_CROWN "usb-crown"
+OBJECT_DECLARE_SIMPLE_TYPE(USBCrownState, USB_CROWN)
+
+static void usb_crown_handle_reset(USBDevice *dev)
+{
+    USB_CROWN(dev)->pending = 0;
+}
+
+static void usb_crown_handle_control(USBDevice *dev, USBPacket *p,
+               int request, int value, int index, int length, uint8_t *data)
+{
+    int ret = usb_desc_handle_control(dev, p, request, value, index, length,
+                                      data);
+
+    if (ret >= 0) {
+        return;
+    }
+    switch (request) {
+    case InterfaceRequest | USB_REQ_GET_DESCRIPTOR:
+        if ((value >> 8) != 0x22) {
+            p->status = USB_RET_STALL;
+            break;
+        }
+        memcpy(data, qemu_mouse_hid_report_descriptor,
+               sizeof(qemu_mouse_hid_report_descriptor));
+        p->actual_length = sizeof(qemu_mouse_hid_report_descriptor);
+        break;
+    case HID_GET_REPORT:
+        memset(data, 0, 4);
+        p->actual_length = 4;
+        break;
+    case HID_GET_IDLE:
+        data[0] = 0;
+        p->actual_length = 1;
+        break;
+    case HID_GET_PROTOCOL:
+        data[0] = 1;
+        p->actual_length = 1;
+        break;
+    case HID_SET_IDLE:
+    case HID_SET_PROTOCOL:
+        break;
+    default:
+        p->status = USB_RET_STALL;
+        break;
+    }
+}
+
+static void usb_crown_handle_data(USBDevice *dev, USBPacket *p)
+{
+    USBCrownState *us = USB_CROWN(dev);
+    uint8_t buf[4] = { 0 };     /* buttons, x, y, wheel */
+    int step;
+
+    if (p->pid != USB_TOKEN_IN || p->ep->nr != 1) {
+        p->status = USB_RET_STALL;
+        return;
+    }
+    if (!us->pending) {
+        p->status = USB_RET_NAK;
+        return;
+    }
+    step = MAX(-127, MIN(127, us->pending));
+    us->pending -= step;
+    buf[3] = (uint8_t)(int8_t)step;
+    usb_packet_copy(p, buf, sizeof(buf));
+}
+
+/* rotate: the crown turned by that many detents (negative: the other way) */
+static void usb_crown_set_rotate(Object *obj, Visitor *v, const char *name,
+                                 void *opaque, Error **errp)
+{
+    USBCrownState *us = USB_CROWN(obj);
+    int64_t n;
+
+    if (!visit_type_int(v, name, &n, errp)) {
+        return;
+    }
+    us->pending = MAX(-100000, MIN(100000, us->pending + n));
+    usb_wakeup(us->intr, 0);
+}
+
+static void usb_crown_realize(USBDevice *dev, Error **errp)
+{
+    USBCrownState *us = USB_CROWN(dev);
+
+    dev->usb_desc = &desc_mouse2;
+    usb_desc_create_serial(dev);
+    usb_desc_init(dev);
+    us->intr = usb_ep_get(dev, USB_TOKEN_IN, 1);
+    us->pending = 0;
+    object_property_add(OBJECT(dev), "rotate", "int", NULL,
+                        usb_crown_set_rotate, NULL, NULL);
+}
+
+static const VMStateDescription vmstate_usb_crown = {
+    .name = "usb-crown",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .fields = (const VMStateField[]) {
+        VMSTATE_USB_DEVICE(dev, USBCrownState),
+        VMSTATE_INT32(pending, USBCrownState),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
+static void usb_crown_class_initfn(ObjectClass *klass, const void *data)
+{
+    DeviceClass *dc = DEVICE_CLASS(klass);
+    USBDeviceClass *uc = USB_DEVICE_CLASS(klass);
+
+    uc->realize        = usb_crown_realize;
+    uc->product_desc   = "QEMU USB Digital Crown";
+    uc->handle_reset   = usb_crown_handle_reset;
+    uc->handle_control = usb_crown_handle_control;
+    uc->handle_data    = usb_crown_handle_data;
+    uc->handle_attach  = usb_desc_attach;
+    dc->vmsd = &vmstate_usb_crown;
+    set_bit(DEVICE_CATEGORY_INPUT, dc->categories);
+}
+
+static const TypeInfo usb_crown_info = {
+    .name          = TYPE_USB_CROWN,
+    .parent        = TYPE_USB_DEVICE,
+    .instance_size = sizeof(USBCrownState),
+    .class_init    = usb_crown_class_initfn,
+};
+
 static void usb_hid_register_types(void)
 {
     type_register_static(&usb_hid_type_info);
@@ -1537,6 +1692,7 @@ static void usb_hid_register_types(void)
     usb_legacy_register("usb-tablet", "tablet", NULL);
     type_register_static(&usb_touchscreen_info);
     type_register_static(&usb_consumer_info);
+    type_register_static(&usb_crown_info);
     type_register_static(&usb_mouse_info);
     usb_legacy_register("usb-mouse", "mouse", NULL);
     type_register_static(&usb_keyboard_info);

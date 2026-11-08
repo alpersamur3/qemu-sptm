@@ -135,6 +135,23 @@ struct GtkDisplayState {
     GtkWidget *sidebar_lock;
     unsigned int consumer_keys_down;  /* F1-F4 held, as usb-consumer buttons */
     GtkWidget *sidebar_power;
+    bool sharp;                 /* gl=on: scale the picture with the sharper filter */
+    /* a watch guest (usb-crown): the crown, a case around the screen */
+    bool watch;
+    GtkWidget *watch_case;      /* the overlay in a drawn watch: case, crown, side button, band */
+    double crown_pending;       /* smooth scrolling short of a detent */
+    double crown_phase;         /* the crown's knurling, moved by every turn */
+    int crown_target;           /* what the mouse button went down on: 0, 1 crown, 2 side button */
+    double crown_down_y, crown_last_y, crown_acc;
+    bool crown_moved, crown_holding, crown_hover;
+    guint crown_hold_id;        /* the crown held still: a long press */
+    /* the watch hangs from the window's top edge and swings when the window is moved */
+    double swing_angle, swing_vel;  /* radians, radians/s, about the band's pivot */
+    int swing_dx, swing_dy;         /* the screen's offset applied for the swing, pixels */
+    guint swing_tick_id;
+    gint64 swing_t, swing_born;     /* the last tick; when the watch was made (early moves are the fit) */
+    int win_x, win_y;               /* the toplevel's last position */
+    bool win_pos_known;
     /* the guest's display power, from its keyboard's Scroll Lock LED */
     GtkWidget *overlay;         /* the notebook, and screen_off over it */
     GtkWidget *screen_off;
