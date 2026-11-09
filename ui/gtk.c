@@ -1977,24 +1977,20 @@ static void gd_sidebar_states(GtkButton *button, void *opaque)
 /*
  * Quick boot: closing the window saves the machine as the internal snapshot
  * QUICK_BOOT_SNAPSHOT and quits (gd_snapshot_run, what 3); the launcher starts
- * it next time with -loadvm of it. Once that machine runs, the snapshot goes:
- * the disk goes on from there, so a state is never resumed twice.
+ * it next time with -loadvm of it. Once that machine runs, the snapshot stays
+ * as a way back: the launcher notes which one it resumed and does not resume
+ * it again by itself (the disk goes on from there), but can go back to it on
+ * request. The next close replaces it.
  */
 static gboolean gd_quick_clear(void *opaque)
 {
     GtkDisplayState *s = opaque;
     Error *err = NULL;
 
-    if (bdrv_all_has_snapshot(QUICK_BOOT_SNAPSHOT, false, NULL, &err) == 1 &&
-        delete_snapshot(QUICK_BOOT_SNAPSHOT, false, NULL, &err)) {
+    if (bdrv_all_has_snapshot(QUICK_BOOT_SNAPSHOT, false, NULL, &err) == 1) {
         gd_sidebar_say(s, "Resumed where it was closed.");
     }
-    if (err) {
-        g_autofree char *said = g_strdup_printf("The quick boot state stays: "
-                                                "%s", error_get_pretty(err));
-        gd_sidebar_say(s, said);
-        error_free(err);
-    }
+    error_free(err);
     return G_SOURCE_REMOVE;
 }
 
