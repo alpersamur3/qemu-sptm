@@ -38,6 +38,9 @@
 #include "hw/core/qdev-properties.h"
 #include "qom/object.h"
 #include "trace.h"
+#include "qemu/main-loop.h"
+#include "system/runstate.h"
+#include "ui/keylog.h"
 
 struct USBHIDState {
     USBDevice dev;
@@ -56,6 +59,39 @@ struct USBHIDState {
      * and event system then handle ~60 unchanged keyboard reports a second.
      */
     bool idle_reports;
+    /* usb-touchscreen: hover, paced moves, settled and held presses, walk mode (dev-hid-walk.c.inc) */
+    bool ts_hover;
+    const QemuInputHandler *ts_handler;
+    QemuInputHandlerState *walk_s;
+    QEMUTimer *walk_timer;
+    QEMUBH *walk_bh;
+    bool walk_mode;
+    bool walk, walk_want, walk_toggle, walk_by_hold;
+    uint32_t walk_hold_key;                 /* Linux key code held in the guest while walk mode is on */
+    bool walk_clicking, walk_click_pending, walk_button, walk_invert_y;
+    int walk_state;
+    int walk_dx, walk_dy;
+    int64_t walk_x, walk_y, walk_pitch;     /* hundredths of touch units */
+    int64_t walk_last_motion;
+    uint32_t walk_gain, walk_pitch_max;
+    QEMUTimer *walk_pace_timer, *ts_pace_timer;
+    int64_t walk_last_report, ts_last;
+    int ts_x, ts_y;
+    bool ts_pending, ts_edge;
+    uint32_t ts_pace_ms, walk_hold_ms;
+    QEMUTimer *walk_key_timer;
+    int64_t walk_owe_x, walk_owe_y, walk_until_x, walk_until_y, walk_shift_since;
+    unsigned int walk_key_x, walk_key_y;
+    bool walk_shift_down, walk_keys_release, walk_look_touch;
+    uint32_t walk_key_gain, walk_key_min_px, walk_key_ms_per_px, walk_key_min_ms, walk_key_max_ms;
+    QEMUTimer *ts_release_timer;
+    int64_t ts_press_at;
+    bool ts_release_held;
+    uint32_t ts_min_press_ms;
+    QEMUTimer *ts_press_timer;
+    int64_t ts_last_move;
+    bool ts_press_deferred, ts_release_deferred;
+    uint32_t ts_min_hover_ms;
 };
 
 /* usb-touchscreen report layout variants (the "variant" property, a bitmask) */
@@ -762,7 +798,12 @@ static int usb_touchscreen_report(USBHIDState *us, uint8_t *buf, int len,
         fprintf(stderr, "LAT report %" PRId64 " tip=%d x=%d y=%d\n", get_clock(),
                 buf[0] & 1, buf[1] | buf[2] << 8, buf[3] | buf[4] << 8);
     }
-    flags = (buf[0] & 0x01) ? 0x07 : 0x04;  /* Tip|InRange|Valid, or Valid */
+    /*
+     * Tip|InRange|Valid, or Valid; with hover=on a pointer in the window is
+     * in range (InRange|Valid), so a guest that hit-tests the hover
+     * (visionOS) has its target before the touch
+     */
+    flags = (buf[0] & 0x01) ? 0x07 : us->ts_hover ? 0x06 : 0x04;
     if (!(us->ts_variant & TS_VARIANT_CONTACT)) {
         buf[0] = flags;
         buf[5] = 0;
@@ -1003,6 +1044,8 @@ static void usb_tablet_realize(USBDevice *dev, Error **errp)
     usb_hid_initfn(dev, HID_TABLET, &desc_tablet, &desc_tablet2, errp);
 }
 
+#include "dev-hid-walk.c.inc"
+
 static void usb_touchscreen_realize(USBDevice *dev, Error **errp)
 {
     USBHIDState *us = USB_HID(dev);
@@ -1011,6 +1054,9 @@ static void usb_touchscreen_realize(USBDevice *dev, Error **errp)
     us->ts_desc_len = usb_touchscreen_build_desc(us->ts_desc, us->ts_variant);
     stw_le_p(&touchscreen_hid_class_desc[7], us->ts_desc_len);
     usb_hid_initfn(dev, HID_TABLET, &desc_touchscreen, &desc_touchscreen2, errp);
+    if (us->hid.s) {
+        usb_touchscreen_walk_realize(us);
+    }
 }
 
 static void usb_mouse_realize(USBDevice *dev, Error **errp)
@@ -1121,6 +1167,7 @@ static void usb_touchscreen_class_initfn(ObjectClass *klass, const void *data)
 static const TypeInfo usb_touchscreen_info = {
     .name          = "usb-touchscreen",
     .parent        = TYPE_USB_HID,
+    .instance_init = usb_touchscreen_walk_instance_init,
     .class_init    = usb_touchscreen_class_initfn,
 };
 
@@ -1201,6 +1248,7 @@ struct USBConsumerState {
     QEMUTimer *timer;
     uint8_t power_usage;   /* the second button's Consumer usage */
     uint8_t rdesc[29];     /* this device's report descriptor */
+    uint64_t keylog_queued, keylog_read;   /* reports queued and read, for the key overlay */
 };
 
 #define TYPE_USB_CONSUMER "usb-consumer"
@@ -1305,8 +1353,13 @@ static const USBDesc desc_consumer = {
 };
 
 /* The buttons become @report: queued for the guest, which is woken for it. */
+static const char *const usb_consumer_keylog_names[4] = { "Home", "Power", "Vol up", "Vol down" };
+
 static void usb_consumer_set_report(USBConsumerState *us, uint8_t report)
 {
+    uint8_t changed = report ^ us->report;
+    int b;
+
     if (report == us->report) {
         return;
     }
@@ -1316,8 +1369,15 @@ static void usb_consumer_set_report(USBConsumerState *us, uint8_t report)
         us->queue[(us->head + us->count - 1) % USB_CONSUMER_QUEUE] = report;
     } else {
         us->queue[(us->head + us->count++) % USB_CONSUMER_QUEUE] = report;
+        us->keylog_queued++;
     }
     trace_usb_consumer_queue(report, us->count);
+    /* the key overlay (F12): a change is logged when queued, and read at the read of its report */
+    for (b = 0; b < 4; b++) {
+        if (changed & (1 << b)) {
+            keylog_add(us, usb_consumer_keylog_names[b], report & (1 << b), KEYLOG_WAIT, us->keylog_queued);
+        }
+    }
     usb_wakeup(us->intr, 0);
 }
 
@@ -1339,6 +1399,8 @@ static void usb_consumer_handle_reset(USBDevice *dev)
     us->report = 0;
     us->head = us->count = 0;
     us->auto_release = us->armed = 0;
+    us->keylog_read = us->keylog_queued;
+    keylog_lost(us);
 }
 
 static void usb_consumer_handle_control(USBDevice *dev, USBPacket *p,
@@ -1391,6 +1453,8 @@ static void usb_consumer_handle_data(USBDevice *dev, USBPacket *p)
         buf[0] = us->queue[us->head];
         us->head = (us->head + 1) % USB_CONSUMER_QUEUE;
         us->count--;
+        us->keylog_read++;
+        keylog_taken(us, us->keylog_read);
         usb_packet_copy(p, buf, 1);
         trace_usb_consumer_read(buf[0], us->count);
         /* a press's hold counts from the guest's read of it */
