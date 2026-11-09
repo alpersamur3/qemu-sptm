@@ -56,6 +56,7 @@
 
 #include "trace.h"
 #include "standard-headers/linux/input-event-codes.h"
+#include "ui/keylog.h"
 #include "ui/input.h"
 #include "system/runstate.h"
 #include "system/system.h"
@@ -349,6 +350,13 @@ static void gd_update_geometry_hints(VirtualConsole *vc)
 #define WATCH_BEZEL 22      /* the case around the screen */
 #define WATCH_TOP 72        /* the upper strap, from the window's top edge to the case */
 #define WATCH_BOTTOM 130    /* the lower strap dangling below the case */
+/* The drawn headset around a headset guest's screen (gd_create_visor), in logical pixels */
+#define VISOR_SIDE 56       /* left and right of the frame: the head band's ends */
+#define VISOR_FRAME 12      /* the aluminium frame */
+#define VISOR_GLASS 10      /* the glass between the frame and the picture */
+#define VISOR_BEZEL (VISOR_FRAME + VISOR_GLASS)
+#define VISOR_TOP 26        /* above the frame: the crown and the top button */
+#define VISOR_BOTTOM 46     /* below it: the mode strip */
 #define WATCH_NOTCH 16.0    /* pixels of drag per crown notch */
 #define WATCH_HOLD_MS 550
 
@@ -387,6 +395,11 @@ static void gd_fit_window(VirtualConsole *vc)
         /* the drawn watch around the screen: the case, the crown's room, the band */
         bar += WATCH_LEFT + WATCH_RIGHT + 2 * WATCH_BEZEL;
         menu += WATCH_TOP + WATCH_BOTTOM + 2 * WATCH_BEZEL;
+    }
+    if (!vc->window && s->visor) {
+        /* the drawn headset around the screen: the frame, the band's ends, the mode strip */
+        bar += 2 * (VISOR_SIDE + VISOR_BEZEL);
+        menu += VISOR_TOP + VISOR_BOTTOM + 2 * VISOR_BEZEL;
     }
     scale = MIN((area.height * WINDOW_FIT_SHARE - frame.height - menu) / height,
                 (area.width * WINDOW_FIT_SHARE - frame.width - bar) / width);
@@ -793,6 +806,7 @@ static const DisplayGLCtxOps egl_ctx_ops = {
 
 static gboolean gd_quick_clear(void *opaque);
 static void gd_sidebar_set_label(GtkWidget *button, const char *text);
+static void gd_visor_mode_changed(GtkDisplayState *s);
 static void gd_busy_idle(GtkDisplayState *s);
 
 static void gd_change_runstate(void *opaque, bool running, RunState state)
@@ -810,6 +824,24 @@ static void gd_change_runstate(void *opaque, bool running, RunState state)
     }
 }
 
+/*
+ * A headset guest (ASoftware visionOS): the machine's usb-touchscreen has
+ * walk-mode=on. Its "walk" property says whether walk mode is on now.
+ */
+static Object *gd_walk_touch(void)
+{
+    Object *ts = object_resolve_path_type("", "usb-touchscreen", NULL);
+
+    return ts && object_property_get_bool(ts, "walk-mode", NULL) ? ts : NULL;
+}
+
+static bool gd_walk_on(void)
+{
+    Object *ts = gd_walk_touch();
+
+    return ts && object_property_get_bool(ts, "walk", NULL);
+}
+
 static void gd_mouse_mode_change(Notifier *notify, void *data)
 {
     GtkDisplayState *s;
@@ -825,6 +857,27 @@ static void gd_mouse_mode_change(Notifier *notify, void *data)
             gd_ungrab_pointer(s);
         }
     }
+    /*
+     * Walk mode came on (the touchscreen's middle button, or its right
+     * button held): the pointer is the head from now on, without the
+     * click that takes the grab in any other relative mode.
+     */
+    if (!s->ptr_owner && gd_walk_on() &&
+        gtk_window_is_active(GTK_WINDOW(s->window))) {
+        /* (only the window in use: walk mode set from outside takes no pointer the user has elsewhere) */
+        VirtualConsole *vc = gd_vc_find_current(s);
+
+        if (vc && vc->type == GD_VC_GFX &&
+            !qemu_input_is_absolute(vc->gfx.dcl.con)) {
+            if (!vc->window) {
+                gtk_check_menu_item_set_active(GTK_CHECK_MENU_ITEM(s->grab_item),
+                                               TRUE);
+            } else {
+                gd_grab_pointer(vc, "walk-mode");
+            }
+        }
+    }
+    gd_visor_mode_changed(s);
     for (i = 0; i < s->vcs->len; i++) {
         VirtualConsole *vc = g_ptr_array_index(s->vcs, i);
         gd_update_cursor(vc);
@@ -2571,6 +2624,403 @@ static void gd_create_watch_case(GtkDisplayState *s)
     gtk_box_pack_start(GTK_BOX(s->hbox), s->watch_case, TRUE, TRUE, 0);
 }
 
+/*
+ * A headset guest's screen in a drawn visor (ASoftware visionOS), the watch case's sibling: an aluminium
+ * frame around a dark glass, the screen with round corners inside it, the Digital Crown on the frame's top
+ * right and the top button on its top left (as the wearer has them), the head band's ends running off the
+ * window's sides. The drawn crown and button are real: a click presses them (F1, F2), held they stay down
+ * (the crown held recentres the view). Under the frame a strip says what the keyboard and the mouse do
+ * now: typing, or walk mode (the touchscreen's "walk"), in which the glass's rim lights up.
+ */
+
+typedef struct VisorGeometry {
+    double sx, sy, sw, sh, sr;          /* the screen and its corners' radius */
+    double fx, fy, fw, fh, fr;          /* the frame's outer edge */
+    double kx, ky, kw, kh;              /* the Digital Crown */
+    double bx, by, bw, bh;              /* the top button */
+} VisorGeometry;
+
+static void gd_hold_key(unsigned int lnx, int button, bool down);
+static void gd_keys_toggle(void);
+
+static void gd_visor_geometry(GtkDisplayState *s, VisorGeometry *g)
+{
+    GtkAllocation o, w;
+
+    gtk_widget_get_allocation(s->overlay, &o);
+    gtk_widget_get_allocation(s->visor, &w);
+    g->sx = o.x - w.x;
+    g->sy = o.y - w.y;
+    g->sw = o.width;
+    g->sh = o.height;
+    g->sr = MIN(g->sw, g->sh) * 0.075;
+    g->fx = g->sx - VISOR_BEZEL;
+    g->fy = g->sy - VISOR_BEZEL;
+    g->fw = g->sw + 2 * VISOR_BEZEL;
+    g->fh = g->sh + 2 * VISOR_BEZEL;
+    g->fr = g->sr + VISOR_BEZEL;
+    g->kw = 44;
+    g->kh = 20;
+    g->kx = g->fx + g->fw - g->fr - g->kw - 26;
+    g->ky = g->fy - 13;
+    g->bw = 58;
+    g->bh = 12;
+    g->bx = g->fx + g->fr + 26;
+    g->by = g->fy - 6;
+}
+
+/* One end of the head band: a ribbed knit strap from the window's edge to the frame, and its audio pod */
+static void gd_visor_draw_band(cairo_t *cr, VisorGeometry *g, bool right)
+{
+    double h = g->fh * 0.40, y = g->fy + (g->fh - h) / 2;
+    double x0 = right ? g->fx + g->fw - 14 : -30, x1 = right ? g->fx + g->fw + VISOR_SIDE + 30 : g->fx + 14;
+    double pod = right ? g->fx + g->fw - 6 : g->fx - 28, x;
+    cairo_pattern_t *p = cairo_pattern_create_linear(0, y, 0, y + h);
+
+    cairo_pattern_add_color_stop_rgb(p, 0.00, 0.47, 0.48, 0.50);
+    cairo_pattern_add_color_stop_rgb(p, 0.45, 0.66, 0.67, 0.69);
+    cairo_pattern_add_color_stop_rgb(p, 1.00, 0.36, 0.37, 0.39);
+    cairo_set_source(cr, p);
+    gd_rounded(cr, x0, y, x1 - x0, h, 14);
+    cairo_fill(cr);
+    cairo_pattern_destroy(p);
+    /* the knit's ribs */
+    cairo_save(cr);
+    gd_rounded(cr, x0, y, x1 - x0, h, 14);
+    cairo_clip(cr);
+    cairo_set_line_width(cr, 1);
+    for (x = x0 + 3; x < x1; x += 5) {
+        cairo_set_source_rgba(cr, 0, 0, 0, 0.16);
+        cairo_move_to(cr, x + 0.5, y);
+        cairo_line_to(cr, x + 0.5, y + h);
+        cairo_stroke(cr);
+        cairo_set_source_rgba(cr, 1, 1, 1, 0.07);
+        cairo_move_to(cr, x + 1.5, y);
+        cairo_line_to(cr, x + 1.5, y + h);
+        cairo_stroke(cr);
+    }
+    cairo_restore(cr);
+    /* the audio pod the band clips into */
+    p = cairo_pattern_create_linear(0, y - 6, 0, y + h + 6);
+    cairo_pattern_add_color_stop_rgb(p, 0.0, 0.90, 0.90, 0.92);
+    cairo_pattern_add_color_stop_rgb(p, 0.5, 0.74, 0.74, 0.77);
+    cairo_pattern_add_color_stop_rgb(p, 1.0, 0.55, 0.55, 0.58);
+    cairo_set_source(cr, p);
+    gd_rounded(cr, pod, y - 6, 34, h + 12, 12);
+    cairo_fill(cr);
+    cairo_pattern_destroy(p);
+}
+
+/* The Digital Crown from the front, standing on the frame's top edge: a knurled wheel seen side-on */
+static void gd_visor_draw_crown(GtkDisplayState *s, cairo_t *cr, VisorGeometry *g)
+{
+    double lit = s->visor_target == 1 ? -0.14 : s->visor_hover == 1 ? 0.10 : 0, x;
+    cairo_pattern_t *p = cairo_pattern_create_linear(g->kx, 0, g->kx + g->kw, 0);
+
+    cairo_pattern_add_color_stop_rgb(p, 0.00, 0.30 + lit, 0.30 + lit, 0.32 + lit);
+    cairo_pattern_add_color_stop_rgb(p, 0.30, 0.66 + lit, 0.66 + lit, 0.69 + lit);
+    cairo_pattern_add_color_stop_rgb(p, 0.50, 0.82 + lit, 0.82 + lit, 0.85 + lit);
+    cairo_pattern_add_color_stop_rgb(p, 0.75, 0.60 + lit, 0.60 + lit, 0.63 + lit);
+    cairo_pattern_add_color_stop_rgb(p, 1.00, 0.27 + lit, 0.27 + lit, 0.30 + lit);
+    cairo_set_source(cr, p);
+    gd_rounded(cr, g->kx, g->ky, g->kw, g->kh, 6);
+    cairo_fill(cr);
+    cairo_pattern_destroy(p);
+    cairo_save(cr);
+    gd_rounded(cr, g->kx, g->ky, g->kw, g->kh, 6);
+    cairo_clip(cr);
+    cairo_set_line_width(cr, 1.3);
+    for (x = g->kx + 3; x < g->kx + g->kw; x += 4.2) {
+        double edge = MIN(x - g->kx, g->kx + g->kw - x) / (g->kw / 2);
+
+        cairo_set_source_rgba(cr, 0, 0, 0, (30 + 120 * MIN(1, edge * 1.4)) / 255.0);
+        cairo_move_to(cr, x, g->ky);
+        cairo_line_to(cr, x, g->ky + g->kh);
+        cairo_stroke(cr);
+    }
+    cairo_restore(cr);
+    cairo_set_line_width(cr, 1);
+    cairo_set_source_rgba(cr, 1, 1, 1, 0.45);
+    cairo_move_to(cr, g->kx + 6, g->ky + 1);
+    cairo_line_to(cr, g->kx + g->kw - 6, g->ky + 1);
+    cairo_stroke(cr);
+}
+
+static void gd_visor_draw_top(GtkDisplayState *s, cairo_t *cr, VisorGeometry *g)
+{
+    double lit = s->visor_target == 2 ? -0.14 : s->visor_hover == 2 ? 0.10 : 0;
+    double down = s->visor_target == 2 ? 2 : 0;
+    cairo_pattern_t *p = cairo_pattern_create_linear(0, g->by, 0, g->by + g->bh);
+
+    cairo_pattern_add_color_stop_rgb(p, 0, 0.88 + lit, 0.88 + lit, 0.90 + lit);
+    cairo_pattern_add_color_stop_rgb(p, 1, 0.58 + lit, 0.58 + lit, 0.61 + lit);
+    cairo_set_source(cr, p);
+    gd_rounded(cr, g->bx, g->by + down, g->bw, g->bh, 5);
+    cairo_fill(cr);
+    cairo_pattern_destroy(p);
+}
+
+/* Text for the mode strip: its size is returned, drawn at (x, y) unless @measure */
+static void gd_visor_text(GtkWidget *widget, cairo_t *cr, const char *markup, double x, double y,
+                          bool measure, int *w, int *h)
+{
+    PangoLayout *layout = gtk_widget_create_pango_layout(widget, NULL);
+
+    pango_layout_set_markup(layout, markup, -1);
+    pango_layout_get_pixel_size(layout, w, h);
+    if (!measure) {
+        cairo_move_to(cr, x, y);
+        pango_cairo_show_layout(cr, layout);
+    }
+    g_object_unref(layout);
+}
+
+/* Under the frame: a pill with the mode, and what the keys and the mouse do in it */
+static void gd_visor_draw_mode(GtkDisplayState *s, cairo_t *cr, VisorGeometry *g)
+{
+    Object *ts = gd_walk_touch();
+    bool walk = ts && object_property_get_bool(ts, "walk", NULL);
+    bool key = ts && object_property_get_uint(ts, "walk-hold-key", NULL) != 0;
+    const char *pill = walk ? "<span weight=\"600\" foreground=\"#ffffff\">Walk mode</span>"
+                            : "<span weight=\"600\" foreground=\"#e5e5ea\">Typing</span>";
+    const char *hint = walk
+        ? "<span foreground=\"#aeaeb2\">W A S D walk  ·  R F up and down  ·  Shift turns  ·  the mouse looks, "
+          "a click taps  ·  middle button: leave</span>"
+        : key
+        ? "<span foreground=\"#8e8e93\">the keyboard writes  ·  hold the right mouse button to look around and "
+          "walk  ·  middle button: walk mode</span>"
+        : "<span foreground=\"#8e8e93\">W A S D R F Q E and Shift also move the head  ·  middle button: walk "
+          "mode (the mouse looks)</span>";
+    double cy = g->fy + g->fh + VISOR_BOTTOM / 2.0 + 2, x;
+    int pw, ph, hw, hh;
+
+    gd_visor_text(s->visor, cr, pill, 0, 0, true, &pw, &ph);
+    gd_visor_text(s->visor, cr, hint, 0, 0, true, &hw, &hh);
+    if (pw + 24 + 14 + hw > g->fw) {
+        hw = 0;             /* a narrow window: the pill alone */
+    }
+    x = g->fx + (g->fw - (pw + 24 + (hw ? 14 + hw : 0))) / 2;
+    if (walk) {
+        cairo_set_source_rgb(cr, 0.04, 0.52, 1.0);
+    } else {
+        cairo_set_source_rgba(cr, 1, 1, 1, 0.10);
+    }
+    gd_rounded(cr, x, cy - ph / 2.0 - 4, pw + 24, ph + 8, (ph + 8) / 2.0);
+    cairo_fill(cr);
+    gd_visor_text(s->visor, cr, pill, x + 12, cy - ph / 2.0, false, &pw, &ph);
+    if (hw) {
+        gd_visor_text(s->visor, cr, hint, x + pw + 24 + 14, cy - hh / 2.0, false, &hw, &hh);
+    }
+}
+
+/* The headset from the front: band ends, crown, top button, frame, glass; then the mode strip */
+static void gd_visor_paint(GtkDisplayState *s, cairo_t *cr)
+{
+    VisorGeometry g;
+    cairo_pattern_t *p;
+
+    gd_visor_geometry(s, &g);
+    cairo_set_source_rgb(cr, 0.055, 0.055, 0.063);
+    cairo_paint(cr);
+    gd_visor_draw_band(cr, &g, false);
+    gd_visor_draw_band(cr, &g, true);
+    gd_visor_draw_crown(s, cr, &g);
+    gd_visor_draw_top(s, cr, &g);
+    /* the frame: brushed aluminium, lit from above */
+    p = cairo_pattern_create_linear(0, g.fy, 0, g.fy + g.fh);
+    cairo_pattern_add_color_stop_rgb(p, 0.00, 0.93, 0.93, 0.95);
+    cairo_pattern_add_color_stop_rgb(p, 0.08, 0.76, 0.76, 0.79);
+    cairo_pattern_add_color_stop_rgb(p, 0.55, 0.60, 0.60, 0.63);
+    cairo_pattern_add_color_stop_rgb(p, 1.00, 0.40, 0.40, 0.43);
+    cairo_set_source(cr, p);
+    gd_rounded(cr, g.fx, g.fy, g.fw, g.fh, g.fr);
+    cairo_fill(cr);
+    cairo_pattern_destroy(p);
+    cairo_set_line_width(cr, 1);
+    cairo_set_source_rgba(cr, 1, 1, 1, 0.55);
+    gd_rounded(cr, g.fx + 0.5, g.fy + 0.5, g.fw - 1, g.fh - 1, g.fr);
+    cairo_stroke(cr);
+    /* the glass: black to the screen's edge, a reflection along its rim; in walk mode the rim is lit */
+    cairo_set_source_rgb(cr, 0, 0, 0);
+    gd_rounded(cr, g.sx - VISOR_GLASS, g.sy - VISOR_GLASS, g.sw + 2 * VISOR_GLASS, g.sh + 2 * VISOR_GLASS,
+               g.sr + VISOR_GLASS);
+    cairo_fill(cr);
+    if (gd_walk_on()) {
+        cairo_set_line_width(cr, 2);
+        cairo_set_source_rgba(cr, 0.04, 0.52, 1.0, 0.95);
+        gd_rounded(cr, g.sx - 4, g.sy - 4, g.sw + 8, g.sh + 8, g.sr + 4);
+        cairo_stroke(cr);
+    } else {
+        cairo_set_line_width(cr, 1);
+        cairo_set_source_rgba(cr, 1, 1, 1, 0.10);
+        gd_rounded(cr, g.sx - VISOR_GLASS + 0.5, g.sy - VISOR_GLASS + 0.5, g.sw + 2 * VISOR_GLASS - 1,
+                   g.sh + 2 * VISOR_GLASS - 1, g.sr + VISOR_GLASS);
+        cairo_stroke(cr);
+    }
+    gd_visor_draw_mode(s, cr, &g);
+}
+
+/* Under the screen: the headset */
+static gboolean gd_visor_draw(GtkWidget *widget, cairo_t *cr, void *opaque)
+{
+    gd_visor_paint(opaque, cr);
+    return FALSE;       /* then the screen */
+}
+
+/* Over the screen: its round corners, painted as the headset behind them, the rest clear (as the watch's) */
+static gboolean gd_visor_draw_corners(GtkWidget *widget, cairo_t *cr, void *opaque)
+{
+    GtkDisplayState *s = opaque;
+    VisorGeometry g;
+
+    gd_visor_geometry(s, &g);
+    cairo_set_fill_rule(cr, CAIRO_FILL_RULE_EVEN_ODD);
+    cairo_rectangle(cr, 0, 0, g.sw, g.sh);
+    gd_rounded(cr, 0, 0, g.sw, g.sh, g.sr);
+    cairo_clip(cr);
+    /* painted apart and laid down once: layer by layer, the clip's soft edge would let each one through */
+    cairo_push_group(cr);
+    cairo_translate(cr, -g.sx, -g.sy);
+    gd_visor_paint(s, cr);
+    cairo_pop_group_to_source(cr);
+    cairo_paint(cr);
+    return FALSE;
+}
+
+/* 1: the crown, 2: the top button, 0: neither (a few pixels of slack around each) */
+static int gd_visor_hit(GtkDisplayState *s, double x, double y)
+{
+    VisorGeometry g;
+
+    gd_visor_geometry(s, &g);
+    if (x >= g.kx - 6 && x < g.kx + g.kw + 6 && y >= g.ky - 6 && y < g.fy + VISOR_FRAME) {
+        return 1;
+    }
+    if (x >= g.bx - 6 && x < g.bx + g.bw + 6 && y >= g.by - 8 && y < g.fy + VISOR_FRAME) {
+        return 2;
+    }
+    return 0;
+}
+
+static gboolean gd_visor_button_press(GtkWidget *widget, GdkEventButton *e, void *opaque)
+{
+    GtkDisplayState *s = opaque;
+    unsigned int key;
+
+    if (e->button != 1 || e->type != GDK_BUTTON_PRESS || s->visor_target) {
+        return FALSE;
+    }
+    s->visor_target = gd_visor_hit(s, e->x, e->y);
+    if (!s->visor_target) {
+        return FALSE;
+    }
+    key = s->visor_target == 1 ? KEY_F1 : KEY_F2;
+    gd_hold_key(key, gd_consumer_button(key), true);    /* a click presses it, held it stays down */
+    gtk_widget_queue_draw(widget);
+    return TRUE;
+}
+
+static gboolean gd_visor_button_release(GtkWidget *widget, GdkEventButton *e, void *opaque)
+{
+    GtkDisplayState *s = opaque;
+    unsigned int key;
+
+    if (e->button != 1 || !s->visor_target) {
+        return FALSE;
+    }
+    key = s->visor_target == 1 ? KEY_F1 : KEY_F2;
+    gd_hold_key(key, gd_consumer_button(key), false);
+    s->visor_target = 0;
+    gtk_widget_queue_draw(widget);
+    return TRUE;
+}
+
+static gboolean gd_visor_motion(GtkWidget *widget, GdkEventMotion *e, void *opaque)
+{
+    GtkDisplayState *s = opaque;
+    int hover = gd_visor_hit(s, e->x, e->y);
+
+    if (hover != s->visor_hover) {
+        GdkWindow *window = gtk_widget_get_window(widget);
+        GdkCursor *cursor = hover ? gdk_cursor_new_from_name(gtk_widget_get_display(widget), "pointer") : NULL;
+
+        s->visor_hover = hover;
+        if (window) {
+            gdk_window_set_cursor(window, cursor);
+        }
+        g_clear_object(&cursor);
+        gtk_widget_queue_draw(widget);
+    }
+    return FALSE;
+}
+
+static gboolean gd_visor_leave(GtkWidget *widget, GdkEventCrossing *e, void *opaque)
+{
+    GtkDisplayState *s = opaque;
+
+    if (s->visor_hover) {
+        s->visor_hover = 0;
+        gtk_widget_queue_draw(widget);
+    }
+    return FALSE;
+}
+
+static void gd_create_visor(GtkDisplayState *s)
+{
+    GtkWidget *corners = gtk_drawing_area_new();
+
+    s->visor = gtk_event_box_new();
+    gtk_event_box_set_visible_window(GTK_EVENT_BOX(s->visor), FALSE);
+    gtk_widget_set_app_paintable(s->visor, TRUE);
+    gtk_widget_add_events(s->visor, GDK_BUTTON_PRESS_MASK | GDK_BUTTON_RELEASE_MASK |
+                          GDK_POINTER_MOTION_MASK | GDK_LEAVE_NOTIFY_MASK);
+    gtk_widget_set_tooltip_text(s->visor, "Digital Crown (top right): click for the Home view (F1), hold to "
+                                "recentre. Top button (top left): F2. Right mouse button held: look around "
+                                "and walk. Middle button: walk mode.");
+    gtk_widget_set_margin_start(s->overlay, VISOR_SIDE + VISOR_BEZEL);
+    gtk_widget_set_margin_end(s->overlay, VISOR_SIDE + VISOR_BEZEL);
+    gtk_widget_set_margin_top(s->overlay, VISOR_TOP + VISOR_BEZEL);
+    gtk_widget_set_margin_bottom(s->overlay, VISOR_BOTTOM + VISOR_BEZEL);
+    gtk_container_add(GTK_CONTAINER(s->visor), s->overlay);
+    g_signal_connect(s->visor, "draw", G_CALLBACK(gd_visor_draw), s);
+    /* the corners over everything in the overlay, clicks through to the screen */
+    gtk_overlay_add_overlay(GTK_OVERLAY(s->overlay), corners);
+    gtk_overlay_set_overlay_pass_through(GTK_OVERLAY(s->overlay), corners, TRUE);
+    g_signal_connect(corners, "draw", G_CALLBACK(gd_visor_draw_corners), s);
+    g_signal_connect(s->visor, "button-press-event", G_CALLBACK(gd_visor_button_press), s);
+    g_signal_connect(s->visor, "button-release-event", G_CALLBACK(gd_visor_button_release), s);
+    g_signal_connect(s->visor, "motion-notify-event", G_CALLBACK(gd_visor_motion), s);
+    g_signal_connect(s->visor, "leave-notify-event", G_CALLBACK(gd_visor_leave), s);
+    gtk_box_pack_start(GTK_BOX(s->hbox), s->visor, TRUE, TRUE, 0);
+}
+
+/* The side bar's walk mode row: the touchscreen's "walk", as its middle button does */
+static void gd_sidebar_walk(GtkButton *button, void *opaque)
+{
+    Object *ts = gd_walk_touch();
+    Error *err = NULL;
+
+    if (ts && !object_property_set_bool(ts, "walk", !object_property_get_bool(ts, "walk", NULL), &err)) {
+        error_report_err(err);
+    }
+}
+
+static void gd_sidebar_keys(GtkButton *button, void *opaque)
+{
+    gd_keys_toggle();
+}
+
+/* Walk mode came on or went off: the strip under the visor, the glass's rim, the side bar's row */
+static void gd_visor_mode_changed(GtkDisplayState *s)
+{
+    if (s->visor) {
+        gtk_widget_queue_draw(s->visor);
+    }
+    if (s->sidebar_walk) {
+        gd_sidebar_set_label(s->sidebar_walk, gd_walk_on() ? "Walk mode: on" : "Walk mode: off");
+    }
+}
+
 static void gd_create_sidebar(GtkDisplayState *s)
 {
     const char *shots = g_getenv("ASOFT_SHOTS_DIR");
@@ -2620,6 +3070,29 @@ static void gd_create_sidebar(GtkDisplayState *s)
     gtk_box_pack_start(GTK_BOX(s->sidebar), header, FALSE, FALSE, 0);
 
     group = gd_sidebar_group(s, "BUTTONS");
+    if (s->vision) {
+        gd_sidebar_button(s, group, "Crown", "F1",
+                          "Press the Digital Crown (F1): the Home view. Hold F1 to recentre",
+                          G_CALLBACK(gd_sidebar_key), KEY_F1);
+        s->sidebar_lock = gd_sidebar_button(s, group, "Top button", "F2",
+                                            "The top button (F2)",
+                                            G_CALLBACK(gd_sidebar_key), KEY_F2);
+        gd_sidebar_button(s, group, "Volume up", "F4", "Volume up (F4)",
+                          G_CALLBACK(gd_sidebar_key), KEY_F4);
+        gd_sidebar_button(s, group, "Volume down", "F3", "Volume down (F3)",
+                          G_CALLBACK(gd_sidebar_key), KEY_F3);
+        group = gd_sidebar_group(s, "MOVE");
+        s->sidebar_walk = gd_sidebar_button(s, group, "Walk mode: off", "Middle",
+                                            "Walk mode: the mouse looks around, W A S D walk, R F go up "
+                                            "and down, a click taps what you look at. The middle mouse "
+                                            "button turns it on and off; the right button held is walk "
+                                            "mode while it is down. Outside it the keyboard only writes",
+                                            G_CALLBACK(gd_sidebar_walk), 0);
+        gd_sidebar_button(s, group, "Keys", "F12",
+                          "Show the keys and buttons the guest got, over the screen (F12)",
+                          G_CALLBACK(gd_sidebar_keys), 0);
+        goto screen;
+    }
     if (s->watch) {
         gd_sidebar_button(s, group, "Crown", "F1",
                           "Press the Digital Crown (F1): the clock face, the apps",
@@ -2671,8 +3144,8 @@ screen:
                       "Open the folder the screenshots go to",
                       G_CALLBACK(gd_sidebar_open_shots), 0);
 
-    group = gd_sidebar_group(s, s->watch ? "TEXT" : "APPS AND TEXT");
-    if (s->watch) {
+    group = gd_sidebar_group(s, s->watch || s->vision ? "TEXT" : "APPS AND TEXT");
+    if (s->watch || s->vision) {
         goto text;
     }
     install = gd_sidebar_button(s, group, "Install .ipa…", NULL,
@@ -3500,6 +3973,119 @@ static gboolean gd_text_key_down(GtkWidget *widget,
     return TRUE;
 }
 
+/*
+ * The key overlay (ASoftware): F12 shows the keys and buttons the guest got (ui/keylog.c) over the screen's
+ * bottom-left corner; ASOFT_KEYSHOW=1 starts with it shown. Hidden, it costs nothing; shown, a 100 ms timer
+ * that redraws the label only when the log changed or an entry still waits.
+ */
+static GtkWidget *gd_keys_label;
+static guint gd_keys_timer;
+static unsigned gd_keys_seen;
+
+static gboolean gd_keys_tick(gpointer opaque)
+{
+    unsigned gen = keylog_gen();
+
+    if (opaque || gen != gd_keys_seen || keylog_waiting()) {
+        char *m = keylog_markup();
+
+        gd_keys_seen = gen;
+        gtk_label_set_markup(GTK_LABEL(gd_keys_label), m);
+        g_free(m);
+    }
+    return G_SOURCE_CONTINUE;
+}
+
+static void gd_keys_toggle(void)
+{
+    if (!gd_keys_label) {
+        return;
+    }
+    if (gtk_widget_get_visible(gd_keys_label)) {
+        gtk_widget_hide(gd_keys_label);
+        if (gd_keys_timer) {
+            g_source_remove(gd_keys_timer);
+            gd_keys_timer = 0;
+        }
+        return;
+    }
+    gd_keys_tick(GINT_TO_POINTER(1));
+    gtk_widget_show(gd_keys_label);
+    gd_keys_timer = g_timeout_add(100, gd_keys_tick, NULL);
+}
+
+static void gd_keys_create(GtkWidget *overlay)
+{
+    GtkCssProvider *css = gtk_css_provider_new();
+    GtkWidget *label = gtk_label_new(NULL);
+
+    gtk_css_provider_load_from_data(css,
+        "label { background-color: rgba(0, 0, 0, 0.66); color: #ffffff; border-radius: 10px;"
+        " padding: 8px 12px; font-family: Consolas, monospace; font-size: 13px; }", -1, NULL);
+    gtk_style_context_add_provider(gtk_widget_get_style_context(label), GTK_STYLE_PROVIDER(css),
+                                   GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
+    g_object_unref(css);
+    gtk_label_set_xalign(GTK_LABEL(label), 0);
+    gtk_widget_set_halign(label, GTK_ALIGN_START);
+    gtk_widget_set_valign(label, GTK_ALIGN_END);
+    gtk_widget_set_margin_start(label, 16);
+    gtk_widget_set_margin_bottom(label, 16);
+    gtk_widget_set_can_focus(label, FALSE);
+    gtk_widget_set_no_show_all(label, TRUE);
+    gtk_overlay_add_overlay(GTK_OVERLAY(overlay), label);
+    gtk_overlay_set_overlay_pass_through(GTK_OVERLAY(overlay), label, TRUE);
+    gd_keys_label = label;
+    if (g_strcmp0(g_getenv("ASOFT_KEYSHOW"), "1") == 0) {
+        gd_keys_toggle();
+    }
+}
+
+/*
+ * F1-F4 as buttons that can be held (ASoftware): a tap stays one press (the device releases it hold-ms after
+ * the guest read it); a key held past GD_HOLD_MS holds the button down until the key goes up (visionOS: the
+ * Digital Crown held recentres the view).
+ */
+#define GD_HOLD_MS 500
+static guint gd_hold_timer[4];
+static bool gd_hold_down[4];
+
+static gboolean gd_hold_fire(gpointer opaque)
+{
+    int button = GPOINTER_TO_INT(opaque);
+    Object *consumer = gd_consumer();
+    Error *err = NULL;
+
+    gd_hold_timer[button] = 0;
+    gd_hold_down[button] = true;
+    if (consumer && !object_property_set_str(consumer, "down", gd_consumer_buttons[button].button, &err)) {
+        error_report_err(err);
+    }
+    return G_SOURCE_REMOVE;
+}
+
+static void gd_hold_key(unsigned int lnx, int button, bool down)
+{
+    Object *consumer = gd_consumer();
+    Error *err = NULL;
+
+    if (down) {
+        if (!gd_hold_timer[button] && !gd_hold_down[button]) {
+            gd_hold_timer[button] = g_timeout_add(GD_HOLD_MS, gd_hold_fire, GINT_TO_POINTER(button));
+        }
+        return;
+    }
+    if (gd_hold_timer[button]) {
+        g_source_remove(gd_hold_timer[button]);
+        gd_hold_timer[button] = 0;
+        gd_sidebar_press(lnx);
+    } else if (gd_hold_down[button]) {
+        gd_hold_down[button] = false;
+        if (consumer && !object_property_set_str(consumer, "up", gd_consumer_buttons[button].button, &err)) {
+            error_report_err(err);
+        }
+    }
+}
+
 static gboolean gd_key_event(GtkWidget *widget, GdkEventKey *key, void *opaque)
 {
     VirtualConsole *vc = opaque;
@@ -3529,6 +4115,14 @@ static gboolean gd_key_event(GtkWidget *widget, GdkEventKey *key, void *opaque)
         ) {
         qkbd_state_key_event(vc->gfx.kbd, KEY_PAUSE,
                              key->type == GDK_KEY_PRESS);
+        return TRUE;
+    }
+
+    /* F12 shows or hides the key overlay; the guest does not get it */
+    if (key->keyval == GDK_KEY_F12) {
+        if (key->type == GDK_KEY_PRESS) {
+            gd_keys_toggle();
+        }
         return TRUE;
     }
 
@@ -3564,9 +4158,10 @@ static gboolean gd_key_event(GtkWidget *widget, GdkEventKey *key, void *opaque)
         if (key->type == GDK_KEY_PRESS &&
             !(vc->s->consumer_keys_down & BIT(button))) {
             vc->s->consumer_keys_down |= BIT(button);
-            gd_sidebar_press(lnx);
+            gd_hold_key(lnx, button, true);
         } else if (key->type == GDK_KEY_RELEASE) {
             vc->s->consumer_keys_down &= ~BIT(button);
+            gd_hold_key(lnx, button, false);
         }
         return TRUE;
     }
@@ -5000,6 +5595,7 @@ static void gtk_display_init(DisplayState *ds, DisplayOptions *opts)
     }
     if (opts->u.gtk.has_sidebar && opts->u.gtk.sidebar) {
         s->watch = gd_watch_guest();
+        s->vision = !s->watch && gd_walk_touch() != NULL;
         gd_create_sidebar(s);
         gd_create_screen_off(s);
         gd_create_busy(s);
@@ -5009,13 +5605,19 @@ static void gtk_display_init(DisplayState *ds, DisplayOptions *opts)
         gtk_overlay_add_overlay(GTK_OVERLAY(s->overlay), s->busy);
         if (s->watch) {
             gd_create_watch_case(s);
+        } else if (s->vision) {
+            gd_create_visor(s);
         } else {
             gtk_box_pack_start(GTK_BOX(s->hbox), s->overlay, TRUE, TRUE, 0);
         }
         gtk_box_pack_end(GTK_BOX(s->hbox), s->sidebar, FALSE, FALSE, 0);
     } else {
-        gtk_box_pack_start(GTK_BOX(s->hbox), s->notebook, TRUE, TRUE, 0);
+        /* the notebook in an overlay of its own, for the key overlay */
+        s->overlay = gtk_overlay_new();
+        gtk_container_add(GTK_CONTAINER(s->overlay), s->notebook);
+        gtk_box_pack_start(GTK_BOX(s->hbox), s->overlay, TRUE, TRUE, 0);
     }
+    gd_keys_create(s->overlay);
 
     gtk_box_pack_start(GTK_BOX(s->vbox), s->menu_bar, FALSE, TRUE, 0);
     gtk_box_pack_start(GTK_BOX(s->vbox), s->hbox, TRUE, TRUE, 0);

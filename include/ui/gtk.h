@@ -145,6 +145,12 @@ struct GtkDisplayState {
     double crown_down_y, crown_last_y, crown_acc;
     bool crown_moved, crown_holding, crown_hover;
     guint crown_hold_id;        /* the crown held still: a long press */
+    /* a headset guest (usb-touchscreen walk-mode=on): a drawn visor around the screen */
+    bool vision;
+    GtkWidget *visor;           /* the overlay in a drawn headset: frame, crown, top button, band */
+    int visor_target;           /* what the mouse button went down on: 0, 1 crown, 2 top button */
+    int visor_hover;            /* what the pointer is over, the same way */
+    GtkWidget *sidebar_walk;    /* the side bar's walk mode row */
     /* the watch hangs from the window's top edge and swings when the window is moved */
     double swing_angle, swing_vel;  /* radians, radians/s, about the band's pivot */
     int swing_dx, swing_dy;         /* the screen's offset applied for the swing, pixels */
