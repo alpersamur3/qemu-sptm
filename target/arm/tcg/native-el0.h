@@ -25,7 +25,7 @@ void native_el0_tlbi_range(uint64_t base, uint64_t len, int asid);
  * in that ASID right now.  ASOFT_TLBI_FILTER=0: always TLBI_SCOPE_ALL.
  */
 enum { TLBI_SCOPE_ALL, TLBI_SCOPE_SELF, TLBI_SCOPE_NONE };
-int native_el0_tlbi_scope(CPUState *cs, uint64_t va, uint16_t asid);
+int native_el0_tlbi_scope(CPUState *cs, uint64_t va, uint64_t len, uint16_t asid);
 
 extern bool native_el0_enabled;
 

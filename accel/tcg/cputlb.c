@@ -170,6 +170,51 @@ static void tb_jmp_cache_clear_page(CPUState *cpu, vaddr page_addr)
     }
 }
 
+/*
+ * Drop @cpu's jump-cache entries for the pages of [addr, addr + len) and the
+ * page before (a TB can span two pages) from another thread, lock free: bump
+ * the pages' epochs (tb_jmp_cache_clear_page()'s job, done by cmpxchg).  An
+ * owner's concurrent plain increment can only merge with ours: the epoch
+ * still moves away from the one the stale entries carry.  False if an epoch
+ * would wrap (the owner must clear everything then) or the range is long:
+ * the caller falls back to a synced flush.
+ */
+bool tb_jmp_cache_bump_remote(CPUState *cpu, vaddr addr, vaddr len)
+{
+    CPUJumpCache *jc = cpu->tb_jmp_cache;
+    vaddr first, last;
+
+    if (unlikely(!jc)) {
+        return true;
+    }
+    if (len > (vaddr)TARGET_PAGE_SIZE * 16) {
+        return false;
+    }
+    first = (addr & TARGET_PAGE_MASK) - TARGET_PAGE_SIZE;
+    last = (addr + len - 1) & TARGET_PAGE_MASK;
+    for (vaddr page = first; ; page += TARGET_PAGE_SIZE) {
+        uint16_t *p = &jc->page_epoch[tb_jmp_cache_page_slot(page)];
+        uint16_t e = qatomic_read(p);
+
+        for (;;) {
+            uint16_t seen;
+
+            if ((uint16_t)(e + 1) == 0) {
+                return false;
+            }
+            seen = qatomic_cmpxchg(p, e, (uint16_t)(e + 1));
+            if (seen == e) {
+                break;
+            }
+            e = seen;
+        }
+        if (page == last) {
+            break;
+        }
+    }
+    return true;
+}
+
 /**
  * tlb_mmu_resize_locked() - perform TLB resize bookkeeping; resize if necessary
  * @desc: The CPUTLBDesc portion of the TLB

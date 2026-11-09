@@ -40,5 +40,7 @@ void tb_jmp_cache_drop_users(CPUState *cs);
 /* the lower half's jump cache follows the guest's address space (ASID) */
 void tb_jmp_cache_switch(CPUState *cs, uint32_t tag);
 void tb_jmp_cache_drop(CPUState *cs, uint32_t tag);
+/* another thread drops @cs's entries for a few pages, lock free; false: do a synced flush */
+bool tb_jmp_cache_bump_remote(CPUState *cs, vaddr addr, vaddr len);
 
 #endif /* _TB_FLUSH_H_ */

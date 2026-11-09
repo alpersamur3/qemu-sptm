@@ -501,7 +501,8 @@ static void tlbi_aa64_vae1is_write(CPUARMState *env, const ARMCPRegInfo *ri,
     native_el0_tlbi_page(pageaddr, (ri->opc2 & 2) ? -1 : (int)extract64(value, 48, 16));
 
     if (!(ri->opc2 & 2)) {
-        switch (native_el0_tlbi_scope(cs, pageaddr, extract64(value, 48, 16))) {
+        switch (native_el0_tlbi_scope(cs, pageaddr, TARGET_PAGE_SIZE,
+                                      extract64(value, 48, 16))) {
         case TLBI_SCOPE_NONE:
             return;
         case TLBI_SCOPE_SELF:
@@ -1010,6 +1011,23 @@ static void tlbi_aa64_rvae1is_write(CPUARMState *env,
      * shareable specific flushes.
      */
 
+    if (!(ri->opc2 & 2)) {
+        /* by ASID: only the vCPUs in it, as tlbi_aa64_vae1is_write() */
+        int idxmap = vae1_tlbmask(env);
+        TLBIRange range = tlbi_aa64_get_range(env, ARM_MMU_IDX_A | ctz32(idxmap),
+                                              value);
+
+        switch (native_el0_tlbi_scope(env_cpu(env), range.base, range.length,
+                                      extract64(value, 48, 16))) {
+        case TLBI_SCOPE_NONE:
+            return;
+        case TLBI_SCOPE_SELF:
+            do_rvae_write(env, value, idxmap, false);
+            return;
+        default:
+            break;
+        }
+    }
     do_rvae_write(env, value, vae1_tlbmask(env), true);
 }
 

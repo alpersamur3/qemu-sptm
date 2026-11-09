@@ -1342,6 +1342,8 @@ static const Property arm_cpu_has_gcie_property =
 
 static const Property arm_cpu_keep_kernel_tlb_property =
             DEFINE_PROP_BOOL("x-keep-kernel-tlb", ARMCPU, keep_kernel_tlb, false);
+static const Property arm_cpu_tlbi_filter_property =
+            DEFINE_PROP_BOOL("x-tlbi-filter", ARMCPU, tlbi_filter, false);
 static const Property arm_cpu_el0_pac_off_property =
             DEFINE_PROP_BOOL("x-el0-pac-off", ARMCPU, el0_pac_off, false);
 static const Property arm_cpu_host_counter_property =
@@ -1758,6 +1760,7 @@ static void arm_cpu_post_init(Object *obj)
     }
     if (arm_feature(&cpu->env, ARM_FEATURE_AARCH64)) {
         qdev_property_add_static(DEVICE(obj), &arm_cpu_keep_kernel_tlb_property);
+        qdev_property_add_static(DEVICE(obj), &arm_cpu_tlbi_filter_property);
         qdev_property_add_static(DEVICE(obj), &arm_cpu_el0_pac_off_property);
         qdev_property_add_static(DEVICE(obj), &arm_cpu_host_counter_property);
         qdev_property_add_static(DEVICE(obj), &arm_cpu_va_param_cache_property);

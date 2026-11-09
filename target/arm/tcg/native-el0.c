@@ -54,6 +54,7 @@
 #include "cpu-features.h"
 #include "syndrome.h"
 #include "native-el0.h"
+#include "exec/tb-flush.h"
 
 bool native_el0_enabled;
 
@@ -61,37 +62,57 @@ bool native_el0_enabled;
 static int tlbi_filter = -1;
 static uint64_t tlbi_scope_n[3];
 
-int native_el0_tlbi_scope(CPUState *cs, uint64_t va, uint16_t asid)
+int native_el0_tlbi_scope(CPUState *cs, uint64_t va, uint64_t len, uint16_t asid)
 {
     CPUARMState *env = cpu_env(cs);
+    ARMCPU *cpu = env_archcpu(env);
+    uint16_t amask;
+    CPUState *other;
 
     if (unlikely(tlbi_filter < 0)) {
         const char *e = getenv("ASOFT_TLBI_FILTER");
         tlbi_filter = !e || *e != '0';
     }
+    /* 8-bit ASIDs unless TCR_EL1.AS */
+    amask = (env->cp15.tcr_el[1] & (1ULL << 36)) ? 0xffff : 0xff;
+    asid &= amask;
     /*
-     * Not with x-keep-kernel-tlb: its per-ASID jump caches outlive an ASID
-     * change, so another vCPU has to hear about the page.  Not for ASID 0 or
-     * the upper half: global entries match any ASID.
+     * Not for ASID 0 or the upper half: global entries match any ASID.
      */
-    if (!tlbi_filter || env_archcpu(env)->keep_kernel_tlb || !asid ||
-        (int64_t)va < 0 || arm_is_el2_enabled(env)) {
+    if (!tlbi_filter || !asid || !len || (int64_t)va < 0 ||
+        (int64_t)(va + len - 1) < 0 || arm_is_el2_enabled(env)) {
         return TLBI_SCOPE_ALL;
     }
     /*
-     * Against vmsa_ttbr_write(): the guest's PTE store is ordered before these
-     * reads, so a vCPU we see in another ASID walks the new PTE once it comes
-     * to this one.
+     * QEMU's TLB has no ASID tag: an ASID change empties the lower half, so a
+     * vCPU in another ASID holds no TLB entry for the page.  With
+     * x-keep-kernel-tlb its per-ASID jump caches outlive the change, so
+     * another vCPU has to hear about the page: only with x-tlbi-filter, which
+     * bumps the pages' jump-cache epochs on every vCPU first, lock free.
+     */
+    if (cpu->keep_kernel_tlb) {
+        if (!cpu->tlbi_filter) {
+            return TLBI_SCOPE_ALL;
+        }
+        CPU_FOREACH(other) {
+            if (!tb_jmp_cache_bump_remote(other, va, len)) {
+                return TLBI_SCOPE_ALL;
+            }
+        }
+    }
+    /*
+     * Against vmsa_ttbr_write(): the epoch bumps and the guest's PTE store
+     * are ordered before these reads, so a vCPU we see in another ASID sees
+     * the new epoch and walks the new PTE once it comes to this one.
      */
     smp_mb();
     bool self = false;
-    CPUState *other;
     CPU_FOREACH(other) {
         CPUARMState *e = cpu_env(other);
         uint64_t ttbr = (qatomic_read(&e->cp15.tcr_el[1]) & (1ULL << 22))
                         ? qatomic_read(&e->cp15.ttbr1_el[1])
                         : qatomic_read(&e->cp15.ttbr0_el[1]);
-        if (extract64(ttbr, 48, 16) != asid) {
+        if ((extract64(ttbr, 48, 16) & amask) != asid) {
             continue;
         }
         if (other != cs) {
@@ -3659,5 +3680,5 @@ void asoft_who_syscall(uint16_t asid, int64_t num) { }      /* ASOFT_WHO is the 
 #endif
 
 #ifdef CONFIG_USER_ONLY
-int native_el0_tlbi_scope(CPUState *cs, uint64_t va, uint16_t asid) { return TLBI_SCOPE_ALL; }
+int native_el0_tlbi_scope(CPUState *cs, uint64_t va, uint64_t len, uint16_t asid) { return TLBI_SCOPE_ALL; }
 #endif
