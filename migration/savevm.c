@@ -264,6 +264,7 @@ typedef struct SaveState {
     uint32_t caps_count;
     MigrationCapability *capabilities;
     QemuUUID uuid;
+    uint32_t smp_cpus;
 } SaveState;
 
 static SaveState savevm_state = {
@@ -320,6 +321,7 @@ static bool configuration_pre_save(void *opaque, Error **errp)
         }
     }
     state->uuid = qemu_uuid;
+    state->smp_cpus = current_machine->smp.cpus;
 
     return true;
 }
@@ -342,6 +344,8 @@ static bool configuration_pre_load(void *opaque, Error **errp)
      * minimum possible value for this CPU.
      */
     state->target_page_bits = migration_legacy_page_bits();
+    /* (a state saved before the smp-cpus subsection: not known, not checked) */
+    state->smp_cpus = 0;
     return true;
 }
 
@@ -402,6 +406,22 @@ static bool configuration_post_load(void *opaque, int version_id, Error **errp)
 
     if (!configuration_validate_capabilities(state)) {
         error_setg(errp, "Failed to validate capabilities");
+        ok = false;
+        goto out;
+    }
+
+    /*
+     * Checked here, before any device: the CPUs' and the GIC's states are
+     * arrays of the machine's CPU count, which the stream does not carry, so
+     * a state of 4 CPUs loaded into 8 read the following sections as CPU
+     * state and crashed (vresearch, arm_gicv3).
+     */
+    if (state->smp_cpus && state->smp_cpus != current_machine->smp.cpus) {
+        error_setg(errp,
+                   "The state was saved with %u CPU(s) and this machine has "
+                   "%u: load it with -smp %u",
+                   state->smp_cpus, current_machine->smp.cpus,
+                   state->smp_cpus);
         ok = false;
         goto out;
     }
@@ -543,6 +563,23 @@ static const VMStateDescription vmstate_uuid = {
     }
 };
 
+static bool vmstate_smp_cpus_needed(void *opaque)
+{
+    return true;
+}
+
+/* The machine's CPU count, checked in configuration_post_load */
+static const VMStateDescription vmstate_smp_cpus = {
+    .name = "configuration/smp-cpus",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = vmstate_smp_cpus_needed,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT32(smp_cpus, SaveState),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
 static const VMStateDescription vmstate_configuration = {
     .name = "configuration",
     .version_id = 1,
@@ -559,6 +596,7 @@ static const VMStateDescription vmstate_configuration = {
         &vmstate_target_page_bits,
         &vmstate_capabilites,
         &vmstate_uuid,
+        &vmstate_smp_cpus,
         NULL
     }
 };
