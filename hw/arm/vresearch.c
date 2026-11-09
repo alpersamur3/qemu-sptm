@@ -27,6 +27,7 @@
 #include "qemu/error-report.h"
 #include "qemu/log.h"
 #include "qemu/timer.h"
+#include "qemu/units.h"
 #include "qobject/qlist.h"
 #include "hw/arm/boot.h"
 #include "hw/arm/machines-qom.h"
@@ -151,8 +152,14 @@ static const int irqmap[] = {
  * 16-byte stores that aren't 16-byte aligned, and its console ignores
  * v_rowBytes (rows of v_width * 4 bytes): the width is rounded up to a
  * multiple of 16 pixels.
+ *
+ * It lives at VR_FB_BASE, where saved states of up to 4 GB of RAM expect it,
+ * unless DRAM or /product/util reach that far (from 5 GB less 32 MB of RAM):
+ * then at the next VR_FB_ALIGN past them. Inside DRAM the guest would use its
+ * pages as RAM, and it would split DRAM's range for pvg=reims.
  */
 #define VR_FB_BASE      0x1c0000000ULL
+#define VR_FB_ALIGN     (1 * GiB)
 
 #define VR_MAX_CPUS 8
 
@@ -581,6 +588,20 @@ static const GraphicHwOps fb_ops = {
     .gfx_update = fb_update,
 };
 
+/* The boot framebuffer's guest address: past DRAM and /product/util */
+static hwaddr fb_base(const struct xnu_boot_info *info, struct dtree_node *dt_root)
+{
+    struct dtree_node *util = adt_find_node(dt_root, "product/util");
+    hwaddr end = info->dram_base + info->dram_size;
+
+    if (util && adt_get_prop_len(util, "reg") >= sizeof(struct adt_io_reg)) {
+        struct adt_io_reg *reg = adt_get_prop_val(util, "reg");
+
+        end = MAX(end, reg->base + reg->len);
+    }
+    return end <= VR_FB_BASE ? VR_FB_BASE : QEMU_ALIGN_UP(end, VR_FB_ALIGN);
+}
+
 /* Parses fb=WxH into the boot info and points /vram at the framebuffer */
 static void setup_fb(VResearchState *s, struct dtree_node *dt_root)
 {
@@ -597,14 +618,14 @@ static void setup_fb(VResearchState *s, struct dtree_node *dt_root)
         error_report("vresearch: fb=%s: give WxH (at most 4096x4096) or off", s->fb);
         exit(1);
     }
-    info->video_base = VR_FB_BASE;
+    info->video_base = fb_base(info, dt_root);
     info->video_width = ROUND_UP_POW2(w, 16);
     info->video_height = h;
     info->video_stride = info->video_width * 4;
     if (vram && adt_get_prop_len(vram, "reg") == 2 * sizeof(u64)) {
         u64 *reg = adt_get_prop_val(vram, "reg");
 
-        reg[0] = VR_FB_BASE;
+        reg[0] = info->video_base;
         reg[1] = ROUND_UP_POW2((u64)info->video_stride * h, DARWIN_PAGE_SIZE);
     }
 }
