@@ -30,6 +30,9 @@
 #include "hw/input/hid.h"
 #include "migration/vmstate.h"
 #include "trace.h"
+#include "qemu/bitops.h"
+#include "ui/keylog.h"
+#include "standard-headers/linux/input-event-codes.h"
 
 #define HID_USAGE_ERROR_ROLLOVER        0x01
 #define HID_USAGE_POSTFAIL              0x02
@@ -239,24 +242,186 @@ static void hid_pointer_sync(DeviceState *dev)
     }
 }
 
-static void hid_keyboard_event(DeviceState *dev, QemuConsole *src,
-                               QemuInputEvent *evt)
-{
-    HIDState *hs = (HIDState *)dev;
-    int scancodes[3], i, count;
-    int slot;
+/*
+ * The keyboard queue (ASoftware):
+ *  - A key already down is not queued again. The host repeats a held key
+ *    (Windows: ~30 a second); a repeat changes nothing in the report (the
+ *    guest makes its own repeats) but took a queue slot and a guest read. A
+ *    slow guest's queue filled with them, and the release that came next was
+ *    dropped as "queue full": the key stayed down in the guest (visionOS
+ *    walked on with D held).
+ *  - A release that finds the queue full waits (release bitmap) and goes in
+ *    as soon as the guest has read room for it. While one waits, presses are
+ *    dropped and further releases wait too, so the order holds.
+ * Each key is written to the key log (ui/keylog.c) for the display's key
+ * overlay: queued, read by the guest, or dropped. All of it runs under the
+ * BQL: input events, the guest's USB reads (xhci) and the display's timer.
+ * The state is kept beside HIDState, by its pointer, so that HIDState's
+ * layout and its migration stream stay as they were.
+ */
+#define HID_KBDQS 4
+typedef struct HIDKbdQueue {
+    HIDState *hs;
+    unsigned long down[BITS_TO_LONGS(KEY_CNT)];     /* queued down: the guest has it down, or will */
+    unsigned long release[BITS_TO_LONGS(KEY_CNT)];  /* releases waiting for room */
+    unsigned long lost[BITS_TO_LONGS(KEY_CNT)];     /* held keys whose press found no room */
+    uint64_t queued, taken;                         /* scancodes queued, read by the guest */
+} HIDKbdQueue;
+static HIDKbdQueue hid_kbdqs[HID_KBDQS];
 
-    count = qemu_input_linux_to_scancode(evt->key.key, evt->key.down,
-                                         scancodes);
-    if (hs->n + count > QUEUE_LENGTH) {
-        trace_hid_kbd_queue_full();
+static HIDKbdQueue *hid_kbdq(HIDState *hs, bool make)
+{
+    int i;
+
+    for (i = 0; i < HID_KBDQS; i++) {
+        if (hid_kbdqs[i].hs == hs) {
+            return &hid_kbdqs[i];
+        }
+    }
+    for (i = 0; make && i < HID_KBDQS; i++) {
+        if (!hid_kbdqs[i].hs) {
+            hid_kbdqs[i].hs = hs;
+            return &hid_kbdqs[i];
+        }
+    }
+    return NULL;
+}
+
+static void hid_key_name(unsigned int lnx, char *buf, size_t size)
+{
+    static const struct { int qcode; const char *name; } pretty[] = {
+        { Q_KEY_CODE_SHIFT, "Shift" }, { Q_KEY_CODE_SHIFT_R, "Shift R" },
+        { Q_KEY_CODE_CTRL, "Ctrl" }, { Q_KEY_CODE_CTRL_R, "Ctrl R" },
+        { Q_KEY_CODE_ALT, "Alt" }, { Q_KEY_CODE_ALT_R, "Alt R" },
+        { Q_KEY_CODE_META_L, "Cmd" }, { Q_KEY_CODE_META_R, "Cmd R" },
+        { Q_KEY_CODE_SPC, "Space" }, { Q_KEY_CODE_RET, "Enter" },
+        { Q_KEY_CODE_ESC, "Esc" }, { Q_KEY_CODE_TAB, "Tab" },
+        { Q_KEY_CODE_BACKSPACE, "Backspace" },
+        { Q_KEY_CODE_UP, "Up" }, { Q_KEY_CODE_DOWN, "Down" },
+        { Q_KEY_CODE_LEFT, "Left" }, { Q_KEY_CODE_RIGHT, "Right" },
+    };
+    int qcode = qemu_input_linux_to_qcode(lnx);
+    const char *s;
+    size_t i;
+
+    for (i = 0; i < ARRAY_SIZE(pretty); i++) {
+        if (pretty[i].qcode == qcode) {
+            g_strlcpy(buf, pretty[i].name, size);
+            return;
+        }
+    }
+    s = qcode > 0 && qcode < Q_KEY_CODE__MAX ? QKeyCode_str(qcode) : NULL;
+    if (!s) {
+        snprintf(buf, size, "key %u", lnx);
         return;
+    }
+    g_strlcpy(buf, s, size);
+    if (buf[0] && !buf[1]) {
+        buf[0] = g_ascii_toupper(buf[0]);
+    }
+}
+
+static bool hid_kbdq_releases_wait(HIDKbdQueue *k)
+{
+    return find_first_bit(k->release, KEY_CNT) < KEY_CNT;
+}
+
+/* waiting releases into the queue while there is room; true if any went in */
+static bool hid_kbdq_flush(HIDState *hs, HIDKbdQueue *k)
+{
+    int scancodes[3], i, count;
+    unsigned long lnx;
+    bool in = false;
+    char name[24];
+
+    for (lnx = find_first_bit(k->release, KEY_CNT); lnx < KEY_CNT;
+         lnx = find_next_bit(k->release, KEY_CNT, lnx + 1)) {
+        count = qemu_input_linux_to_scancode(lnx, false, scancodes);
+        if (hs->n + count > QUEUE_LENGTH) {
+            break;
+        }
+        for (i = 0; i < count; i++) {
+            hs->kbd.keycodes[(hs->head + hs->n) & QUEUE_MASK] = scancodes[i];
+            hs->n++;
+        }
+        k->queued += count;
+        clear_bit(lnx, k->release);
+        hid_key_name(lnx, name, sizeof(name));
+        keylog_queued(hs, name, k->queued);
+        in = true;
+    }
+    return in;
+}
+
+/* one key event by the rules above (K NULL: as upstream); true if it went into the queue */
+static bool hid_kbdq_event(HIDState *hs, HIDKbdQueue *k, unsigned int lnx, bool down)
+{
+    int scancodes[3], i, count, slot;
+    char name[24];
+
+    if (k && down && test_bit(lnx, k->release)) {
+        /* pressed again before its release went in: the guest still has it down */
+        clear_bit(lnx, k->release);
+        set_bit(lnx, k->down);
+        hid_key_name(lnx, name, sizeof(name));
+        keylog_add(hs, name, true, KEYLOG_KEPT, 0);
+        return false;
+    }
+    if (k && down && test_bit(lnx, k->down)) {
+        return false;                   /* the host's autorepeat */
+    }
+    if (k && !down && test_and_clear_bit(lnx, k->lost)) {
+        return false;                   /* the guest never had it down */
+    }
+    count = qemu_input_linux_to_scancode(lnx, down, scancodes);
+    if (hs->n + count > QUEUE_LENGTH || (k && hid_kbdq_releases_wait(k))) {
+        trace_hid_kbd_queue_full();
+        if (k && !down && test_bit(lnx, k->down)) {
+            clear_bit(lnx, k->down);
+            set_bit(lnx, k->release);
+            hid_key_name(lnx, name, sizeof(name));
+            keylog_add(hs, name, false, KEYLOG_LATER, 0);
+        } else if (k && !(down && test_bit(lnx, k->lost))) {
+            /* a held key's repeats try again quietly: the press goes in late once there is room */
+            if (down) {
+                set_bit(lnx, k->lost);
+            }
+            hid_key_name(lnx, name, sizeof(name));
+            keylog_add(hs, name, down, KEYLOG_FULL, 0);
+        }
+        return false;
     }
     for (i = 0; i < count; i++) {
         slot = (hs->head + hs->n) & QUEUE_MASK; hs->n++;
         hs->kbd.keycodes[slot] = scancodes[i];
     }
-    hs->event(hs);
+    if (k) {
+        k->queued += count;
+        if (down) {
+            set_bit(lnx, k->down);
+            clear_bit(lnx, k->lost);
+        } else {
+            clear_bit(lnx, k->down);
+        }
+        if (count) {
+            hid_key_name(lnx, name, sizeof(name));
+            keylog_add(hs, name, down, KEYLOG_WAIT, k->queued);
+        }
+    }
+    return true;
+}
+
+static void hid_keyboard_event(DeviceState *dev, QemuConsole *src,
+                               QemuInputEvent *evt)
+{
+    HIDState *hs = (HIDState *)dev;
+    unsigned int lnx = evt->key.key;
+    HIDKbdQueue *k = lnx < KEY_CNT ? hid_kbdq(hs, true) : NULL;
+    bool in = k && hid_kbdq_flush(hs, k);
+
+    if (hid_kbdq_event(hs, k, lnx, evt->key.down) || in) {
+        hs->event(hs);
+    }
 }
 
 static void hid_keyboard_process_keycode(HIDState *hs)
@@ -457,7 +622,19 @@ int hid_keyboard_poll(HIDState *hs, uint8_t *buf, int len)
         return 0;
     }
 
-    hid_keyboard_process_keycode(hs);
+    {
+        /* what the guest read, for the key log, and room for a waiting release */
+        int n0 = hs->n;
+        HIDKbdQueue *k;
+
+        hid_keyboard_process_keycode(hs);
+        k = hid_kbdq(hs, false);
+        if (k) {
+            k->taken += n0 - hs->n;
+            keylog_taken(hs, k->taken);
+            hid_kbdq_flush(hs, k);
+        }
+    }
 
     buf[0] = hs->kbd.modifiers & 0xff;
     buf[1] = 0;
@@ -503,6 +680,16 @@ void hid_reset(HIDState *hs)
         memset(hs->kbd.key, 0, sizeof(hs->kbd.key));
         hs->kbd.keys = 0;
         hs->kbd.modifiers = 0;
+        {
+            HIDKbdQueue *k = hid_kbdq(hs, false);
+            if (k) {
+                memset(k->down, 0, sizeof(k->down));
+                memset(k->release, 0, sizeof(k->release));
+                memset(k->lost, 0, sizeof(k->lost));
+                k->queued = k->taken = 0;
+                keylog_lost(hs);
+            }
+        }
         break;
     case HID_MOUSE:
     case HID_TABLET:

@@ -56,6 +56,7 @@ system_ss.add(png)
 system_ss.add(files(
   'input-barrier.c',
   'input.c',
+  'keylog.c',
   'ui-hmp-cmds.c',
   'ui-qmp-cmds.c',
   'util.c',
