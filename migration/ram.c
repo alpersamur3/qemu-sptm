@@ -28,10 +28,13 @@
 
 #include "qemu/osdep.h"
 #include "qemu/cutils.h"
+#include "qemu/units.h"
 #include "qemu/bitops.h"
 #include "qemu/bitmap.h"
 #include "qemu/madvise.h"
 #include "qemu/main-loop.h"
+#include "qemu/coroutine.h"
+#include "monitor/monitor.h"
 #include "xbzrle.h"
 #include "ram.h"
 #include "migration.h"
@@ -1192,6 +1195,114 @@ void migration_bitmap_sync_precopy(bool last_stage)
     }
 }
 
+/*
+ * release-ram in a savevm of a machine that will not run again
+ * (save_snapshot: it was not running when the save began): each page of guest
+ * RAM is freed once the stream has it, so the host's memory falls during the
+ * save. Without it a save reads every page back, and what the host had
+ * swapped out comes back at once: on Android, the low-memory killer took the
+ * app (and the save) with ~4 GB of vmstate written. Postcopy's release is
+ * madvise(DONTNEED), which does not free a shared memfd's pages (the guest's
+ * RAM here, mapped by other processes too): ram_block_discard_range punches
+ * the file, which frees them and their swap for every mapping.
+ */
+static struct {
+    bool on;
+    bool failed;                /* a discard failed: the rest of the save keeps its pages */
+    uint64_t released;          /* bytes */
+    RAMBlock *zero_block;       /* a run of zero pages waiting to be released */
+    uint64_t zero_start, zero_len;
+} savevm_release;
+
+/* A zero run is released at most this long: reading a hole allocates the page */
+#define SAVEVM_RELEASE_ZERO_RUN (16 * MiB)
+
+/*
+ * Whole pages of @rb's page size only: what the stream has written of them.
+ * What a failure reports goes to stderr, as outside a monitor: in HMP's
+ * savevm it would land in the command's reply, which a client takes for the
+ * save's error.
+ */
+static void savevm_release_range(RAMBlock *rb, uint64_t offset, uint64_t length)
+{
+    uint64_t start = ROUND_UP(offset, rb->page_size);
+    uint64_t end = ROUND_DOWN(offset + length, rb->page_size);
+    Monitor *mon;
+
+    if (savevm_release.failed || end <= start) {
+        return;
+    }
+    mon = monitor_set_cur(qemu_coroutine_self(), NULL);
+    if (ram_block_discard_range(rb, start, end - start)) {
+        warn_report("savevm: release-ram stops at %s+0x%" PRIx64
+                    ": the rest of the guest's RAM stays", rb->idstr, start);
+        savevm_release.failed = true;
+    } else {
+        savevm_release.released += end - start;
+    }
+    monitor_set_cur(qemu_coroutine_self(), mon);
+}
+
+/* QEMUFileReleaseRAM: guest RAM a flush has written, which may span blocks */
+static void savevm_release_written(void *host, size_t len)
+{
+    uint8_t *p = host;
+
+    RCU_READ_LOCK_GUARD();
+    while (len) {
+        ram_addr_t offset;
+        RAMBlock *rb = qemu_ram_block_from_host(p, false, &offset);
+        uint64_t n;
+
+        if (!rb || offset >= rb->used_length) {
+            return;
+        }
+        n = MIN(len, rb->used_length - offset);
+        savevm_release_range(rb, offset, n);
+        p += n;
+        len -= n;
+    }
+}
+
+static void savevm_release_zero_flush(void)
+{
+    if (savevm_release.zero_len) {
+        savevm_release_range(savevm_release.zero_block, savevm_release.zero_start,
+                             savevm_release.zero_len);
+        savevm_release.zero_len = 0;
+    }
+}
+
+/* A zero page is sent as a flag: its page can go now, in runs */
+static void savevm_release_zero(RAMBlock *rb, uint64_t offset)
+{
+    if (savevm_release.zero_len &&
+        (rb != savevm_release.zero_block ||
+         offset != savevm_release.zero_start + savevm_release.zero_len ||
+         savevm_release.zero_len >= SAVEVM_RELEASE_ZERO_RUN)) {
+        savevm_release_zero_flush();
+    }
+    if (!savevm_release.zero_len) {
+        savevm_release.zero_block = rb;
+        savevm_release.zero_start = offset;
+    }
+    savevm_release.zero_len += TARGET_PAGE_SIZE;
+}
+
+void ram_savevm_release_begin(QEMUFile *f)
+{
+    memset(&savevm_release, 0, sizeof(savevm_release));
+    savevm_release.on = true;
+    qemu_file_set_release_ram(f, savevm_release_written);
+}
+
+uint64_t ram_savevm_release_end(void)
+{
+    savevm_release_zero_flush();
+    savevm_release.on = false;
+    return savevm_release.released;
+}
+
 void ram_release_page(const char *rbname, uint64_t offset)
 {
     if (!migrate_release_ram() || !migration_in_postcopy()) {
@@ -1236,7 +1347,11 @@ static int save_zero_page(RAMState *rs, PageSearchStatus *pss,
     len += save_page_header(pss, file, pss->block, offset | RAM_SAVE_FLAG_ZERO);
     qemu_put_byte(file, 0);
     len += 1;
-    ram_release_page(pss->block->idstr, offset);
+    if (savevm_release.on) {
+        savevm_release_zero(pss->block, offset);
+    } else {
+        ram_release_page(pss->block->idstr, offset);
+    }
     ram_transferred_add(len);
 
     /*
@@ -1277,8 +1392,9 @@ static int save_normal_page(PageSearchStatus *pss, RAMBlock *block,
                                              offset | RAM_SAVE_FLAG_PAGE));
         if (async) {
             qemu_put_buffer_async(file, buf, TARGET_PAGE_SIZE,
-                                  migrate_release_ram() &&
-                                  migration_in_postcopy());
+                                  savevm_release.on ||
+                                  (migrate_release_ram() &&
+                                   migration_in_postcopy()));
         } else {
             qemu_put_buffer(file, buf, TARGET_PAGE_SIZE);
         }

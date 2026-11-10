@@ -58,6 +58,9 @@
 #include "block/snapshot.h"
 #include "block/thread-pool.h"
 #include "qemu/cutils.h"
+#include "qemu/units.h"
+#include "qemu/coroutine.h"
+#include "monitor/monitor.h"
 #include "io/channel-buffer.h"
 #include "io/channel-file.h"
 #include "system/replay.h"
@@ -3259,6 +3262,17 @@ bool qemu_loadvm_load_state_buffer(const char *idstr, uint32_t instance_id,
     return se->ops->load_state_buffer(se->opaque, buf, len, errp);
 }
 
+/*
+ * A save with release-ram freed guest RAM as it wrote it (ram.c): until a
+ * loadvm puts it back, the machine may not run (qmp_cont) or be saved again.
+ */
+static bool savevm_guest_ram_released;
+
+bool snapshot_guest_ram_released(void)
+{
+    return savevm_guest_ram_released;
+}
+
 bool save_snapshot(const char *name, bool overwrite, const char *vmstate,
                   bool has_devices, strList *devices, Error **errp)
 {
@@ -3268,9 +3282,16 @@ bool save_snapshot(const char *name, bool overwrite, const char *vmstate,
     QEMUFile *f;
     RunState saved_state = runstate_get();
     uint64_t vm_state_size;
+    bool release_ram;
     g_autoptr(GDateTime) now = g_date_time_new_now_local();
 
     GLOBAL_STATE_CODE();
+
+    if (savevm_guest_ram_released) {
+        error_setg(errp, "The guest's RAM was released by a save with "
+                   "release-ram: only a loadvm or quit can follow it");
+        return false;
+    }
 
     if (!migrate_can_snapshot(errp)) {
         return false;
@@ -3346,9 +3367,30 @@ bool save_snapshot(const char *name, bool overwrite, const char *vmstate,
         error_setg(errp, "Could not open VM state file");
         goto the_end;
     }
+    /*
+     * release-ram on a machine that was not running when the save began: it
+     * is saved to be ended (Android's Save and close), so each page of its RAM
+     * is freed once written. A save of a running machine resumes it and never
+     * releases.
+     */
+    release_ram = migrate_release_ram() && !runstate_is_live(saved_state);
+    if (release_ram) {
+        ram_savevm_release_begin(f);
+    }
     ret = qemu_savevm_state(f, errp);
     vm_state_size = qemu_file_transferred(f);
     ret2 = qemu_fclose(f);
+    if (release_ram) {
+        uint64_t released = ram_savevm_release_end();
+        /* on stderr: in HMP's savevm the line would be the reply, read as an error */
+        Monitor *mon = monitor_set_cur(qemu_coroutine_self(), NULL);
+
+        savevm_guest_ram_released = released != 0;
+        info_report("savevm: %" PRIu64 " MiB of guest RAM released as it was "
+                    "written (release-ram)%s", released / MiB,
+                    released ? ": the machine can be loaded or quit, not run" : "");
+        monitor_set_cur(qemu_coroutine_self(), mon);
+    }
     if (ret < 0) {
         goto the_end;
     }
@@ -3562,6 +3604,8 @@ bool load_snapshot(const char *name, const char *vmstate,
         return false;
     }
 
+    /* the loaded state has every page of RAM again */
+    savevm_guest_ram_released = false;
     load_snapshot_catch_up(&sn);
     return true;
 
