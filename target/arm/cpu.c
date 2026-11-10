@@ -2666,6 +2666,7 @@ static const TCGCPUOps arm_tcg_ops = {
 #ifndef CONFIG_USER_ONLY
     .try_native = native_el0_try,
     .native_kick = native_el0_kick,
+    .native_quiesce = native_el0_quiesce,
 #endif
     /* ARM processors have a weak memory model */
     .guest_default_memory_order = 0,

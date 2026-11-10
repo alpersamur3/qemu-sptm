@@ -594,6 +594,10 @@ void cpu_exec_step_atomic(CPUState *cpu)
         start_exclusive();
         g_assert(cpu == current_cpu);
         g_assert(!cpu->running);
+        if (cpu->cc->tcg_ops->native_quiesce) {
+            /* this one instruction must see no other guest code run */
+            cpu->cc->tcg_ops->native_quiesce();
+        }
         cpu->running = true;
 
         TCGTBCPUState s = cpu->cc->tcg_ops->get_tb_cpu_state(cpu);
@@ -836,6 +840,8 @@ static inline bool cpu_handle_exception(CPUState *cpu, int *ret)
 
     return false;
 }
+
+__thread bool tcg_kick_lazy;
 
 void tcg_kick_vcpu_thread(CPUState *cpu)
 {

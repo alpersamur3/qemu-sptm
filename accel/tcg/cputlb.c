@@ -368,11 +368,14 @@ static void flush_all_helper(CPUState *src, run_on_cpu_func fn,
 {
     CPUState *cpu;
 
+    /* a vCPU in native code flushes when it comes back: it does not use this TLB there */
+    tcg_kick_lazy = true;
     CPU_FOREACH(cpu) {
         if (cpu != src) {
             async_run_on_cpu(cpu, fn, d);
         }
     }
+    tcg_kick_lazy = false;
 }
 
 static void tlb_flush_by_mmuidx_async_work(CPUState *cpu, run_on_cpu_data data)

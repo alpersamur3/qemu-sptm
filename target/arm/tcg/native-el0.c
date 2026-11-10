@@ -44,6 +44,21 @@
  * Diagnostics: ASOFT_NATIVE_EL0_STATS=1, ASOFT_NATIVE_EL0_TRACE=<n> (first n
  * traps on stderr), ASOFT_EL_SAMPLER=<s> (1 kHz where-is-each-vCPU sampler,
  * reports every s seconds, works without the engine too).
+ * ASOFT_NATIVE_EL0_SWITCH=<file>: about once a second the sampler applies the
+ * "excl=0|1 around=N range-asid=0|1 spin-us=N wfe=0|1 stub-spin-us=N tpro=0|1
+ * spin-spare=N|auto pacga-local=0|1" tokens in that file, deletes it and
+ * prints one el-switch line; without ASOFT_EL_SAMPLER it is never read.
+ * tpro= (the TPRO pair rewrite in code pages filled from then on, see
+ * patched_at()) needs ASOFT_NATIVE_EL0_TPRO_SSBS not 0 at start; otherwise
+ * it is ignored.
+ * ASOFT_NATIVE_EL0_WFE=1 (stub mode): the spin before a futex wait (QEMU for a
+ * report, a stub thread for a command) waits with WFE instead of YIELD, and
+ * the side that stores what the other one waits for sends SEV after it.
+ * ASOFT_NATIVE_EL0_SPIN_SPARE=<n> (stub mode): at most n of those waits spin
+ * at once (0: none, a large n: all); unset: the CPUs this process may run on
+ * minus the vCPUs, looked at about once a second (see spin_take).
+ * ASOFT_NATIVE_EL0_PACGA_LOCAL=0 (stub mode, EL0 PAC off): a stub reports each
+ * PACGA to QEMU instead of emulating it in its trap handler (see is_pacga).
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -56,6 +71,15 @@
 #include "native-el0.h"
 
 bool native_el0_enabled;
+/* ASOFT_TLBI_RANGE_ASID=0: a range TLBI with an ASID is done as one for any ASID (tlb-insns.c) */
+bool native_el0_range_by_asid = true;
+
+/* on every host: tlb-insns.c uses it with or without the engine */
+static void __attribute__((constructor)) native_el0_range_setup(void)
+{
+    const char *e = getenv("ASOFT_TLBI_RANGE_ASID");
+    native_el0_range_by_asid = !e || *e != '0';
+}
 
 #ifndef CONFIG_USER_ONLY
 static int tlbi_filter = -1;
@@ -130,6 +154,7 @@ int native_el0_tlbi_scope(CPUState *cs, uint64_t va, uint16_t asid)
 #include "qemu/rcu.h"
 #include "qemu/int128.h"
 #include "accel/tcg/cpu-loop.h"
+#include "accel/tcg/cpu-ops.h"
 #include "exec/icount.h"
 #include "exec/translation-block.h"
 #include "exec/page-protection.h"
@@ -165,6 +190,8 @@ typedef struct NativeCtx {
     void *altbase;              /* ALT_SIZE-aligned; [0] holds this pointer */
     int in_guest;               /* guest state is live natively (or a stub runs it) */
     int kick_pending;
+    int urgent;                 /* a kick that cannot wait for the next trap came since the last entry */
+    int parked;                 /* stub mode: waiting for the stub, not "running" for exclusive sections */
     int tcg_until_el1;          /* something native cannot do: TCG until EL1 */
     int last_deny;              /* why the last try declined (DR_*), DR_N once it ran */
     uint64_t deny_t;            /* cntvct at that refusal, 0 once the next try saw it */
@@ -174,9 +201,11 @@ typedef struct NativeCtx {
     int stub;
     struct StubSlot *slot;
     int fill_pending;           /* handle_trap queued a fill in slot->fill */
+    int fill_pair;              /* mirror_fill: an exec fault's pc is the second word of a TPRO pair (-1: not known) */
     /* statistics */
     uint64_t enters, svcs, fills, fill_fails, faults, ills, emul_mrs, brks,
              kicks, unsupported;
+    uint64_t pacga;             /* PACGAs (their UDFs) emulated here, reported by the stub */
     /* time accounting, CNTVCT ticks: native = guest code running on the
      * CPU (stub mode: command posted to report received), handler = inside
      * the trap decision before going back natively or to TCG, entry =
@@ -186,6 +215,10 @@ typedef struct NativeCtx {
     /* heat: native_ticks when the stub was acquired; a TCG slice for want of one */
     uint64_t native_mark, deny_tick;
     uint16_t deny_asid;
+    /* stub mode: ticks in the spin part of stub_drive's waits, waits that
+     * ended while spinning, waits that went on to the futex, waits that got
+     * no spin token */
+    uint64_t spin_ticks, spin_hits, spin_sleeps, spin_none;
 } NativeCtx;
 
 static NativeCtx *ctx_by_index[MAX_CTX];
@@ -202,12 +235,30 @@ static uint64_t tpidrro_patched;
 static bool perm_fallback;  /* ASOFT_NATIVE_EL0_PERMFALLBACK=1 */
 static bool patch_log;      /* ASOFT_NATIVE_EL0_PATCHLOG=1: every rewritten word with its neighbours */
 static int nstubs;          /* ASOFT_NATIVE_EL0_STUBS=N: stub mode when > 0 */
-static uint64_t stub_spin_ticks;    /* ASOFT_NATIVE_EL0_STUB_SPIN_US: a stub thread spins this long for a command */
+static uint64_t stub_spin_ticks;    /* ASOFT_NATIVE_EL0_STUB_SPIN_US: a stub thread spins this long for a command (copied to shm) */
+static bool wait_wfe_env;           /* ASOFT_NATIVE_EL0_WFE: see the top (copied to shm) */
 static uint64_t qemu_spin_ticks;    /* ASOFT_NATIVE_EL0_SPIN_US: a vCPU thread spins this long for a report */
 static cpu_set_t stub_cpuset;       /* ASOFT_NATIVE_EL0_STUB_CPUS=a,b,...: pin stub threads */
 static bool stub_cpuset_on;
 static bool tlbi_all_stubs;         /* ASOFT_NATIVE_EL0_TLBI_ASID=0: page TLBIs go to every bound stub, not by ASID */
 static bool lazy_inval;             /* idle stubs apply at the next entry; ASOFT_NATIVE_EL0_LAZY_INVAL=0: at once, waited for */
+/*
+ * While a stub runs the guest's EL0 code, its vCPU thread touches nothing of
+ * TCG's: it does not count as running (cpu_exec_end/cpu_exec_start around
+ * the wait), so an exclusive section of another vCPU (every broadcast TLB
+ * flush is one) neither waits for it nor pulls it out of native code, and a
+ * flush of its own softmmu TLB is queued without a kick: it runs when the
+ * vCPU next leaves native code, before any translated code.
+ * ASOFT_NATIVE_EL0_EXCL=0: as before, native code stops for every section.
+ */
+static bool excl_free = true;
+static uint64_t lazy_kicks;
+/* ASOFT_NATIVE_EL0_FILL_AROUND; off by default: measured slower on the S25 (2026-11-10).
+ * The switch file's around= can raise it only when it was on at start (mapped_bits). */
+static int fill_around = 0;
+static int around_max;              /* what the switch file may set fill_around to: 0 without mapped_bits */
+static uint8_t *mapped_bits;        /* MAPPED_BYTES per stub, shared */
+static uint64_t around_sent;
 static int tlbi_log_left;           /* ASOFT_NATIVE_EL0_TLBI_LOG=N: describe the first N page TLBIs */
 static uint64_t tlbi_asid_hits, tlbi_asid_misses;
 static int asid_watch_init;
@@ -215,6 +266,7 @@ static bool asid_watch_on;
 static bool evict_heat;             /* ASOFT_NATIVE_EL0_EVICT=heat[-admit]: see stub_acquire */
 static bool evict_admit;
 static const char *off_file;        /* ASOFT_NATIVE_EL0_OFF_FILE: while this file exists, EL0 stays in TCG (needs the sampler) */
+static const char *switch_file;     /* ASOFT_NATIVE_EL0_SWITCH: see the top (needs the sampler) */
 static int native_off;
 static bool patch_xo;              /* ASOFT_NATIVE_EL0_PATCH_XO=N: rewritten code pages are execute-only */
 static int xo_log_left;
@@ -397,6 +449,24 @@ static inline void spin_relax(void)
     __asm__ volatile("yield" ::: "memory");
 }
 
+/* one step of a bounded spin: WFE returns on an SEV, an exception return or
+ * the timer's event stream, so the caller still checks its time limit */
+static inline void wait_relax(bool wfe)
+{
+    if (wfe) {
+        __asm__ volatile("wfe" ::: "memory");
+    } else {
+        __asm__ volatile("yield" ::: "memory");
+    }
+}
+
+/* after the store a WFE waiter looks for: the DSB makes the store visible
+ * before the event reaches the other core */
+static inline void wait_signal(void)
+{
+    __asm__ volatile("dsb ishst\n\tsev" ::: "memory");
+}
+
 static inline long futex(void *addr, int op, uint32_t val, const struct timespec *ts)
 {
     return syscall(SYS_futex, addr, op, val, ts, NULL, 0);
@@ -422,6 +492,19 @@ typedef struct StubFill {
     int32_t pad;
 } StubFill;
 
+/*
+ * Fill-around (ASOFT_NATIVE_EL0_FILL_AROUND=N pages on each side, 0: off).
+ * A fault costs a round trip through QEMU; an address space that just got a
+ * stub (the pool is smaller than iOS 26's set of busy processes) takes
+ * hundreds of them for pages its page table already holds. So a fill also
+ * brings the 16 KiB pages around the faulting one that the guest's table
+ * maps for a read right now, as they are there: looked at without setting an
+ * access flag or a dirty state, and only those the stub does not hold yet
+ * (mapped[], one bit per page of the window, kept by the stub and read here).
+ */
+#define FILL_EXTRA      16
+#define MAPPED_BYTES    ((WIN_HI - WIN_LO) / 0x4000 / 8)
+
 /* one per (stub, vCPU) */
 typedef struct StubSlot {
     uint32_t cmd;               /* futex, QEMU -> stub thread */
@@ -436,6 +519,9 @@ typedef struct StubSlot {
     uint64_t fault_addr;
     uint64_t tpidr;             /* guest TPIDR_EL0: in on entry, out on a trap */
     StubFill fill;
+    uint32_t nextra;            /* neighbours of fill: see FILL_EXTRA */
+    uint32_t extra_pad;
+    StubFill extra[FILL_EXTRA];
     ucontext_t uc __attribute__((aligned(16)));     /* the guest register frame */
 } StubSlot;
 
@@ -448,6 +534,10 @@ typedef struct StubCtl {
     uint64_t inval_seq;         /* last range appended (QEMU) */
     uint64_t inval_applied;     /* last range applied (stub), in order */
     uint64_t fill_ticks, fills, patch_fills, apply_ticks;   /* stub-side cost (statistics) */
+    uint64_t around_fills;      /* neighbours mapped along with a fill */
+    uint64_t spin_ticks, spin_hits, spin_sleeps;    /* stub_wait_cmd: spin time, waits ended spinning / in the futex */
+    uint64_t spin_none;         /* stub_wait_cmd: waits that got no spin token */
+    uint64_t pacga_emul;        /* PACGAs emulated in the stub's trap handler, QEMU not told */
     struct { uint64_t lo, hi; } inval[INVAL_RING];
 } StubCtl;
 
@@ -457,11 +547,75 @@ typedef struct StubShm {
     int32_t ram_fd[8];          /* guest RAM fds as the factory (and so the stubs) sees them */
     int32_t nram;
     uint32_t host_counter;      /* set by QEMU once the CPU property is known */
+    uint32_t wait_wfe;          /* spins wait with WFE, stores that end a wait send SEV */
+    uint64_t stub_spin_ticks;   /* a stub thread spins this long for a command */
+    uint32_t tpro_ssbs;         /* tpro_ssbs for the private code copies a stub builds */
+    uint32_t spin_spare;        /* how many waits may spin at the same time (spin_take) */
+    uint32_t spinners;          /* how many do right now */
+    uint32_t pacga_local;       /* stubs emulate PACGA themselves (stub_trap_handler) */
     StubCtl ctl[STUB_MAX];
     StubSlot slot[STUB_MAX][STUB_VCPUS];
 } StubShm;
 
 static StubShm *shm;
+
+/*
+ * Spin tokens (stub mode): a wait (a vCPU thread for its stub's report, a
+ * stub thread for a command) spins only while a core is to spare. Android
+ * confines the app to 4 cores while the phone sleeps; 4 vCPUs there with
+ * spinning waits burned 2.1 of the 4 cores and an iOS boot took 396 s
+ * against 267 s with no spins at all (Galaxy S25 Ultra, 2026-11-10).
+ * Automatic: the CPUs a vCPU thread may run on minus the vCPUs, looked at
+ * about once a second from stub_drive (cpuset moves show in the affinity);
+ * with two cores or more per vCPU (the app on top: 8) no limit, as before.
+ */
+#define SPARE_ALL       1000000
+static int spare_fixed = -1;        /* ASOFT_NATIVE_EL0_SPIN_SPARE / switch file spin-spare=: -1 automatic */
+static uint64_t spare_next;         /* cntvct of the next automatic look */
+static int cpus_allowed;            /* what the last look found */
+static int spare_shown = -1;        /* CPUs allowed in the last line printed */
+
+/* false: no core to spare, check and go to the futex at once */
+static inline bool spin_take(void)
+{
+    if (qatomic_fetch_inc(&shm->spinners) < qatomic_read(&shm->spin_spare)) {
+        return true;
+    }
+    qatomic_dec(&shm->spinners);
+    return false;
+}
+
+static inline void spin_give(void)
+{
+    qatomic_dec(&shm->spinners);
+}
+
+/* on a vCPU thread, once the tick @now reached spare_next: one thread looks */
+static void spare_refresh(uint64_t now)
+{
+    uint64_t next = qatomic_read(&spare_next);
+    if (now < next || qatomic_cmpxchg(&spare_next, next, now + cntfrq) != next) {
+        return;
+    }
+    cpu_set_t set;
+    if (sched_getaffinity(0, sizeof(set), &set) != 0) {
+        return;
+    }
+    int a = CPU_COUNT(&set), v = qatomic_read(&shm->nvcpus);
+    int k = a >= 2 * v ? SPARE_ALL : a > v ? a - v : 0;
+    int fixed = qatomic_read(&spare_fixed);
+    qatomic_set(&cpus_allowed, a);
+    /* a fixed count too: a switch racing with this look is put right within a second */
+    qatomic_set(&shm->spin_spare, fixed >= 0 ? fixed : k);
+    if (fixed < 0 && a != spare_shown) {
+        spare_shown = a;
+        if (k == SPARE_ALL) {
+            fprintf(stderr, "native-el0: %d CPUs allowed, %d vCPUs: every wait may spin\n", a, v);
+        } else {
+            fprintf(stderr, "native-el0: %d CPUs allowed, %d vCPUs: %d waits may spin at once\n", a, v, k);
+        }
+    }
+}
 static pid_t factory_pid;
 static int fac_sock = -1;       /* QEMU's end of the fd-passing socket */
 static int ram_fd_q[8];         /* QEMU-side fd numbers, same index as shm->ram_fd */
@@ -487,6 +641,11 @@ static uint64_t el0tcg_reason[DR_N + 1];    /* sampler: EL0-TCG samples by the p
 static uint64_t el0tcg_pc[5];       /* sampler: EL0-TCG samples by pc region */
 enum { MK_TPRO_W, MK_TPRO_R, MK_TPIDRRO, MK_CNT, MK_ACNT, MK_N };
 static uint64_t mrs_kind[MK_N];     /* emulated MRS/MSR by register */
+static bool tpro_carry = true;      /* PSTATE.SSBS carries the TPRO bit (fixed at start): see patched_at() */
+static bool tpro_ssbs = true;       /* new code pages get the TPRO pair rewritten (switch file: tpro=) */
+static uint64_t tpro_pairs, tpro_lone, ssbs_guest_words;    /* in new code cache pages */
+static uint64_t tpro_rewinds;       /* threads set back to the first word of a TPRO pair */
+static int tpro_log_left;
 #define TPRO_SITES 256
 static uint64_t tpro_site_pc[TPRO_SITES];
 static uint64_t tpro_site_n[TPRO_SITES];
@@ -511,7 +670,7 @@ static uint64_t tlbi_kind[TL_KINDS];
 static void stats_report(void)
 {
     uint64_t enters = 0, svcs = 0, fills = 0, fill_fails = 0, faults = 0,
-             ills = 0, emul = 0, brks = 0, kicks = 0, unsup = 0;
+             ills = 0, emul = 0, brks = 0, kicks = 0, unsup = 0, pacga = 0, pacga_stub = 0;
     for (int i = 0; i < MAX_CTX; i++) {
         NativeCtx *nc = ctx_by_index[i];
         if (!nc) {
@@ -520,14 +679,18 @@ static void stats_report(void)
         enters += nc->enters; svcs += nc->svcs; fills += nc->fills;
         fill_fails += nc->fill_fails; faults += nc->faults; ills += nc->ills;
         emul += nc->emul_mrs; brks += nc->brks; kicks += nc->kicks;
-        unsup += nc->unsupported;
+        unsup += nc->unsupported; pacga += nc->pacga;
+    }
+    for (int s = 0; stub_mode && s < nstubs; s++) {
+        pacga_stub += qatomic_read(&shm->ctl[s].pacga_emul);
     }
     fprintf(stderr, "native-el0: enters %" PRIu64 " svc %" PRIu64
             " fills %" PRIu64 " (failed %" PRIu64 ") faults-injected %" PRIu64
             " undef %" PRIu64 " mrs-emulated %" PRIu64 " brk %" PRIu64
-            " kicks %" PRIu64 " unsupported %" PRIu64 " tpidrro-patched %" PRIu64 "\n",
+            " kicks %" PRIu64 " unsupported %" PRIu64 " tpidrro-patched %" PRIu64
+            " pacga-emulated %" PRIu64 " (in stubs %" PRIu64 ")\n",
             enters, svcs, fills, fill_fails, faults, ills, emul, brks, kicks,
-            unsup, tpidrro_patched);
+            unsup, tpidrro_patched, pacga, pacga_stub);
     if (stub_mode) {
         int bound = 0;
         for (int i = 0; i < nstubs; i++) {
@@ -654,13 +817,94 @@ static void prof_drain(void)
     }
 }
 
+/*
+ * The sampler, about once a second: if the switch file exists, apply its
+ * key=value tokens (unknown ones are ignored), delete it and print what is
+ * now in force. Plain stores: every reader picks the new value up at its
+ * next look (stub_drive latches excl_free once per round trip).
+ */
+static void switch_poll(int64_t t0)
+{
+    char buf[256];
+    int fd = open(switch_file, O_RDONLY);
+    if (fd < 0) {
+        return;
+    }
+    ssize_t n = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    unlink(switch_file);
+    buf[n > 0 ? n : 0] = 0;
+    char *save = NULL;
+    for (char *tok = strtok_r(buf, " \t\r\n", &save); tok; tok = strtok_r(NULL, " \t\r\n", &save)) {
+        char *val = strchr(tok, '='), *end;
+        if (!val) {
+            continue;
+        }
+        *val++ = 0;
+        if (!strcmp(tok, "spin-spare") && !strcmp(val, "auto")) {
+            qatomic_set(&spare_fixed, -1);
+            spare_shown = -1;
+            qatomic_set(&spare_next, 0);    /* the next wait looks at the CPUs */
+            continue;
+        }
+        long v = strtol(val, &end, 10);
+        if (end == val) {
+            continue;
+        }
+        if (!strcmp(tok, "excl")) {
+            excl_free = v != 0;
+        } else if (!strcmp(tok, "around")) {
+            fill_around = v < 0 ? 0 : v > around_max ? around_max : v;
+        } else if (!strcmp(tok, "range-asid")) {
+            native_el0_range_by_asid = v != 0;
+        } else if (!strcmp(tok, "spin-us")) {
+            qemu_spin_ticks = (uint64_t)(v < 0 ? 0 : v > 100000 ? 100000 : v) * cntfrq / 1000000;
+        } else if (!strcmp(tok, "wfe")) {
+            if (shm) {
+                qatomic_set(&shm->wait_wfe, v != 0);
+            }
+        } else if (!strcmp(tok, "stub-spin-us")) {
+            if (shm) {
+                qatomic_set(&shm->stub_spin_ticks,
+                            (uint64_t)(v < 0 ? 0 : v > 100000 ? 100000 : v) * cntfrq / 1000000);
+            }
+        } else if (!strcmp(tok, "tpro")) {
+            /* SSBS keeps carrying the bit, so pages rewritten before stay right */
+            if (tpro_carry && (v != 0) != tpro_ssbs) {
+                tpro_ssbs = v != 0;
+                if (shm) {
+                    qatomic_set(&shm->tpro_ssbs, tpro_ssbs);
+                }
+                native_el0_tlbi_all();      /* code pages refill in the new shape */
+            }
+        } else if (!strcmp(tok, "spin-spare")) {
+            qatomic_set(&spare_fixed, v < 0 ? 0 : v > 1000000 ? 1000000 : v);
+            if (shm) {
+                qatomic_set(&shm->spin_spare, spare_fixed);
+            }
+        } else if (!strcmp(tok, "pacga-local")) {
+            if (shm) {
+                qatomic_set(&shm->pacga_local, v != 0);
+            }
+        }
+    }
+    uint64_t sst = shm ? qatomic_read(&shm->stub_spin_ticks) : stub_spin_ticks;
+    fprintf(stderr, "el-switch t=%" PRId64 "s: excl=%d around=%d range-asid=%d spin-us=%" PRIu64
+            " wfe=%u stub-spin-us=%" PRIu64 " tpro=%d spin-spare=%s%u pacga-local=%u\n",
+            (mono_ns() - t0) / 1000000000, excl_free, fill_around, native_el0_range_by_asid,
+            (qemu_spin_ticks * 1000000 + cntfrq / 2) / cntfrq,
+            shm ? qatomic_read(&shm->wait_wfe) : 0, (sst * 1000000 + cntfrq / 2) / cntfrq, tpro_ssbs,
+            spare_fixed < 0 ? "auto:" : "", shm ? qatomic_read(&shm->spin_spare) : 0,
+            shm ? qatomic_read(&shm->pacga_local) : 0);
+}
+
 /* 1 kHz sampler: where is each vCPU? halted (WFI), EL1 (XNU), EL0 under TCG,
  * EL0 natively. Reads env->pstate and cs->halted from another thread: a
  * sample may be off by one TB, which the 1 ms grain does not notice. */
 static void *sampler_main(void *arg)
 {
     struct el_samples last[MAX_CTX] = { 0 };
-    uint64_t lnat = 0, lhand = 0, lent = 0, lenter = 0, lfill = 0, lsteal = 0, lmrs = 0;
+    uint64_t lnat = 0, lhand = 0, lent = 0, lenter = 0, lfill = 0, lsteal = 0, lmrs = 0, lpq = 0, lps = 0;
     rcu_register_thread();
     sleep(1);
     int64_t t0 = mono_ns();
@@ -671,6 +915,9 @@ static void *sampler_main(void *arg)
         off_tick++;
         if (off_file && off_tick % 500 == 0) {
             qatomic_set(&native_off, access(off_file, F_OK) == 0);
+        }
+        if (switch_file && off_tick % 1000 == 0) {
+            switch_poll(t0);
         }
         if (prof_dir && off_tick % 4096 == 0) {
             prof_drain();
@@ -716,7 +963,7 @@ static void *sampler_main(void *arg)
         }
         next += sampler_period * 1000000000LL;
         struct el_samples tot = { 0 };
-        uint64_t nat = 0, hand = 0, ent = 0, enters = 0, fills = 0, mrs = 0;
+        uint64_t nat = 0, hand = 0, ent = 0, enters = 0, fills = 0, mrs = 0, pq = 0, ps = 0;
         for (int i = 0; i < MAX_CTX; i++) {
             struct el_samples d = { samples[i].halted - last[i].halted,
                                     samples[i].el1 - last[i].el1,
@@ -735,20 +982,23 @@ static void *sampler_main(void *arg)
             NativeCtx *nc = ctx_by_index[i];
             if (nc) {
                 nat += nc->native_ticks; hand += nc->handler_ticks; ent += nc->entry_ticks;
-                enters += nc->enters; fills += nc->fills; mrs += nc->emul_mrs;
+                enters += nc->enters; fills += nc->fills; mrs += nc->emul_mrs; pq += nc->pacga;
             }
+        }
+        for (int s = 0; stub_mode && s < nstubs; s++) {
+            ps += qatomic_read(&shm->ctl[s].pacga_emul);
         }
         uint64_t n = tot.halted + tot.el1 + tot.el0_tcg + tot.el0_nat;
         if (n) {
             uint64_t steals = stub_mode ? stub_evictions : slot.steals;
             fprintf(stderr, "el-sample t=%" PRId64 "s all: halted %4.1f%% el1 %4.1f%% el0-tcg %4.1f%% el0-nat %4.1f%%"
                     " | native %" PRIu64 " ms handler %" PRIu64 " ms entry %" PRIu64 " ms enters %" PRIu64
-                    " fills %" PRIu64 " mrs %" PRIu64 " %s %" PRIu64 "\n",
+                    " fills %" PRIu64 " mrs %" PRIu64 " %s %" PRIu64 " pacga qemu %" PRIu64 " stubs %" PRIu64 "\n",
                     (now - t0) / 1000000000LL, 100.0 * tot.halted / n, 100.0 * tot.el1 / n,
                     100.0 * tot.el0_tcg / n, 100.0 * tot.el0_nat / n,
                     ticks_ms(nat - lnat), ticks_ms(hand - lhand), ticks_ms(ent - lent),
                     enters - lenter, fills - lfill, mrs - lmrs,
-                    stub_mode ? "evictions" : "steals", steals - lsteal);
+                    stub_mode ? "evictions" : "steals", steals - lsteal, pq - lpq, ps - lps);
             lsteal = steals;
             {
                 static uint64_t lr[DR_N + 1], lt[DR_N], lp[5], lm[MK_N];
@@ -803,19 +1053,52 @@ static void *sampler_main(void *arg)
                         tlbi_scope_n[TLBI_SCOPE_SELF], tlbi_scope_n[TLBI_SCOPE_NONE]);
             }
             if (stub_mode) {
-                uint64_t ft = 0, fn = 0, fp = 0, at = 0;
+                uint64_t ft = 0, fn = 0, fp = 0, at = 0, fa = 0;
                 for (int s = 0; s < nstubs; s++) {
                     ft += qatomic_read(&shm->ctl[s].fill_ticks);
                     fn += qatomic_read(&shm->ctl[s].fills);
                     fp += qatomic_read(&shm->ctl[s].patch_fills);
+                    fa += qatomic_read(&shm->ctl[s].around_fills);
                     at += qatomic_read(&shm->ctl[s].apply_ticks);
                 }
                 fprintf(stderr, "el-sample t=%" PRId64 "s stub-side: fill %" PRIu64 " ms for %" PRIu64
                         " fills (%" PRIu64 " code copies), invalidation %" PRIu64 " ms (totals)"
                         " xo-reads %" PRIu64 " hits %" PRIu64 " | code pages: clean %" PRIu64 " cached %" PRIu64
-                        " new %" PRIu64 " changed %" PRIu64 " private %" PRIu64 " slots %u\n",
+                        " new %" PRIu64 " changed %" PRIu64 " private %" PRIu64 " slots %u"
+                        " | tpro reads paired/lone %" PRIu64 "/%" PRIu64 " guest ssbs words %" PRIu64 "%s"
+                        " rewinds %" PRIu64 "\n",
                         (now - t0) / 1000000000LL, ticks_ms(ft), fn, fp, ticks_ms(at), xo_reads, xo_hits,
-                        cc_clean, cc_hits, cc_misses, cc_stale, cc_none, cc_next);
+                        cc_clean, cc_hits, cc_misses, cc_stale, cc_none, cc_next,
+                        tpro_pairs, tpro_lone, ssbs_guest_words, tpro_ssbs ? "" : " (off)", tpro_rewinds);
+                fprintf(stderr, "el-sample t=%" PRId64 "s exclusive: native vCPUs %s, kicks left for the next trap %" PRIu64
+                        " | fill-around %d: neighbours sent %" PRIu64 " mapped %" PRIu64 " (totals)\n",
+                        (now - t0) / 1000000000LL, excl_free ? "stay out" : "stop (off)", qatomic_read(&lazy_kicks),
+                        fill_around, around_sent, fa);
+                {
+                    uint64_t qt = 0, qh = 0, qs = 0, qn = 0, st = 0, sh = 0, ss = 0, sn = 0;
+                    for (int i = 0; i < MAX_CTX; i++) {
+                        NativeCtx *nc = ctx_by_index[i];
+                        if (nc) {
+                            qt += nc->spin_ticks; qh += nc->spin_hits; qs += nc->spin_sleeps;
+                            qn += nc->spin_none;
+                        }
+                    }
+                    for (int s = 0; s < nstubs; s++) {
+                        st += qatomic_read(&shm->ctl[s].spin_ticks);
+                        sh += qatomic_read(&shm->ctl[s].spin_hits);
+                        ss += qatomic_read(&shm->ctl[s].spin_sleeps);
+                        sn += qatomic_read(&shm->ctl[s].spin_none);
+                    }
+                    uint64_t sst = qatomic_read(&shm->stub_spin_ticks);
+                    fprintf(stderr, "el-sample t=%" PRId64 "s waits: qemu spin %" PRIu64 " ms hits %" PRIu64
+                            " sleeps %" PRIu64 " | stub spin %" PRIu64 " ms hits %" PRIu64 " sleeps %" PRIu64
+                            " | wfe=%u spin-us=%" PRIu64 " stub-spin-us=%" PRIu64
+                            " | spin-spare %s%u, %d CPUs allowed, no token qemu %" PRIu64 " stub %" PRIu64 "\n",
+                            (int64_t)((now - t0) / 1000000000LL), ticks_ms(qt), qh, qs, ticks_ms(st), sh, ss,
+                            qatomic_read(&shm->wait_wfe), (qemu_spin_ticks * 1000000 + cntfrq / 2) / cntfrq,
+                            (sst * 1000000 + cntfrq / 2) / cntfrq, spare_fixed < 0 ? "auto:" : "",
+                            qatomic_read(&shm->spin_spare), qatomic_read(&cpus_allowed), qn, sn);
+                }
                 fprintf(stderr, "el-sample t=%" PRId64 "s stubs: waits %" PRIu64 " slow %" PRIu64
                         " timeouts %" PRIu64 " spawned %" PRIu64 " tlbi-asid hit %" PRIu64 " miss %" PRIu64
                         " asid-max %d root-changes %" PRIu64 " concurrent %" PRIu64 " denials %" PRIu64
@@ -830,7 +1113,7 @@ static void *sampler_main(void *arg)
                         deny_reason[DR_DELAY], deny_reason[DR_WINDOW], deny_reason[DR_READY]);
             }
         }
-        lnat = nat; lhand = hand; lent = ent; lenter = enters; lfill = fills; lmrs = mrs;
+        lnat = nat; lhand = hand; lent = ent; lenter = enters; lfill = fills; lmrs = mrs; lpq = pq; lps = ps;
     }
     return arg;
 }
@@ -842,6 +1125,7 @@ static void sampler_start(void)
     prof_dir = getenv("ASOFT_PC_SAMPLER");
     e = getenv("ASOFT_WHO");
     who_on = sampler_period > 0 && e && *e == '1';
+    switch_file = getenv("ASOFT_NATIVE_EL0_SWITCH");
 }
 
 static int sampler_launched;
@@ -909,6 +1193,10 @@ static void __attribute__((constructor)) native_el0_setup(void)
     delay_ns = e ? atoll(e) * 1000000LL : 0;
     e = getenv("ASOFT_NATIVE_EL0_PERMFALLBACK");
     perm_fallback = e && *e && *e != '0';
+    e = getenv("ASOFT_NATIVE_EL0_TPRO_SSBS");
+    tpro_carry = tpro_ssbs = !e || *e != '0';
+    e = getenv("ASOFT_NATIVE_EL0_TPRO_LOG");
+    tpro_log_left = e ? atoi(e) : 0;
     e = getenv("ASOFT_NATIVE_EL0_PATCHLOG");
     patch_log = e && *e && *e != '0';
     e = getenv("ASOFT_NATIVE_EL0_STEAL_MS");
@@ -919,6 +1207,12 @@ static void __attribute__((constructor)) native_el0_setup(void)
     nstubs = e ? atoi(e) : 0;
     e = getenv("ASOFT_NATIVE_EL0_STUB_SPIN_US");
     stub_spin_ticks = (e ? atoll(e) : 300) * cntfrq / 1000000;
+    e = getenv("ASOFT_NATIVE_EL0_WFE");
+    wait_wfe_env = e && *e && *e != '0';
+    e = getenv("ASOFT_NATIVE_EL0_SPIN_SPARE");
+    if (e && *e >= '0' && *e <= '9') {
+        spare_fixed = MIN(atoi(e), 1000000);
+    }
     e = getenv("ASOFT_NATIVE_EL0_SPIN_US");
     qemu_spin_ticks = (e ? atoll(e) : 100) * cntfrq / 1000000;
     e = getenv("ASOFT_NATIVE_EL0_TLBI_LOG");
@@ -928,6 +1222,15 @@ static void __attribute__((constructor)) native_el0_setup(void)
     asid_watch_on = asid_watch_init > 0;
     e = getenv("ASOFT_NATIVE_EL0_LAZY_INVAL");
     lazy_inval = !e || !*e || *e != '0';
+    e = getenv("ASOFT_NATIVE_EL0_FILL_AROUND");
+    if (e) {
+        fill_around = atoi(e);
+        if (fill_around < 0 || fill_around > FILL_EXTRA / 2) {
+            fill_around = FILL_EXTRA / 2;
+        }
+    }
+    e = getenv("ASOFT_NATIVE_EL0_EXCL");
+    excl_free = !e || *e != '0';
     e = getenv("ASOFT_NATIVE_EL0_TLBI_ASID");
     tlbi_all_stubs = e && *e == '0';
     off_file = getenv("ASOFT_NATIVE_EL0_OFF_FILE");
@@ -1146,12 +1449,26 @@ static inline uint64_t pauth_pacga_off(uint64_t x, uint64_t y)
  * it MACs with the host's GA key here and the guest's under TCG, and libobjc
  * checks a class cache's PACGA (cache_t::maybeConvertToPreoptimized, brk #1).
  * Both sides compute pacga_off() instead, its low 32 bits zero as PACGA's are
- * (libobjc folds both halves): TCG's helper, and here a UDF in place of each
- * PACGA that the SIGILL handler emulates.
+ * (libobjc folds both halves): TCG's helper, and here an undefined word in
+ * place of each PACGA that the SIGILL handler emulates. The word carries the
+ * operands, PACGA_UDF | rm << 10 | rn << 5 | rd, so a stub emulates it in its
+ * own trap handler (ASOFT_NATIVE_EL0_PACGA_LOCAL=0: it reports it to QEMU, which
+ * decodes the guest's original word).
  */
 static inline bool is_pacga(uint32_t w)
 {
     return (w & 0xffe0fc00u) == 0x9ac03000u;
+}
+
+/*
+ * The word patched_word() puts in place of a PACGA: undefined like a UDF, but
+ * from the unallocated words next to it (bit 31 and bits 28:25 zero, bits
+ * 24:16 not), so that a udf #imm of the guest's own is never taken for one.
+ */
+#define PACGA_UDF       0x00a58000u
+static inline bool is_pacga_udf(uint32_t w)
+{
+    return (w & 0xffff8000u) == PACGA_UDF;
 }
 
 static inline bool host_counter_on(void)
@@ -1167,6 +1484,111 @@ static inline bool tpro_const_on(void)
         tpro_const = e && *e == '1';    /* off: launchd aborts with the constant (a TPRO state check), 2026-11-05 */
     }
     return tpro_const;
+}
+
+/*
+ * TPRO reads without a trap (ASOFT_NATIVE_EL0_TPRO_SSBS=0 turns it off).
+ * libsystem asks "may this thread write TPRO memory" with
+ *     mrs Xt, SPRR_UPERM_EL0 ; tb(n)z Xt, #36, ...
+ * tens of thousands of times a second, and every one was a SIGILL round trip
+ * through the stub. The answer is one bit of per-thread state, so a bit of
+ * the host's own PSTATE carries it: SSBS, which EL0 reads natively, which the
+ * kernel keeps per thread across switches and signals, and which nothing of
+ * the guest's EL0 code depends on (it only steers speculation). The pair
+ * becomes
+ *     mrs Xt, SSBS ; tb(n)z Xt, #12, ...   (the branch's sense inverted)
+ * The entry frame's SSBS is the INVERSE of bit 36 of the guest's register:
+ * with PSTATE.SSBS clear the host CPU stops speculating past stores (measured
+ * on the Snapdragon 8 Elite: plain code 1.0-1.3x slower, 2.9x in the worst
+ * loop), and a thread keeps TPRO memory read-only nearly all the time, so
+ * that state must be SSBS set, Linux's own default. Only the short writable
+ * windows run with it clear.
+ * The emulated MSR (a rare trap) updates both, and the guest's own
+ * PSTATE.SSBS stays in TCG's state untouched. A read in any other shape
+ * still traps and is emulated.
+ * Two flags: tpro_carry (fixed at start) keeps SSBS carrying the bit and the
+ * guest's own SSBS words neutralised; tpro_ssbs only says whether code pages
+ * filled from now on get the pair rewritten. The switch file flips the second
+ * one alone, so pages rewritten before keep working.
+ * A thread stopped on the second word holds the first word's answer in one
+ * style (TCG and the trap: the whole register; the rewrite: 0 or 0x1000),
+ * and what runs the second word next may be the other style (TCG, or a page
+ * refilled meanwhile). So wherever the engine holds such a thread (an exit to
+ * TCG, an instruction abort, an exec fill of its page) it sets pc back to the
+ * first word, a plain register read (tpro_pair_rewind). Not covered: TCG
+ * ending a translation block between the two words and the engine entering
+ * natively at the second; only the 512-instruction limit splits there.
+ */
+#define TPRO_W_BIT      (1ULL << 36)
+
+static inline bool is_tpro_mrs(uint32_t w)
+{
+    return (w & 0xffffffe0u) == 0xd53ef1a0u;
+}
+
+/* tbz or tbnz Xrt, #36, label */
+static inline bool is_tb_bit36(uint32_t w, uint32_t rt)
+{
+    return (w & 0xfef8001fu) == (0xb6200000u | rt);
+}
+
+/* is @pc the second word of a TPRO pair? @w: the guest's own words at @pc - 4 and @pc */
+static inline bool tpro_pair_second(uint64_t pc, const uint32_t *w)
+{
+    return tpro_carry && (pc & 0x3fff) && is_tpro_mrs(w[0]) && is_tb_bit36(w[1], w[0] & 31);
+}
+
+/* the guest's own accesses to PSTATE.SSBS: msr SSBS, #imm and mrs Xt, SSBS */
+static inline bool is_ssbs_msr(uint32_t w)
+{
+    return (w & 0xfffff0ffu) == 0xd503403fu;
+}
+
+static inline bool is_ssbs_mrs(uint32_t w)
+{
+    return (w & 0xffffffe0u) == 0xd53b42c0u;
+}
+
+static inline bool is_patch_word(uint32_t w);
+static inline uint32_t patched_word(uint32_t w);
+
+/* tpro_ssbs as the stubs see it too: they build private code copies themselves */
+static inline bool tpro_pair_on(void)
+{
+    return shm ? qatomic_read(&shm->tpro_ssbs) != 0 : tpro_ssbs;
+}
+
+/*
+ * The rewrite of a code word (the word itself when it stays). @i: its index
+ * from a guest page boundary; @prev, @next: its neighbours as the guest wrote
+ * them. A TPRO pair must lie within one 16 KiB page, since two pages are
+ * filled, cached and invalidated apart.
+ */
+static inline uint32_t patched_at(uint32_t prev, uint32_t x, uint32_t next, uint64_t i)
+{
+    if (tpro_pair_on()) {
+        if (is_tpro_mrs(x)) {
+            if (((i + 1) & 0xfff) && is_tb_bit36(next, x & 31)) {
+                return 0xd53b42c0u | (x & 31);                  /* mrs Xt, SSBS */
+            }
+        } else if ((i & 0xfff) && is_tpro_mrs(prev) && is_tb_bit36(x, prev & 31)) {
+            return ((x ^ 0x01000000u) & 0x0107ffffu) | 0x36600000u;     /* the inverse branch on bit 12 */
+        }
+    }
+    if (tpro_carry) {
+        if (is_ssbs_msr(x)) {
+            return 0xd503201fu;                                 /* nop: the bit is not the guest's here */
+        } else if (is_ssbs_mrs(x)) {
+            return 0xd2820000u | (x & 31);                      /* movz Xt, #0x1000: SSBS set */
+        }
+    }
+    return is_patch_word(x) ? patched_word(x) : x;
+}
+
+/* the same for word @i of the @n words at @w, all still as the guest wrote them */
+static inline uint32_t patched_in(const uint32_t *w, uint64_t i, uint64_t n)
+{
+    return patched_at(i ? w[i - 1] : 0, w[i], i + 1 < n ? w[i + 1] : 0, i);
 }
 
 static inline bool is_patch_word(uint32_t w)
@@ -1193,7 +1615,8 @@ static inline uint32_t patched_word(uint32_t w)
 {
     uint32_t rt = w & 31;
     if (pac_off && is_pacga(w)) {
-        return 0x00009ac3u;         /* udf: emulated, see is_pacga() */
+        /* udf #(0x8000 | rm << 10 | rn << 5 | rd): emulated, see is_pacga() */
+        return PACGA_UDF | (((w >> 16) & 31) << 10) | (w & 0x3ffu);
     }
     switch (w & 0xffffffe0u) {
     case 0xd53bd060u:   /* mrs Xt, TPIDRRO_EL0 -> TPIDR_EL0 */
@@ -1230,10 +1653,16 @@ static uint64_t patch_code_words(uint32_t *w, uint64_t nwords, uint64_t pg)
                     i >= 2 ? w[i - 2] : 0, i >= 1 ? w[i - 1] : 0, w[i],
                     i + 1 < nwords ? w[i + 1] : 0, i + 2 < nwords ? w[i + 2] : 0);
         }
-        if (is_patch_word(w[i])) {
-            w[i] = patched_word(w[i]);
+    }
+    uint32_t prev = 0;      /* a rewrite looks at its neighbours as the guest wrote them */
+    for (uint64_t i = 0; i < nwords; i++) {
+        uint32_t cur = w[i];
+        uint32_t x = patched_at(prev, cur, i + 1 < nwords ? w[i + 1] : 0, i);
+        if (x != cur) {
+            w[i] = x;
             n++;
         }
+        prev = cur;
     }
     tpidrro_patched += n;
     return n;
@@ -1289,19 +1718,31 @@ static int cc_scan(const uint32_t *w, uint16_t *idx)
     /* PACGA (is_pacga) only with EL0 PAC off; otherwise a mask that never matches */
     const uint32x4_t gmask = vdupq_n_u32(pac_off ? 0xffe0fc00u : 0u);
     const uint32x4_t gwant = vdupq_n_u32(pac_off ? 0x9ac03000u : 1u);
-    int n = 0;
+    /* msr SSBS, #imm (is_ssbs_msr) only while SSBS carries the TPRO bit */
+    const uint32x4_t smask = vdupq_n_u32(tpro_carry ? 0xfffff0ffu : 0u);
+    const uint32x4_t swant = vdupq_n_u32(tpro_carry ? 0xd503403fu : 1u);
+    int n = 0, done = -1;
     for (unsigned i = 0; i < CC_WORDS; i += 4) {
         uint32x4_t v = vld1q_u32(w + i);
         uint32x4_t m = vandq_u32(v, mask);
-        if (vmaxvq_u32(vorrq_u32(vorrq_u32(vceqq_u32(m, want), vceqq_u32(m, want2)),
-                                 vceqq_u32(vandq_u32(v, gmask), gwant)))) {
-            for (unsigned j = i; j < i + 4; j++) {
-                if (is_patch_word(w[j])) {
-                    if (n == CC_MAXP) {
-                        return -1;
-                    }
-                    idx[n++] = j;
+        if (vmaxvq_u32(vorrq_u32(vorrq_u32(vorrq_u32(vceqq_u32(m, want), vceqq_u32(m, want2)),
+                                           vceqq_u32(vandq_u32(v, gmask), gwant)),
+                                 vceqq_u32(vandq_u32(v, smask), swant)))) {
+            for (int j = i; j < (int)i + 4; j++) {
+                if (j <= done || patched_in(w, j, CC_WORDS) == w[j]) {
+                    continue;
                 }
+                /* a TPRO pair brings its branch, a word the filter above does not know */
+                int more = is_tpro_mrs(w[j]) && j + 1 < (int)CC_WORDS &&
+                           patched_in(w, j + 1, CC_WORDS) != w[j + 1];
+                if (n + 1 + more > CC_MAXP) {
+                    return -1;
+                }
+                idx[n++] = j;
+                if (more) {
+                    idx[n++] = j + 1;
+                }
+                done = j + more;
             }
         }
     }
@@ -1320,7 +1761,7 @@ static bool cc_same(const uint32_t *w, const uint32_t *copy, const CcMeta *m, co
         if (memcmp(w + from, copy + from, (to - from) * 4)) {
             return false;
         }
-        if (k < n && copy[to] != patched_word(w[to])) {
+        if (k < n && copy[to] != patched_in(w, to, CC_WORDS)) {
             return false;
         }
         from = to + 1;
@@ -1367,7 +1808,26 @@ static int cc_fill(const void *hp, uint64_t off, uint64_t *slot_off)
     uint32_t *copy = (uint32_t *)(cc_base + (uint64_t)s * CC_PAGE);
     memcpy(copy, w, CC_PAGE);
     for (int k = 0; k < n; k++) {
-        copy[idx[k]] = patched_word(w[idx[k]]);
+        copy[idx[k]] = patched_in(w, idx[k], CC_WORDS);
+        if (is_tpro_mrs(w[idx[k]])) {
+            bool pair = (copy[idx[k]] & 0xffffffe0u) == 0xd53b42c0u;
+            pair ? tpro_pairs++ : tpro_lone++;
+            if (tpro_log_left > 0) {
+                /* which shapes the reads have: the guest's words around each */
+                tpro_log_left--;
+                fprintf(stderr, "native-el0: tpro read %s frame %#" PRIx64 " +%#x:", pair ? "paired" : "lone",
+                        frame, idx[k] * 4);
+                for (int d = -6; d <= 9; d++) {
+                    int at = idx[k] + d;
+                    if (at >= 0 && at < (int)CC_WORDS) {
+                        fprintf(stderr, d == 0 ? " [%08x]" : " %08x", w[at]);
+                    }
+                }
+                fprintf(stderr, "\n");
+            }
+        } else if (tpro_carry && (is_ssbs_msr(w[idx[k]]) || is_ssbs_mrs(w[idx[k]]))) {
+            ssbs_guest_words++;
+        }
     }
     __builtin___clear_cache((char *)copy, (char *)copy + CC_PAGE);
     cc_meta[s].n = n;
@@ -1510,6 +1970,9 @@ typedef struct StubThread {
     uint64_t host_x18;          /* Bionic's shadow call stack; the guest owns x18 */
     int in_guest;
     sigjmp_buf loop;
+    sigjmp_buf probe;           /* the trap handler's guarded read of the word at pc */
+    int probing;
+    uint32_t entries;           /* the per-entry checks run on every 1024th */
     size_t uc_off;              /* offset of the ucontext inside the frame */
     int tmpl_ok;
     unsigned char tmpl[8192] __attribute__((aligned(16)));  /* a kernel-built rt_sigframe */
@@ -1569,12 +2032,55 @@ static inline StubThread *stub_self(void)
     return NULL;
 }
 
+static inline uint8_t *mapped_of(int stub)
+{
+    return mapped_bits ? mapped_bits + (size_t)stub * MAPPED_BYTES : NULL;
+}
+
+static inline bool mapped_test(const uint8_t *m, uint64_t va)
+{
+    uint64_t i = (va - WIN_LO) >> 14;
+    return (qatomic_read(&m[i >> 3]) >> (i & 7)) & 1;
+}
+
+/* the stub's own pages [lo, hi) are mapped (or no more): only the stub writes its map */
+static void mapped_mark(uint64_t lo, uint64_t hi, bool on)
+{
+    uint8_t *m = mapped_of(my_idx);
+    if (!m || lo >= hi) {
+        return;
+    }
+    uint64_t a = (lo - WIN_LO) >> 14, b = (hi - WIN_LO + 0x3fff) >> 14;
+    if (!on && lo == WIN_LO && hi == WIN_HI) {
+        /* shared memory: MADV_REMOVE frees the touched pages, they read as zero again */
+        if (madvise(m, MAPPED_BYTES, MADV_REMOVE) != 0) {
+            memset(m, 0, MAPPED_BYTES);
+        }
+        return;
+    }
+    while (a < b && (a & 7)) {
+        uint8_t v = m[a >> 3];
+        qatomic_set(&m[a >> 3], on ? (v | (1 << (a & 7))) : (v & ~(1 << (a & 7))));
+        a++;
+    }
+    if (b - a >= 8) {
+        memset(m + (a >> 3), on ? 0xff : 0, (b - a) >> 3);
+        a += (b - a) & ~7ULL;
+    }
+    while (a < b) {
+        uint8_t v = m[a >> 3];
+        qatomic_set(&m[a >> 3], on ? (v | (1 << (a & 7))) : (v & ~(1 << (a & 7))));
+        a++;
+    }
+}
+
 static void stub_unmap(uint64_t lo, uint64_t hi)
 {
     clamp_range(&lo, &hi);
     if (lo >= hi) {
         return;
     }
+    mapped_mark(lo, hi, false);
     if (lo == WIN_LO && hi == WIN_HI) {
         memset(slabs, 0, NSLABS * sizeof(Extent));
     } else {
@@ -1685,9 +2191,37 @@ static bool stub_do_fill_locked(StubThread *st)
     if ((f.prot & PROT_EXEC) && !f.patch) {
         __builtin___clear_cache((char *)f.va, (char *)f.va + f.len);
     }
+    mapped_mark(f.va, f.va + f.len, true);
+    /* the neighbours QEMU found mapped in the guest's table; one this stub holds by now stays as it is */
+    uint32_t nx = st->slot->nextra;
+    const uint8_t *mine = mapped_of(my_idx);
+    for (uint32_t k = 0; k < nx && k < FILL_EXTRA && mine; k++) {
+        StubFill x = st->slot->extra[k];
+        int xfd = x.fd_index == FD_INDEX_CC ? cc_fd :
+                  (x.fd_index >= 0 && x.fd_index < qatomic_read(&shm->nram)) ? shm->ram_fd[x.fd_index] : -1;
+        if (xfd < 0 || x.len != 0x4000 || !in_window(x.va) || x.va + x.len > WIN_HI || mapped_test(mine, x.va)) {
+            st->slot->extra[k].len = 0;
+            continue;
+        }
+        if (mmap((void *)x.va, x.len, x.prot, MAP_SHARED | MAP_FIXED, xfd, x.off) == MAP_FAILED) {
+            st->slot->extra[k].len = 0;
+            continue;
+        }
+        if (x.prot & PROT_EXEC) {
+            __builtin___clear_cache((char *)x.va, (char *)x.va + x.len);
+        }
+        mapped_mark(x.va, x.va + x.len, true);
+        qatomic_inc(&my_ctl->around_fills);
+    }
     if (qatomic_read(&my_ctl->inval_seq) != f.gen || qatomic_read(&my_ctl->overflow)) {
-        /* a TLBI raced with the page walk: the mapping may be stale */
+        /* a TLBI raced with the page walks: the mappings may be stale */
         stub_unmap(f.va, f.va + f.len);
+        for (uint32_t k = 0; k < nx && k < FILL_EXTRA; k++) {
+            StubFill x = st->slot->extra[k];
+            if (x.len) {
+                stub_unmap(x.va, x.va + x.len);
+            }
+        }
     }
     return true;
 }
@@ -1711,6 +2245,9 @@ static void stub_report(StubThread *st, uint32_t status)
     StubSlot *slot = st->slot;
     smp_wmb();
     qatomic_set(&slot->status, status);
+    if (qatomic_read(&shm->wait_wfe)) {
+        wait_signal();
+    }
     futex(&slot->status, FUTEX_WAKE, 1, NULL);
 }
 
@@ -1739,6 +2276,9 @@ static STUB_HANDLER void stub_trap_handler(int sig, siginfo_t *si, void *uc_)
         return;
     }
     load_host_regs(st);
+    if (st->probing && (sig == SIGSEGV || sig == SIGBUS)) {
+        siglongjmp(st->probe, 1);       /* the read of the word at pc below faulted */
+    }
     StubSlot *slot = st->slot;
     uint64_t pc = uc->uc_mcontext.pc;
     uint32_t phase_before = qatomic_read(&slot->phase);
@@ -1778,6 +2318,37 @@ static STUB_HANDLER void stub_trap_handler(int sig, siginfo_t *si, void *uc_)
         signal(sig, SIG_DFL);           /* re-executes and dies with a tombstone */
         write_tpidr(tp);
         return;
+    }
+    /*
+     * A PACGA's UDF (patched_word): emulated right here, QEMU is not told and
+     * the thread stays in guest code. The word is read under a guard: the page
+     * may be execute-only (a guest XO page, ASOFT_NATIVE_EL0_PATCH_XO) or just
+     * unmapped by another thread applying an invalidation; then, or with a kick
+     * pending, it is reported as before.
+     */
+    if (sig == SIGILL && pac_off && in_window(pc) && qatomic_read(&shm->pacga_local)) {
+        volatile uint32_t w = 0;
+        st->probing = 1;
+        barrier();
+        if (sigsetjmp(st->probe, 0) == 0) {
+            w = *(volatile uint32_t *)(uintptr_t)pc;
+        }
+        barrier();
+        st->probing = 0;
+        if (is_pacga_udf(w) && !qatomic_read(&slot->kick_pending)) {
+            unsigned rd = w & 31, rn = (w >> 5) & 31, rm = (w >> 10) & 31;
+            uint64_t xn = rn == 31 ? 0 : uc->uc_mcontext.regs[rn];
+            uint64_t xm = rm == 31 ? uc->uc_mcontext.sp : uc->uc_mcontext.regs[rm];
+            if (rd != 31) {
+                uc->uc_mcontext.regs[rd] = pauth_pacga_off(xn, xm);
+            }
+            uc->uc_mcontext.pc = pc + 4;
+            qatomic_inc(&my_ctl->pacga_emul);
+            /* x18 and the rest come back from the frame; TPIDR_EL0 is not in it */
+            qatomic_set(&slot->phase, phase_before);
+            write_tpidr(tp);
+            return;
+        }
     }
     st->in_guest = 0;
     uint32_t status;
@@ -1854,15 +2425,37 @@ static void __attribute__((noreturn)) stub_enter(void *frame, uint64_t tp)
 
 static uint32_t stub_wait_cmd(StubSlot *slot)
 {
+    bool slept = false;
     for (;;) {
-        uint64_t t0 = cntvct();
-        while (!qatomic_read(&slot->cmd) && cntvct() - t0 < stub_spin_ticks) {
-            spin_relax();
+        /* the switch file may change both at any time */
+        uint64_t limit = qatomic_read(&shm->stub_spin_ticks);
+        bool wfe = qatomic_read(&shm->wait_wfe);
+        /* no core to spare: the path of a zero limit (spin_take) */
+        bool tok = limit && spin_take();
+        if (limit && !tok) {
+            limit = 0;
+            if (!slept) {
+                qatomic_inc(&my_ctl->spin_none);
+            }
         }
+        uint64_t t0 = cntvct();
+        while (!qatomic_read(&slot->cmd) && cntvct() - t0 < limit) {
+            wait_relax(wfe);
+        }
+        if (tok) {
+            spin_give();
+        }
+        qatomic_add(&my_ctl->spin_ticks, cntvct() - t0);
         uint32_t c = qatomic_xchg(&slot->cmd, 0);
         if (c) {
+            if (slept) {
+                qatomic_inc(&my_ctl->spin_sleeps);
+            } else {
+                qatomic_inc(&my_ctl->spin_hits);
+            }
             return c;
         }
+        slept = true;
         futex(&slot->cmd, FUTEX_WAIT, 0, NULL);
     }
 }
@@ -1930,7 +2523,8 @@ static void *stub_thread_main(void *arg)
         }
         qatomic_set(&slot->phase, PH_APPLY);
         apply_pending(st);
-        {
+        /* two syscalls only to check: on every 1024th entry of this thread */
+        if ((st->entries++ & 1023) == 0) {
             stack_t cur;
             sigset_t m;
             if (sigaltstack(NULL, &cur) == 0 &&
@@ -2105,6 +2699,15 @@ static bool stub_shm_init(void)
         shm = NULL;
         return false;
     }
+    /* in the shared block: the stubs read them at every wait, the switch file changes them */
+    shm->wait_wfe = wait_wfe_env;
+    shm->stub_spin_ticks = stub_spin_ticks;
+    shm->tpro_ssbs = tpro_ssbs;
+    shm->spin_spare = spare_fixed >= 0 ? spare_fixed : 0;  /* automatic: the first stub_drive wait looks */
+    {
+        const char *e = getenv("ASOFT_NATIVE_EL0_PACGA_LOCAL");
+        shm->pacga_local = !e || *e != '0';
+    }
     int sv[2];
     if (socketpair(AF_UNIX, SOCK_SEQPACKET, 0, sv) < 0) {
         return false;
@@ -2112,6 +2715,15 @@ static bool stub_shm_init(void)
     for (int i = 0; i < 65536; i++) {
         asid_stub[i] = -1;
     }
+    if (fill_around > 0) {
+        mapped_bits = mmap(NULL, (size_t)STUB_MAX * MAPPED_BYTES, PROT_READ | PROT_WRITE,
+                           MAP_SHARED | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+        if (mapped_bits == MAP_FAILED) {
+            mapped_bits = NULL;
+            fill_around = 0;
+        }
+    }
+    around_max = mapped_bits ? FILL_EXTRA / 2 : 0;
     /* before the fork: the factory and so the stubs inherit the fd */
     if (tpidrro_mode && !(getenv("ASOFT_NATIVE_EL0_CODECACHE") && *getenv("ASOFT_NATIVE_EL0_CODECACHE") == '0') &&
         !cc_create()) {
@@ -2591,6 +3203,87 @@ void native_el0_tlbi_range(uint64_t base, uint64_t len, int asid)
 enum { FILL_OK, FILL_FAULT, FILL_UNSUPPORTED };
 
 /*
+ * The neighbours of the page at @pg that go along with its fill (see
+ * FILL_EXTRA), into the slot's extra[]. Runs after the faulting page's own
+ * walk, so the same @gen covers them: a TLBI in between undoes them all.
+ */
+static uint32_t fill_neighbours(NativeCtx *nc, CPUARMState *env, uint64_t pg)
+{
+    const uint8_t *held = mapped_of(nc->stub);
+    uint32_t n = 0;
+    /* TCR_EL1.HA: hardware would set an access flag on a first touch; these pages are not touched */
+    if (fill_around <= 0 || !held || (env->cp15.tcr_el[1] & (1ULL << 39))) {
+        return 0;
+    }
+    for (int k = 1; k <= fill_around && n + 2 <= FILL_EXTRA; k++) {
+        for (int side = 0; side < 2; side++) {
+            uint64_t va = side ? pg - (uint64_t)k * CC_PAGE : pg + (uint64_t)k * CC_PAGE;
+            if (va < WIN_LO || va + CC_PAGE > WIN_HI || mapped_test(held, va)) {
+                continue;
+            }
+            GetPhysAddrResult res;
+            ARMMMUFaultInfo fi;
+            memset(&res, 0, sizeof(res));
+            memset(&fi, 0, sizeof(fi));
+            if (!get_phys_addr_for_at(env, va, PAGE_READ, ARMMMUIdx_E10_0, arm_security_space_below_el3(env),
+                                      &res, &fi) || res.f.lg_page_size != 14) {
+                continue;
+            }
+            int prot = res.f.prot;
+            hwaddr gpa = res.f.phys_addr & ~(hwaddr)(CC_PAGE - 1);
+            MemoryRegionSection sec = memory_region_find(get_system_memory(), gpa, CC_PAGE);
+            if (!sec.mr) {
+                continue;
+            }
+            bool ok = memory_region_is_ram(sec.mr) && int128_ge(sec.size, int128_make64(CC_PAGE)) &&
+                      sec.offset_within_address_space == gpa;
+            int fd = ok ? memory_region_get_fd(sec.mr) : -1;
+            uint64_t off = 0;
+            ram_addr_t ra = 0;
+            char *hp = NULL;
+            if (fd >= 0) {
+                off = sec.offset_within_region + qemu_ram_get_fd_offset(sec.mr->ram_block);
+                ra = memory_region_get_ram_addr(sec.mr) + sec.offset_within_region;
+                hp = (char *)memory_region_get_ram_ptr(sec.mr) + sec.offset_within_region;
+            }
+            memory_region_unref(sec.mr);
+            int fdi = fd >= 0 ? ram_fd_index(fd) : -1;
+            if (fdi < 0) {
+                continue;
+            }
+            if (tpidrro_mode && (prot & PAGE_EXEC) && !(prot & PAGE_WRITE)) {
+                /* a code page: as it is, or its rewritten copy in the cache; no private copy for a neighbour */
+                uint64_t slot_off;
+                if (!cc_base || patch_xo || fdi != 0) {
+                    continue;
+                }
+                int c = cc_fill(hp, off, &slot_off);
+                if (c == CC_CACHED) {
+                    fdi = FD_INDEX_CC;
+                    off = slot_off;
+                } else if (c != CC_CLEAN) {
+                    continue;
+                }
+            }
+            if (prot & PAGE_WRITE) {
+                tb_invalidate_phys_range(nc->cs, ra, ra + CC_PAGE - 1);
+            }
+            StubFill *x = &nc->slot->extra[n++];
+            x->va = va;
+            x->len = CC_PAGE;
+            x->off = off;
+            x->gen = 0;
+            x->prot = ((prot & PAGE_READ) ? PROT_READ : 0) | ((prot & PAGE_WRITE) ? PROT_WRITE : 0) |
+                      ((prot & PAGE_EXEC) ? PROT_EXEC : 0);
+            x->fd_index = fdi;
+            x->patch = 0;
+        }
+    }
+    around_sent += n;
+    return n;
+}
+
+/*
  * Map the guest page containing @va into the mirror for @access (in stub
  * mode: describe the mapping in the slot for the stub to make).  Returns
  * FILL_FAULT (and *fi) when the guest's own translation faults, so the
@@ -2666,6 +3359,9 @@ retry:
     if (fd < 0) {
         return FILL_UNSUPPORTED;
     }
+    /* for handle_trap: the guest's words before and at an exec fault's pc, at hand here */
+    nc->fill_pair = access != MMU_INST_FETCH ? 0 :
+                    va - 4 >= pg ? tpro_pair_second(va, (const uint32_t *)(hp + (va - pg)) - 1) : -1;
 
     int hprot = ((prot & PAGE_READ) ? PROT_READ : 0) |
                 ((prot & PAGE_WRITE) ? PROT_WRITE : 0) |
@@ -2703,6 +3399,7 @@ retry:
         f->prot = hprot;
         f->fd_index = fdi;
         f->patch = patch;
+        nc->slot->nextra = len == CC_PAGE && !patch ? fill_neighbours(nc, env, pg) : 0;
         nc->fill_pending = 1;
         nc->fills++;
         return FILL_OK;
@@ -2793,6 +3490,16 @@ static void state_to_frame(NativeCtx *nc, ucontext_t *uc)
     uc->uc_mcontext.sp = env->xregs[31];
     uc->uc_mcontext.pc = env->pc;
     uc->uc_mcontext.pstate = pstate_read(env) & PSTATE_COPY;   /* EL0t */
+    static int pstate_logged;
+    if (unlikely(!pstate_logged) && !qatomic_xchg(&pstate_logged, 1)) {
+        fprintf(stderr, "native-el0: the guest's EL0 PSTATE at the first native entry: %#x (SSBS %d, DIT %d)\n",
+                pstate_read(env), !!(pstate_read(env) & PSTATE_SSBS), !!(pstate_read(env) & PSTATE_DIT));
+    }
+    if (tpro_carry) {
+        /* SSBS clear says TPRO memory is writable: see patched_at() */
+        uc->uc_mcontext.pstate = (uc->uc_mcontext.pstate & ~(uint64_t)PSTATE_SSBS) |
+                                 ((env->sprr_uperm_el0 & TPRO_W_BIT) ? 0 : PSTATE_SSBS);
+    }
     struct fpsimd_context *f = find_fpsimd(uc);
     if (f) {
         for (int i = 0; i < 32; i++) {
@@ -2818,8 +3525,8 @@ static void frame_to_state(NativeCtx *nc, ucontext_t *uc, uint64_t guest_tpidr)
     }
     env->xregs[31] = uc->uc_mcontext.sp;
     env->pc = uc->uc_mcontext.pc;
-    pstate_write(env, (pstate_read(env) & ~PSTATE_COPY) |
-                      (uc->uc_mcontext.pstate & PSTATE_COPY));
+    uint32_t copy = tpro_carry ? (PSTATE_COPY & ~PSTATE_SSBS) : PSTATE_COPY;
+    pstate_write(env, (pstate_read(env) & ~copy) | (uc->uc_mcontext.pstate & copy));
     struct fpsimd_context *f = find_fpsimd(uc);
     if (f) {
         for (int i = 0; i < 32; i++) {
@@ -2863,6 +3570,24 @@ static uint32_t fetch_insn(NativeCtx *nc, uint64_t pc)
     return insn;
 }
 
+/* is @pc the second word of a TPRO pair? the guest's own words, through its page tables */
+static bool tpro_pair_at(NativeCtx *nc, uint64_t pc)
+{
+    uint32_t w[2];
+    return tpro_carry && (pc & 0x3fff) && cpu_memory_rw_debug(nc->cs, pc - 4, w, 8, false) == 0 &&
+           tpro_pair_second(pc, w);
+}
+
+/* leaving native code: a thread on the second word of a TPRO pair runs the first again (see TPRO_W_BIT) */
+static void tpro_pair_rewind(NativeCtx *nc)
+{
+    CPUARMState *env = cpu_env(nc->cs);
+    if (tpro_pair_at(nc, env->pc)) {
+        env->pc -= 4;
+        qatomic_inc(&tpro_rewinds);
+    }
+}
+
 /* back to TCG: this vCPU no longer runs natively */
 static inline void leave_native(NativeCtx *nc)
 {
@@ -2891,6 +3616,7 @@ static void resume_guest(NativeCtx *nc, ucontext_t *uc, uint64_t tp)
     if (qatomic_read(&nc->cs->exit_request) || qatomic_read(&nc->kick_pending)) {
         qatomic_set(&nc->kick_pending, 0);
         frame_to_state(nc, uc, tp);
+        tpro_pair_rewind(nc);
         nc->kicks++;
         leave_native(nc);
         cpu_loop_exit(nc->cs);
@@ -2910,6 +3636,25 @@ static void nat_trace(NativeCtx *nc, const char *what, uint64_t pc, uint64_t a)
         trace_left--;
         fprintf(stderr, "native-el0[%d] %" PRId64 "ms: %s pc=%#" PRIx64 " a=%#" PRIx64 "\n",
                 nc->cs->cpu_index, (mono_ns() - trace_t0) / 1000000, what, pc, a);
+    }
+}
+
+/* the first few distinct values the guest's EL0 writes to SPRR_UPERM_EL0 (ASOFT_NATIVE_EL0_TPRO_LOG) */
+static void tpro_value_seen(uint64_t v, uint64_t pc)
+{
+    static uint64_t seen[8];
+    static int nseen;
+    if (tpro_log_left <= 0) {
+        return;
+    }
+    for (int i = 0; i < nseen; i++) {
+        if (seen[i] == v) {
+            return;
+        }
+    }
+    if (nseen < 8) {
+        seen[nseen++] = v;
+        fprintf(stderr, "native-el0: tpro write %#" PRIx64 " at pc=%#" PRIx64 "\n", v, pc);
     }
 }
 
@@ -2934,6 +3679,11 @@ static bool emulate_mrs(NativeCtx *nc, ucontext_t *uc, uint32_t insn)
          */
         if (msr) {
             env->sprr_uperm_el0 = rt == 31 ? 0 : uc->uc_mcontext.regs[rt];
+            if (tpro_carry) {
+                uc->uc_mcontext.pstate = (uc->uc_mcontext.pstate & ~(uint64_t)PSTATE_SSBS) |
+                                         ((env->sprr_uperm_el0 & TPRO_W_BIT) ? 0 : PSTATE_SSBS);
+            }
+            tpro_value_seen(env->sprr_uperm_el0, uc->uc_mcontext.pc);
             uc->uc_mcontext.pc += 4;
             nc->emul_mrs++;
             qatomic_inc(&mrs_kind[MK_TPRO_W]);
@@ -3054,10 +3804,19 @@ static void handle_trap(NativeCtx *nc, int sig, int si_code, uint64_t fault_addr
             int r = mirror_fill(nc, addr, access, &fi);
             if (r == FILL_OK) {
                 nat_trace(nc, "fill", pc, addr);
+                /* the page may come back in the other style: run the pair's first word again (TPRO_W_BIT) */
+                if (access == MMU_INST_FETCH && addr == pc &&
+                    (nc->fill_pair < 0 ? tpro_pair_at(nc, pc) : nc->fill_pair)) {
+                    uc->uc_mcontext.pc = pc - 4;
+                    qatomic_inc(&tpro_rewinds);
+                }
                 resume_guest(nc, uc, tp);
                 return;
             }
             frame_to_state(nc, uc, tp);
+            if (access == MMU_INST_FETCH) {
+                tpro_pair_rewind(nc);       /* TCG or the guest's abort handler goes on from env->pc */
+            }
             if (r == FILL_FAULT && perm_fallback && fi.type == ARMFault_Permission &&
                 access == MMU_DATA_STORE) {
                 nat_trace(nc, "perm->tcg", pc, addr);
@@ -3084,6 +3843,9 @@ static void handle_trap(NativeCtx *nc, int sig, int si_code, uint64_t fault_addr
             uint32_t fsc = arm_fi_to_lfsc(&fi);
             env->exception.vaddress = addr;
             if (access == MMU_INST_FETCH) {
+                if (env->pc != pc) {
+                    env->exception.vaddress = env->pc;  /* rewound: the first word's abort, same page */
+                }
                 leave_native(nc), raise_exception(env, EXCP_PREFETCH_ABORT,
                                 syn_insn_abort(0, fi.ea, fi.s1ptw, fsc), 1);
             } else {
@@ -3128,6 +3890,7 @@ static void handle_trap(NativeCtx *nc, int sig, int si_code, uint64_t fault_addr
                 uc->uc_mcontext.regs[rd] = pauth_pacga_off(xn, xm);
             }
             uc->uc_mcontext.pc += 4;
+            nc->pacga++;
             resume_guest(nc, uc, tp);
             return;
         }
@@ -3191,6 +3954,7 @@ static void handle_trap(NativeCtx *nc, int sig, int si_code, uint64_t fault_addr
         /* the kick: back to cpu_exec, which looks at the interrupt state */
         nat_trace(nc, "kick", pc, 0);
         frame_to_state(nc, uc, tp);
+        tpro_pair_rewind(nc);
         nc->kicks++;
         leave_native(nc), cpu_loop_exit(cs);
     }
@@ -3324,7 +4088,16 @@ void native_el0_kick(CPUState *cs)
     }
     int idx = cs->cpu_index;
     NativeCtx *nc = (idx >= 0 && idx < MAX_CTX) ? ctx_by_index[idx] : NULL;
-    if (!nc || !qatomic_read(&nc->in_guest)) {
+    if (!nc) {
+        return;
+    }
+    if (tcg_kick_lazy && excl_free && stub_mode) {
+        /* exit_request is set: the vCPU leaves native code at its next trap (resume_guest) */
+        qatomic_inc(&lazy_kicks);
+        return;
+    }
+    qatomic_set(&nc->urgent, 1);
+    if (!qatomic_read(&nc->in_guest)) {
         return;
     }
     if (stub_mode) {
@@ -3338,11 +4111,40 @@ void native_el0_kick(CPUState *cs)
     }
 }
 
+/*
+ * Inside an exclusive section that needs every vCPU out of guest code
+ * (cpu_exec_step_atomic): the vCPUs parked on a stub come out. Their threads
+ * then wait in cpu_exec_start() for the section's end.
+ */
+void native_el0_quiesce(void)
+{
+    /* not excl_free: a vCPU parked before the switch file turned it off must still come out */
+    if (!native_el0_enabled || !stub_mode) {
+        return;
+    }
+    for (int i = 0; i < MAX_CTX; i++) {
+        NativeCtx *nc = ctx_by_index[i];
+        while (nc && qatomic_read(&nc->parked)) {
+            int s = nc->stub;
+            StubSlot *sl = nc->slot;
+            if (s >= 0 && sl) {
+                stub_kick_slot(s, sl);
+            }
+            for (int k = 0; k < 4000 && qatomic_read(&nc->parked); k++) {
+                spin_relax();
+            }
+        }
+    }
+}
+
 static inline void post_cmd(StubSlot *sl, uint32_t c)
 {
     qatomic_set(&sl->status, ST_RUNNING);
     smp_wmb();
     qatomic_set(&sl->cmd, c);
+    if (qatomic_read(&shm->wait_wfe)) {
+        wait_signal();
+    }
     futex(&sl->cmd, FUTEX_WAKE, 1, NULL);
 }
 
@@ -3355,20 +4157,51 @@ static void __attribute__((noreturn)) stub_drive(NativeCtx *nc, StubSlot *sl)
     for (;;) {
         uint32_t st;
         bool kicked = false;
+        bool slept = false;
         int timeouts = 0;
+        /* once per round trip: the switch file may flip excl_free meanwhile */
+        bool out = excl_free;
+        if (out) {
+            qatomic_set(&nc->parked, 1);
+            cpu_exec_end(cs);
+        }
         for (;;) {
+            bool wfe = qatomic_read(&shm->wait_wfe);
             uint64_t t0 = cntvct();
-            do {
+            if (unlikely(t0 >= qatomic_read(&spare_next))) {
+                spare_refresh(t0);          /* about once a second, by one vCPU thread */
+            }
+            /* no core to spare: the path of a zero limit (spin_take) */
+            uint64_t limit = qemu_spin_ticks;
+            bool tok = limit && spin_take();
+            if (limit && !tok) {
+                limit = 0;
+                if (!slept) {
+                    nc->spin_none++;
+                }
+            }
+            /* the limit is checked before each step: with spin-us=0 not even one WFE */
+            for (;;) {
                 st = qatomic_read(&sl->status);
-                if (st != ST_RUNNING) {
+                if (st != ST_RUNNING || cntvct() - t0 >= limit) {
                     break;
                 }
-                spin_relax();
-            } while (cntvct() - t0 < qemu_spin_ticks);
+                wait_relax(wfe);
+            }
+            if (tok) {
+                spin_give();
+            }
+            nc->spin_ticks += cntvct() - t0;
             if (st != ST_RUNNING) {
+                if (slept) {
+                    nc->spin_sleeps++;
+                } else {
+                    nc->spin_hits++;
+                }
                 break;
             }
-            if (!kicked && qatomic_read(&cs->exit_request)) {
+            slept = true;
+            if (!kicked && qatomic_read(&cs->exit_request) && (!out || qatomic_read(&nc->urgent))) {
                 kicked = true;
                 stub_kick_slot(s, sl);
             }
@@ -3405,12 +4238,18 @@ static void __attribute__((noreturn)) stub_drive(NativeCtx *nc, StubSlot *sl)
             }
         }
         smp_rmb();
+        if (out) {
+            /* the stub has stopped; what is TCG's is ours again once no exclusive section runs */
+            qatomic_set(&nc->parked, 0);
+            cpu_exec_start(cs);
+        }
         uint64_t now = cntvct();
         nc->native_ticks += now - nc->enter_tick;
         nc->trap_tick = now;
         if (st == ST_KICK) {
             nat_trace(nc, "kick", sl->uc.uc_mcontext.pc, 0);
             frame_to_state(nc, &sl->uc, sl->tpidr);
+            tpro_pair_rewind(nc);
             nc->kicks++;
             leave_native(nc);
             cpu_loop_exit(cs);
@@ -3418,6 +4257,7 @@ static void __attribute__((noreturn)) stub_drive(NativeCtx *nc, StubSlot *sl)
         if (st == ST_FILLFAIL) {
             nat_trace(nc, "fillfail", sl->uc.uc_mcontext.pc, sl->fill.va);
             frame_to_state(nc, &sl->uc, sl->tpidr);
+            tpro_pair_rewind(nc);
             nc->unsupported++;
             nc->tcg_until_el1 = 1;
             leave_native(nc);
@@ -3612,6 +4452,7 @@ bool native_el0_try(CPUState *cs)
         sl->tpidr = nc->guest_tpidr;
         qatomic_set(&sl->kick_pending, 0);
         qatomic_set(&nc->kick_pending, 0);
+        qatomic_set(&nc->urgent, 0);
         qatomic_set(&nc->in_guest, 1);
         smp_mb();
         if (qatomic_read(&cs->exit_request)) {
@@ -3650,6 +4491,7 @@ bool native_el0_try(CPUState *cs)
 
 bool native_el0_try(CPUState *cs) { return false; }
 void native_el0_kick(CPUState *cs) { }
+void native_el0_quiesce(void) { }
 void native_el0_tlbi_all(void) { }
 void native_el0_tlbi_asid(uint16_t asid) { }
 void native_el0_tlbi_page(uint64_t va, int asid) { }

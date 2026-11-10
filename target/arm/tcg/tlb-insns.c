@@ -983,6 +983,47 @@ static void do_rvae_write(CPUARMState *env, uint64_t value,
     }
 }
 
+/*
+ * A range of the EL1&0 regime. With an ASID (RVAE1, RVALE1 and their IS/OS
+ * forms) it concerns one address space, as tlbi_aa64_vae1is_write()'s page
+ * does: the native EL0 engine drops it from that address space's mirror
+ * alone, and only a vCPU in that ASID can hold it in its TLB. iOS 26 sends
+ * about as many of these as XNU's per-page loop used to send pages; each one
+ * stopped every vCPU and went to every stub.
+ */
+static void do_rvae1_write(CPUARMState *env, const ARMCPRegInfo *ri,
+                           uint64_t value, bool synced)
+{
+    int idxmap = vae1_tlbmask(env);
+    ARMMMUIdx one_idx = ARM_MMU_IDX_A | ctz32(idxmap);
+    TLBIRange range = tlbi_aa64_get_range(env, one_idx, value);
+    int bits = tlbbits_for_regime(env, one_idx, range.base);
+    bool any_asid = ri->opc2 & 2;
+    uint16_t asid = extract64(value, 48, 16);
+
+    any_asid |= !native_el0_range_by_asid;  /* ASOFT_TLBI_RANGE_ASID=0: every range as if for any ASID */
+    native_el0_tlbi_range(range.base, range.length, any_asid ? -1 : asid);
+
+    if (synced && !any_asid) {
+        switch (native_el0_tlbi_scope(env_cpu(env), range.base, asid)) {
+        case TLBI_SCOPE_NONE:
+            return;
+        case TLBI_SCOPE_SELF:
+            synced = false;
+            break;
+        default:
+            break;
+        }
+    }
+    if (synced) {
+        tlb_flush_range_by_mmuidx_all_cpus_synced(env_cpu(env), range.base,
+                                                  range.length, idxmap, bits);
+    } else {
+        tlb_flush_range_by_mmuidx(env_cpu(env), range.base, range.length,
+                                  idxmap, bits);
+    }
+}
+
 static void tlbi_aa64_rvae1_write(CPUARMState *env,
                                   const ARMCPRegInfo *ri,
                                   uint64_t value)
@@ -994,8 +1035,7 @@ static void tlbi_aa64_rvae1_write(CPUARMState *env,
      * flush-last-level-only.
      */
 
-    do_rvae_write(env, value, vae1_tlbmask(env),
-                  tlb_force_broadcast(env));
+    do_rvae1_write(env, ri, value, tlb_force_broadcast(env));
 }
 
 static void tlbi_aa64_rvae1is_write(CPUARMState *env,
@@ -1010,7 +1050,7 @@ static void tlbi_aa64_rvae1is_write(CPUARMState *env,
      * shareable specific flushes.
      */
 
-    do_rvae_write(env, value, vae1_tlbmask(env), true);
+    do_rvae1_write(env, ri, value, true);
 }
 
 static void tlbi_aa64_rvae2_write(CPUARMState *env,

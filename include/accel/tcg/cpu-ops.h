@@ -23,6 +23,14 @@
 #include "accel/tcg/tb-cpu-state.h"
 #include "tcg/tcg-mo.h"
 
+/*
+ * Set by a thread around kicks that only announce queued work which may wait
+ * until the vCPU next comes back from native code by itself (a flush of its
+ * softmmu TLB, which native code does not use): @native_kick may then leave
+ * the vCPU alone.
+ */
+extern __thread bool tcg_kick_lazy;
+
 struct TCGCPUOps {
     /**
      * mttcg_supported: multi-threaded TCG is supported
@@ -41,6 +49,12 @@ struct TCGCPUOps {
     bool (*try_native)(CPUState *cpu);
     /** @native_kick: interrupt a vCPU running outside TCG */
     void (*native_kick)(CPUState *cpu);
+    /**
+     * @native_quiesce: called inside an exclusive section that must have
+     * no guest code running at all (cpu_exec_step_atomic): stop the vCPUs
+     * that run outside TCG and do not count as running.
+     */
+    void (*native_quiesce)(void);
 
     /**
      * @precise_smc: Stores which modify code within the current TB force

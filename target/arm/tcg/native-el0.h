@@ -12,6 +12,7 @@
 /* TCGCPUOps hooks (see accel/tcg/cpu-exec.c) */
 bool native_el0_try(CPUState *cs);
 void native_el0_kick(CPUState *cs);
+void native_el0_quiesce(void);
 
 /* TLB maintenance hooks (see tlb-insns.c): keep the host mirror coherent */
 void native_el0_tlbi_all(void);
@@ -28,5 +29,7 @@ enum { TLBI_SCOPE_ALL, TLBI_SCOPE_SELF, TLBI_SCOPE_NONE };
 int native_el0_tlbi_scope(CPUState *cs, uint64_t va, uint16_t asid);
 
 extern bool native_el0_enabled;
+/* ASOFT_TLBI_RANGE_ASID (read at start-up on every host), ASOFT_NATIVE_EL0_SWITCH flips it */
+extern bool native_el0_range_by_asid;
 
 #endif
