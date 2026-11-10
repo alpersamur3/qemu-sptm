@@ -54,6 +54,7 @@
 #include "system/address-spaces.h"
 #include "system/memory.h"
 #include "system/ramblock.h"
+#include "system/runstate.h"
 #include "system/system.h"
 #include "ui/console.h"
 #include "hw/arm/vresearch_pvg.h"
@@ -90,6 +91,7 @@ struct VResearchPVGReimsState {
      * (display_sleep) so a resume restores the screen-off cover. */
     uint8_t *suspend_blob;
     uint32_t suspend_blob_len;
+    bool suspended_early;       /* the blob was made when the machine stopped */
     bool guest_asleep;
     /* the IOSurface device's registers (iosfc_saved_regs), which have no suspend */
     uint64_t iosfc_regs[6];
@@ -820,6 +822,8 @@ static uint32_t *frame_alloc(VResearchPVGReimsState *s)
     return g_malloc0(len);
 }
 
+static void pvg_reims_vm_state(void *opaque, bool running, RunState state);
+
 static void pvg_reims_realize(DeviceState *dev, Error **errp)
 {
     VResearchPVGReimsState *s = VRESEARCH_PVG_REIMS(dev);
@@ -848,6 +852,7 @@ static void pvg_reims_realize(DeviceState *dev, Error **errp)
     /* the guest's RAM is complete only once the machine is */
     s->init_done.notify = pvg_reims_machine_done;
     qemu_add_machine_init_done_notifier(&s->init_done);
+    qemu_add_vm_change_state_handler(pvg_reims_vm_state, s);
 }
 
 static void pvg_reims_init(Object *obj)
@@ -919,13 +924,20 @@ static void pvg_reims_iosfc_load(VResearchPVGReimsState *s)
 }
 
 /*
- * Before the machine is saved: quiesce the device and serialize its state into
- * s->suspend_blob, which vmstate_pvg_reims then writes. Before machine-init-done
- * there is no device and nothing to save.
+ * Quiesce the device and serialize its state into s->suspend_blob, which
+ * vmstate_pvg_reims then writes. Before machine-init-done there is no device and
+ * nothing to save.
+ *
+ * The suspend also writes what only the host's GPU holds (a texture the guest
+ * rendered into, a private buffer) back into the guest's pages, which is where a
+ * resume reads every resource from: the blob has registers only. So it must run
+ * before the machine's RAM is written, and a pre_save runs after it (a snapshot
+ * writes the iterable sections, RAM among them, first). Done there, a loaded
+ * state had the pages as they were before the write-back: a window an app had
+ * drawn once and not touched since came back black, until the app drew again.
  */
-static int pvg_reims_pre_save(void *opaque)
+static int pvg_reims_suspend_to_blob(VResearchPVGReimsState *s)
 {
-    VResearchPVGReimsState *s = opaque;
     RvgBytes state = { NULL, 0 };
 
     g_clear_pointer(&s->suspend_blob, g_free);
@@ -945,6 +957,40 @@ static int pvg_reims_pre_save(void *opaque)
     s->suspend_blob_len = state.length;
     rvg_bytes_free(state);
     return 0;
+}
+
+static int pvg_reims_resume_from_blob(VResearchPVGReimsState *s, const char *when);
+
+/*
+ * The machine stops to be saved (savevm, the quick boot's save), or is paused
+ * (a save may follow while it stands): suspend now, while the RAM is still to be
+ * written. When it runs again with the blob still there (a pause that ended, a
+ * save that failed before its post_save), the device resumes from it.
+ */
+static void pvg_reims_vm_state(void *opaque, bool running, RunState state)
+{
+    VResearchPVGReimsState *s = opaque;
+
+    if (!running) {
+        if ((state == RUN_STATE_SAVE_VM || state == RUN_STATE_PAUSED) &&
+            !s->suspended_early && s->dev) {
+            s->suspended_early = pvg_reims_suspend_to_blob(s) == 0;
+        }
+    } else if (s->suspended_early) {
+        s->suspended_early = false;
+        pvg_reims_resume_from_blob(s, "as the machine runs again");
+    }
+}
+
+/* The blob made when the machine stopped; without one (a save by another way), now. */
+static int pvg_reims_pre_save(void *opaque)
+{
+    VResearchPVGReimsState *s = opaque;
+
+    if (s->suspended_early) {
+        return 0;
+    }
+    return pvg_reims_suspend_to_blob(s);
 }
 
 /* Rebuild the device from the blob so the machine can keep running after a save. */
@@ -979,7 +1025,14 @@ static int pvg_reims_resume_from_blob(VResearchPVGReimsState *s, const char *whe
 
 static void pvg_reims_post_save(void *opaque)
 {
-    pvg_reims_resume_from_blob(opaque, "after save");
+    VResearchPVGReimsState *s = opaque;
+
+    /* (a paused machine stays suspended: a second save writes the same blob) */
+    if (s->suspended_early && !runstate_check(RUN_STATE_SAVE_VM)) {
+        return;
+    }
+    s->suspended_early = false;
+    pvg_reims_resume_from_blob(s, "after save");
 }
 
 static int pvg_reims_post_load(void *opaque, int version_id)
