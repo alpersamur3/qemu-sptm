@@ -145,11 +145,20 @@ struct GtkDisplayState {
     double crown_down_y, crown_last_y, crown_acc;
     bool crown_moved, crown_holding, crown_hover;
     guint crown_hold_id;        /* the crown held still: a long press */
-    /* a headset guest (usb-touchscreen walk-mode=on): a drawn visor around the screen */
+    /* a headset guest (usb-touchscreen walk-mode=on): a drawn Apple Vision Pro around the screen */
     bool vision;
-    GtkWidget *visor;           /* the overlay in a drawn headset: frame, crown, top button, band */
+    GtkWidget *visor;           /* the overlay in the drawn headset: frame, glass, crown, top button */
+    GtkWidget *visor_glass;     /* over the picture: the glass's outline and rim */
+    bool visor_off;             /* the headset is not drawn: the picture alone (F9, ASOFT_FRAME=0) */
+    GtkWidget *visor_row;       /* the side bar's row that says so */
+    cairo_surface_t *visor_under, *visor_over;  /* both layers as last painted, and what they were painted for: */
+    double visor_key[10];       /* the size and the mode (a change paints both again) */
+    double visor_knobs[3];      /* the knobs' hover, press and turn (a change paints the rows above them again) */
+    struct VisorScratch *visor_scratch;     /* memory the painting keeps from one repaint to the next */
     int visor_target;           /* what the mouse button went down on: 0, 1 crown, 2 top button */
     int visor_hover;            /* what the pointer is over, the same way */
+    double visor_phase;         /* the crown's knurling, moved by the wheel */
+    double visor_turn;          /* wheel notches not yet a step of the volume */
     GtkWidget *sidebar_walk;    /* the side bar's walk mode row */
     /* the watch hangs from the window's top edge and swings when the window is moved */
     double swing_angle, swing_vel;  /* radians, radians/s, about the band's pivot */
@@ -210,6 +219,8 @@ struct GtkDisplayState {
     VirtualConsole *ptr_owner;
 
     gboolean full_screen;
+    guint full_screen_row;      /* Windows: the timer that gives a full-screen GL window one row more */
+    int full_screen_tries;
 
     GdkCursor *null_cursor;
     Notifier mouse_mode_notifier;
