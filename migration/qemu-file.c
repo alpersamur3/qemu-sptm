@@ -65,6 +65,8 @@ struct QEMUFile {
 
     bool can_pass_fd;
     QTAILQ_HEAD(, FdEntry) fds;
+
+    QEMUFileReleaseRAM *release_ram;    /* else madvise(DONTNEED) */
 };
 
 /*
@@ -238,6 +240,21 @@ static bool qemu_file_is_writable(QEMUFile *f)
     return f->is_writable;
 }
 
+void qemu_file_set_release_ram(QEMUFile *f, QEMUFileReleaseRAM *release)
+{
+    f->release_ram = release;
+}
+
+static void qemu_iovec_release_range(QEMUFile *f, struct iovec *iov)
+{
+    if (f->release_ram) {
+        f->release_ram(iov->iov_base, iov->iov_len);
+    } else if (qemu_madvise(iov->iov_base, iov->iov_len, QEMU_MADV_DONTNEED) < 0) {
+        error_report("migrate: madvise DONTNEED failed %p %zd: %s",
+                     iov->iov_base, iov->iov_len, strerror(errno));
+    }
+}
+
 static void qemu_iovec_release_ram(QEMUFile *f)
 {
     struct iovec iov;
@@ -248,10 +265,14 @@ static void qemu_iovec_release_ram(QEMUFile *f)
     if (idx >= f->iovcnt) {
         return;
     }
+    /* a release_ram frees for good: only pages the write got */
+    if (f->release_ram && f->last_error) {
+        goto out;
+    }
     iov = f->iov[idx];
 
-    /* The madvise() in the loop is called for iov within a continuous range and
-     * then reinitialize the iov. And in the end, madvise() is called for the
+    /* The release in the loop is called for iov within a continuous range and
+     * then reinitialize the iov. And in the end, it is called for the
      * last iov.
      */
     while ((idx = find_next_bit(f->may_free, f->iovcnt, idx + 1)) < f->iovcnt) {
@@ -260,16 +281,11 @@ static void qemu_iovec_release_ram(QEMUFile *f)
             iov.iov_len += f->iov[idx].iov_len;
             continue;
         }
-        if (qemu_madvise(iov.iov_base, iov.iov_len, QEMU_MADV_DONTNEED) < 0) {
-            error_report("migrate: madvise DONTNEED failed %p %zd: %s",
-                         iov.iov_base, iov.iov_len, strerror(errno));
-        }
+        qemu_iovec_release_range(f, &iov);
         iov = f->iov[idx];
     }
-    if (qemu_madvise(iov.iov_base, iov.iov_len, QEMU_MADV_DONTNEED) < 0) {
-            error_report("migrate: madvise DONTNEED failed %p %zd: %s",
-                         iov.iov_base, iov.iov_len, strerror(errno));
-    }
+    qemu_iovec_release_range(f, &iov);
+out:
     memset(f->may_free, 0, sizeof(f->may_free));
 }
 

@@ -51,6 +51,15 @@ uint64_t qemu_file_transferred(QEMUFile *f);
 void qemu_put_buffer_async(QEMUFile *f, const uint8_t *buf, size_t size,
                            bool may_free);
 
+/*
+ * How the pages put with may_free go once a flush has written them: by
+ * default madvise(DONTNEED) (postcopy's release-ram); with @release, through
+ * it instead (ram.c's savevm release, which also frees a shared file's
+ * pages), and only when the write succeeded.
+ */
+typedef void QEMUFileReleaseRAM(void *host, size_t len);
+void qemu_file_set_release_ram(QEMUFile *f, QEMUFileReleaseRAM *release);
+
 #include "migration/qemu-file-types.h"
 
 size_t coroutine_mixed_fn qemu_peek_buffer(QEMUFile *f, uint8_t **buf, size_t size, size_t offset);

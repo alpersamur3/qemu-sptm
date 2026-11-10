@@ -63,6 +63,13 @@ bool delete_snapshot(const char *name,
                     Error **errp);
 
 /**
+ * snapshot_guest_ram_released: a save_snapshot with release-ram freed the
+ * guest's RAM as it wrote it, and no load_snapshot has put it back since: the
+ * machine must not run.
+ */
+bool snapshot_guest_ram_released(void);
+
+/**
  * load_snapshot_resume: Restore runstate after loading snapshot.
  * @state: state to restore
  */
