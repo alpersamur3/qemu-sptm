@@ -2599,6 +2599,11 @@ static void gd_create_watch_case(GtkDisplayState *s)
 {
     GtkWidget *corners = gtk_drawing_area_new();
 
+    /*
+     * Without a window of its own: an overlay's pass-through lets the pointer through only to what has none, and a
+     * drawing area's window over the screen took every move and click (the guest got none)
+     */
+    gtk_widget_set_has_window(corners, FALSE);
     gd_watch_state = s;
     s->swing_born = g_get_monotonic_time();
     s->watch_case = gtk_event_box_new();
@@ -2913,6 +2918,8 @@ static gboolean gd_visor_tooltip(GtkWidget *widget, int x, int y, gboolean keybo
 static void gd_create_visor(GtkDisplayState *s)
 {
     s->visor_glass = gtk_drawing_area_new();
+    /* no window of its own, as the watch's corners: else the glass takes the pointer from the screen */
+    gtk_widget_set_has_window(s->visor_glass, FALSE);
     s->visor = gtk_event_box_new();
     gtk_event_box_set_visible_window(GTK_EVENT_BOX(s->visor), FALSE);
     gtk_widget_set_app_paintable(s->visor, TRUE);
