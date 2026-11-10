@@ -2595,6 +2595,24 @@ static gboolean gd_watch_leave(GtkWidget *widget, GdkEventCrossing *e, void *opa
     return FALSE;
 }
 
+/*
+ * A word about the crown or the side button, only while the pointer is on one: the case's own tooltip came up over
+ * the screen too (a child without a tooltip of its own shows its parent's), wherever the pointer was
+ */
+static gboolean gd_watch_tooltip(GtkWidget *widget, int x, int y, gboolean keyboard, GtkTooltip *tip,
+                                 void *opaque)
+{
+    int hit = keyboard ? 0 : gd_watch_hit(opaque, x, y);
+
+    if (!hit) {
+        return FALSE;
+    }
+    gtk_tooltip_set_text(tip, hit == 1 ? "Digital Crown: drag or wheel to turn, click to press (F1), hold for Siri. "
+                                         "Move the window: the watch swings."
+                                       : "Side button (F2)");
+    return TRUE;
+}
+
 static void gd_create_watch_case(GtkDisplayState *s)
 {
     GtkWidget *corners = gtk_drawing_area_new();
@@ -2612,8 +2630,8 @@ static void gd_create_watch_case(GtkDisplayState *s)
     gtk_widget_add_events(s->watch_case, GDK_BUTTON_PRESS_MASK | GDK_BUTTON_RELEASE_MASK |
                           GDK_POINTER_MOTION_MASK | GDK_LEAVE_NOTIFY_MASK |
                           GDK_SCROLL_MASK | GDK_SMOOTH_SCROLL_MASK);
-    gtk_widget_set_tooltip_text(s->watch_case, "Digital Crown: drag or wheel to turn, click to press (F1), "
-                                "hold for Siri. Side button below it (F2). Move the window: the watch swings.");
+    gtk_widget_set_has_tooltip(s->watch_case, TRUE);
+    g_signal_connect(s->watch_case, "query-tooltip", G_CALLBACK(gd_watch_tooltip), s);
     gtk_widget_set_margin_start(s->overlay, WATCH_LEFT + WATCH_BEZEL);
     gtk_widget_set_margin_end(s->overlay, WATCH_RIGHT + WATCH_BEZEL);
     gtk_widget_set_margin_top(s->overlay, WATCH_TOP + WATCH_BEZEL);
