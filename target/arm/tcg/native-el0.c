@@ -516,6 +516,10 @@ typedef struct StubSlot {
     uint32_t phase_pad;
     int32_t sig, si_code;
     int32_t owner_pid;       /* the stub process whose thread serves this slot */
+    /* the stub thread's signal handlers since it started (diagnostics, stub_h_enter):
+     * the deepest nesting, and the least room above altbase one started with, in KiB */
+    uint32_t hdepth_max;        /* 0: no handler ran yet */
+    int32_t hroom_min_kib;
     uint64_t fault_addr;
     uint64_t tpidr;             /* guest TPIDR_EL0: in on entry, out on a trap */
     StubFill fill;
@@ -1099,18 +1103,51 @@ static void *sampler_main(void *arg)
                             (sst * 1000000 + cntfrq / 2) / cntfrq, spare_fixed < 0 ? "auto:" : "",
                             qatomic_read(&shm->spin_spare), qatomic_read(&cpus_allowed), qn, sn);
                 }
+                /* the stub threads' signal handlers: deepest nesting, least alt stack room (stub_h_enter) */
+                char hbuf[128];
+                {
+                    uint32_t hd = 0;
+                    int32_t hr = INT32_MAX;
+                    int hds = -1, hdv = -1, hrs = -1, hrv = -1;
+                    int nv = (int)qatomic_read(&shm->nvcpus);
+                    for (int s = 0; s < nstubs; s++) {
+                        for (int v = 0; v < nv && v < STUB_VCPUS; v++) {
+                            StubSlot *o = &shm->slot[s][v];
+                            uint32_t d = qatomic_read(&o->hdepth_max);
+                            int32_t r = qatomic_read(&o->hroom_min_kib);
+                            if (!d) {
+                                continue;       /* no handler ran on that thread yet */
+                            }
+                            if (d > hd) {
+                                hd = d; hds = s; hdv = v;
+                            }
+                            if (r < hr) {
+                                hr = r; hrs = s; hrv = v;
+                            }
+                        }
+                    }
+                    if (!hd) {
+                        snprintf(hbuf, sizeof(hbuf), " | handler depth max 0");
+                    } else if (hr == INT32_MAX) {
+                        snprintf(hbuf, sizeof(hbuf), " | handler depth max %u (stub %d vcpu %d) room min - KiB",
+                                 hd, hds, hdv);
+                    } else {
+                        snprintf(hbuf, sizeof(hbuf), " | handler depth max %u (stub %d vcpu %d)"
+                                 " room min %d KiB (stub %d vcpu %d)", hd, hds, hdv, hr, hrs, hrv);
+                    }
+                }
                 fprintf(stderr, "el-sample t=%" PRId64 "s stubs: waits %" PRIu64 " slow %" PRIu64
                         " timeouts %" PRIu64 " spawned %" PRIu64 " tlbi-asid hit %" PRIu64 " miss %" PRIu64
                         " asid-max %d root-changes %" PRIu64 " concurrent %" PRIu64 " denials %" PRIu64
                         " tlbi all/asid/page-asid/page-any/range %" PRIu64 "/%" PRIu64 "/%" PRIu64
                         "/%" PRIu64 "/%" PRIu64 " deny until/off/mmu/fpen/ss/sve/delay/window/ready %" PRIu64
-                        "/%" PRIu64 "/%" PRIu64 "/%" PRIu64 "/%" PRIu64 "/%" PRIu64 "/%" PRIu64 "/%" PRIu64 "/%" PRIu64 "\n",
+                        "/%" PRIu64 "/%" PRIu64 "/%" PRIu64 "/%" PRIu64 "/%" PRIu64 "/%" PRIu64 "/%" PRIu64 "/%" PRIu64 "%s\n",
                         (now - t0) / 1000000000LL, inval_waits, inval_slow, inval_timeouts, stub_spawns,
                         tlbi_asid_hits, tlbi_asid_misses, asid_max_seen, asid_root_changes, asid_root_concurrent,
                         stub_denials, tlbi_kind[TL_ALL], tlbi_kind[TL_ASID], tlbi_kind[TL_PAGE_ASID],
                         tlbi_kind[TL_PAGE_ANY], tlbi_kind[TL_RANGE], deny_reason[DR_UNTIL], deny_reason[DR_OFF],
                         deny_reason[DR_MMU], deny_reason[DR_FPEN], deny_reason[DR_SS], deny_reason[DR_SVE],
-                        deny_reason[DR_DELAY], deny_reason[DR_WINDOW], deny_reason[DR_READY]);
+                        deny_reason[DR_DELAY], deny_reason[DR_WINDOW], deny_reason[DR_READY], hbuf);
             }
         }
         lnat = nat; lhand = hand; lent = ent; lenter = enters; lfill = fills; lmrs = mrs; lpq = pq; lps = ps;
@@ -1962,6 +1999,20 @@ static void inproc_tlbi_all(void)
 /* (this code runs in the forked processes; it shares nothing with QEMU   */
 /*  but the StubShm mapping and the inherited knobs)                      */
 
+/* one entry of a stub thread's signal handlers (diagnostics, stub_h_enter) */
+#define HRING           16
+#define HROOM_OFF       INT32_MIN       /* the handler does not run on (or next to) the alt stack */
+typedef struct StubHEnt {
+    uint64_t pc, sp;            /* the interrupted context */
+    int64_t x18;                /* its x18 minus host_x18 (in guest code: the guest's x18) */
+    int32_t room;               /* the handler's frame above altbase, bytes, or HROOM_OFF */
+    int16_t code;               /* si_code */
+    uint8_t sig;
+    uint8_t phase;              /* slot->phase at entry */
+    uint8_t depth;              /* the nesting with this handler (255: that or more) */
+    uint8_t in_guest;
+} StubHEnt;
+
 typedef struct StubThread {
     StubSlot *slot;
     int vcpu;
@@ -1972,9 +2023,19 @@ typedef struct StubThread {
     sigjmp_buf loop;
     sigjmp_buf probe;           /* the trap handler's guarded read of the word at pc */
     int probing;
+    int probe_depth;            /* hdepth where st->probe was set */
     uint32_t entries;           /* the per-entry checks run on every 1024th */
     size_t uc_off;              /* offset of the ucontext inside the frame */
     int tmpl_ok;
+    /* crash diagnostics: the signal handlers on this thread (stub_h_enter) */
+    int hdepth;                 /* handler levels live right now */
+    int hdepth_max;
+    int32_t hroom_min;          /* bytes */
+    uint32_t hpos;              /* entries so far; hring keeps the last HRING */
+    uint32_t deep_reports;
+    StubHEnt hring[HRING];
+    size_t diag_len;            /* the light writer: the line(s) being built in diag */
+    char diag[4096];
     unsigned char tmpl[8192] __attribute__((aligned(16)));  /* a kernel-built rt_sigframe */
 } StubThread;
 
@@ -2255,6 +2316,274 @@ static void stub_report(StubThread *st, uint32_t status)
  * (its canary is read through TPIDR, from a page the mirror may have dropped). */
 #define STUB_HANDLER __attribute__((no_stack_protector))
 
+/*
+ * Crash diagnostics for the handlers below. A stub died once (2026-11-10)
+ * inside fprintf with SP 4 KiB below its 1 MiB alt stack: either some 200
+ * nested signal frames or a handler that started near the bottom. The
+ * handlers nest (SA_NODEFER), so each entry is counted (st->hdepth) and kept
+ * in a ring, and what they print goes through a light writer instead of
+ * stdio: Bionic's __vfprintf takes ~1 KiB of stack, and for the unbuffered
+ * stderr __sbprintf adds a BUFSIZ buffer. The writer builds the line in the
+ * thread's own buffer with a few dozen bytes of stack; a nested handler's
+ * line goes after the part of the line it interrupted and is written alone.
+ */
+#define DIAG_FN __attribute__((noinline, cold, no_stack_protector))
+
+static DIAG_FN void dl_put(StubThread *st, const char *s, size_t n)
+{
+    size_t at = st->diag_len;
+    if (at >= sizeof(st->diag)) {
+        return;
+    }
+    if (n > sizeof(st->diag) - at) {
+        n = sizeof(st->diag) - at;
+    }
+    st->diag_len = at + n;          /* claimed before the copy: a nested line goes after it */
+    barrier();
+    for (size_t i = 0; i < n; i++) {
+        st->diag[at + i] = s[i];
+    }
+}
+
+static DIAG_FN void dl_str(StubThread *st, const char *s)
+{
+    size_t n = 0;
+    while (s[n]) {
+        n++;
+    }
+    dl_put(st, s, n);
+}
+
+static DIAG_FN void dl_hex(StubThread *st, uint64_t v)
+{
+    char b[18];
+    int i = sizeof(b);
+    do {
+        b[--i] = "0123456789abcdef"[v & 15];
+        v >>= 4;
+    } while (v);
+    b[--i] = 'x';
+    b[--i] = '0';
+    dl_put(st, b + i, sizeof(b) - i);
+}
+
+static DIAG_FN void dl_dec(StubThread *st, int64_t v)
+{
+    char b[20];
+    int i = sizeof(b);
+    uint64_t u = v < 0 ? -(uint64_t)v : (uint64_t)v;
+    do {
+        b[--i] = '0' + u % 10;
+        u /= 10;
+    } while (u);
+    if (v < 0) {
+        b[--i] = '-';
+    }
+    dl_put(st, b + i, sizeof(b) - i);
+}
+
+/* write out the line that started at @start (st->diag_len then), then drop it */
+static DIAG_FN void dl_flush(StubThread *st, size_t start)
+{
+    size_t end = st->diag_len, at = start;
+    if (end > sizeof(st->diag)) {
+        end = sizeof(st->diag);
+    }
+    if (end > start && end == sizeof(st->diag)) {
+        st->diag[end - 1] = '\n';   /* cut short */
+    }
+    while (at < end) {
+        ssize_t w = write(2, st->diag + at, end - at);
+        if (w < 0 && errno == EINTR) {
+            continue;
+        }
+        if (w <= 0) {
+            break;
+        }
+        at += w;
+    }
+    barrier();
+    st->diag_len = start;
+}
+
+static DIAG_FN void dl_room(StubThread *st, int32_t room)
+{
+    if (room == HROOM_OFF) {
+        dl_str(st, "off");
+    } else {
+        dl_dec(st, room);
+    }
+}
+
+/* depth, room and the ring, newest entry first */
+static DIAG_FN void dl_handlers(StubThread *st, int32_t room)
+{
+    dl_str(st, " | handler depth ");
+    dl_dec(st, st->hdepth);
+    dl_str(st, " room ");
+    dl_room(st, room);
+    dl_str(st, " (max depth ");
+    dl_dec(st, st->hdepth_max);
+    dl_str(st, " room min ");
+    dl_room(st, st->hroom_min == INT32_MAX ? HROOM_OFF : st->hroom_min);
+    dl_str(st, ") | ring, newest first (sig/code, depth, phase, in_guest, interrupted pc sp, its x18-host_x18, room):");
+    uint32_t pos = st->hpos, n = pos < HRING ? pos : HRING;
+    for (uint32_t k = 0; k < n; k++) {
+        const StubHEnt *e = &st->hring[(pos - 1 - k) & (HRING - 1)];
+        dl_str(st, " [");
+        dl_dec(st, k);
+        dl_str(st, "] ");
+        dl_dec(st, e->sig);
+        dl_str(st, "/");
+        dl_dec(st, e->code);
+        dl_str(st, " d");
+        dl_dec(st, e->depth);
+        dl_str(st, " ph");
+        dl_dec(st, e->phase);
+        dl_str(st, " g");
+        dl_dec(st, e->in_guest);
+        dl_str(st, " pc=");
+        dl_hex(st, e->pc);
+        dl_str(st, " sp=");
+        dl_hex(st, e->sp);
+        dl_str(st, e->x18 >= 0 ? " x18+" : " x18");
+        dl_dec(st, e->x18);
+        dl_str(st, " r=");
+        dl_room(st, e->room);
+    }
+}
+
+/* depth >= 4 or less than 256 KiB of room at a handler entry: at most 3 lines per thread */
+static DIAG_FN void stub_diag_deep(StubThread *st, int32_t room)
+{
+    int saved = errno;
+    uint32_t n = ++st->deep_reports;
+    size_t start = st->diag_len;
+    dl_str(st, "native-el0 stub");
+    dl_dec(st, my_idx);
+    dl_str(st, " vcpu ");
+    dl_dec(st, st->vcpu);
+    dl_str(st, ": deep handler (report ");
+    dl_dec(st, n);
+    dl_str(st, "/3) altbase=");
+    dl_hex(st, (uintptr_t)st->altbase);
+    dl_handlers(st, room);
+    dl_str(st, "\n");
+    dl_flush(st, start);
+    errno = saved;
+}
+
+static DIAG_FN void stub_diag_off_alt(StubThread *st, int sig, const ucontext_t *uc,
+                                      const void *frame, uint32_t phase_before, int32_t room)
+{
+    int saved = errno;
+    size_t start = st->diag_len;
+    dl_str(st, "native-el0 stub");
+    dl_dec(st, my_idx);
+    dl_str(st, ": handler for sig ");
+    dl_dec(st, sig);
+    dl_str(st, " off the alt stack: sp=");
+    dl_hex(st, (uintptr_t)frame);
+    dl_str(st, " altbase=");
+    dl_hex(st, (uintptr_t)st->altbase);
+    dl_str(st, " guest sp=");
+    dl_hex(st, uc->uc_mcontext.sp);
+    dl_str(st, " pc=");
+    dl_hex(st, uc->uc_mcontext.pc);
+    dl_str(st, " phase=");
+    dl_dec(st, phase_before);
+    dl_handlers(st, room);
+    dl_str(st, "\n");
+    dl_flush(st, start);
+    errno = saved;
+}
+
+static DIAG_FN void stub_diag_host_signal(StubThread *st, int sig, const siginfo_t *si,
+                                          const ucontext_t *uc, uint64_t tp, int32_t room)
+{
+    int saved = errno;
+    size_t start = st->diag_len;
+    dl_str(st, "native-el0 stub");
+    dl_dec(st, my_idx);
+    dl_str(st, ": host signal ");
+    dl_dec(st, sig);
+    dl_str(st, " code ");
+    dl_dec(st, si->si_code);
+    dl_str(st, " at pc=");
+    dl_hex(st, uc->uc_mcontext.pc);
+    dl_str(st, " addr=");
+    dl_hex(st, (uintptr_t)si->si_addr);
+    dl_str(st, " in_guest=");
+    dl_dec(st, st->in_guest);
+    dl_str(st, " tid=");
+    dl_dec(st, syscall(SYS_gettid));
+    dl_str(st, " vcpu=");
+    dl_dec(st, st->vcpu);
+    dl_str(st, " st=");
+    dl_hex(st, (uintptr_t)st);
+    dl_str(st, " altbase=");
+    dl_hex(st, (uintptr_t)st->altbase);
+    dl_str(st, " sp=");
+    dl_hex(st, uc->uc_mcontext.sp);
+    dl_str(st, " lr=");
+    dl_hex(st, uc->uc_mcontext.regs[30]);
+    dl_str(st, " x22=");
+    dl_hex(st, uc->uc_mcontext.regs[22]);
+    dl_str(st, " tpidr=");
+    dl_hex(st, tp);
+    dl_str(st, " host_tpidr=");
+    dl_hex(st, st->host_tpidr);
+    dl_str(st, " x18=");
+    dl_hex(st, uc->uc_mcontext.regs[18]);
+    dl_str(st, " host_x18=");
+    dl_hex(st, st->host_x18);
+    dl_str(st, " x29=");
+    dl_hex(st, uc->uc_mcontext.regs[29]);
+    dl_handlers(st, room);
+    dl_str(st, "\n");
+    dl_flush(st, start);
+    errno = saved;
+}
+
+/*
+ * Every handler entry on a stub thread, right after load_host_regs: the
+ * nesting goes up by one (each exit path takes it back, a siglongjmp sets it
+ * to where it lands) and the entry goes into the ring; a few loads and
+ * stores. @frame is the handler's frame address; returns its room above
+ * altbase in bytes, HROOM_OFF when it is not on (or next to) the alt stack.
+ */
+static inline __attribute__((always_inline)) int32_t
+stub_h_enter(StubThread *st, int sig, const siginfo_t *si, const ucontext_t *uc, const void *frame)
+{
+    int d = ++st->hdepth;
+    /* without the top byte: altbase carries Bionic's heap tag (0xb4), and so does SP on the alt stack */
+    const uintptr_t tbi = 0x00ffffffffffffffULL;
+    intptr_t r = (intptr_t)(((uintptr_t)frame & tbi) - ((uintptr_t)st->altbase & tbi));
+    int32_t room = r >= -(intptr_t)ALT_SIZE && r < (intptr_t)ALT_SIZE ? (int32_t)r : HROOM_OFF;
+    StubHEnt *e = &st->hring[st->hpos++ & (HRING - 1)];
+    e->pc = uc->uc_mcontext.pc;
+    e->sp = uc->uc_mcontext.sp;
+    e->x18 = (int64_t)(uc->uc_mcontext.regs[18] - st->host_x18);
+    e->room = room;
+    e->code = si->si_code;
+    e->sig = sig;
+    e->phase = qatomic_read(&st->slot->phase);
+    e->depth = d < 255 ? d : 255;
+    e->in_guest = st->in_guest;
+    if (room != HROOM_OFF && room < st->hroom_min) {
+        st->hroom_min = room;
+        qatomic_set(&st->slot->hroom_min_kib, room >> 10);
+    }
+    if (d > st->hdepth_max) {
+        st->hdepth_max = d;
+        qatomic_set(&st->slot->hdepth_max, d);
+    }
+    if (unlikely(d >= 4 || (room != HROOM_OFF && room < (256 << 10))) && st->deep_reports < 3) {
+        stub_diag_deep(st, room);
+    }
+    return room;
+}
+
 static inline void load_host_regs(StubThread *st)
 {
     write_tpidr(st->host_tpidr);
@@ -2276,19 +2605,20 @@ static STUB_HANDLER void stub_trap_handler(int sig, siginfo_t *si, void *uc_)
         return;
     }
     load_host_regs(st);
+    int32_t room = stub_h_enter(st, sig, si, uc, __builtin_frame_address(0));
     if (st->probing && (sig == SIGSEGV || sig == SIGBUS)) {
+        st->hdepth = st->probe_depth;   /* back to the level that set the probe */
         siglongjmp(st->probe, 1);       /* the read of the word at pc below faulted */
     }
     StubSlot *slot = st->slot;
     uint64_t pc = uc->uc_mcontext.pc;
     uint32_t phase_before = qatomic_read(&slot->phase);
     qatomic_set(&slot->phase, PH_TRAP);
-    if ((uintptr_t)&uc < (uintptr_t)st->altbase || (uintptr_t)&uc >= (uintptr_t)st->altbase + ALT_SIZE) {
+    if (room < 0) {
+        /* not inside [altbase, altbase + ALT_SIZE) */
         static int n;
         if (n++ < 3) {
-            fprintf(stderr, "native-el0 stub%d: handler for sig %d off the alt stack: sp=%p altbase=%p"
-                    " guest sp=%#" PRIx64 " pc=%#" PRIx64 " phase=%u\n", my_idx, sig, (void *)&uc,
-                    st->altbase, (uint64_t)uc->uc_mcontext.sp, pc, phase_before);
+            stub_diag_off_alt(st, sig, uc, __builtin_frame_address(0), phase_before, room);
         }
     }
 
@@ -2305,17 +2635,13 @@ static STUB_HANDLER void stub_trap_handler(int sig, siginfo_t *si, void *uc_)
     if (!guest) {
         if (sig == sig_kick) {
             qatomic_set(&slot->phase, phase_before);
+            st->hdepth--;
             write_tpidr(tp);
             return;             /* not in guest code: the entry path looks at kick_pending */
         }
-        fprintf(stderr, "native-el0 stub%d: host signal %d code %d at pc=%#" PRIx64
-                " addr=%p in_guest=%d tid=%ld vcpu=%d st=%p altbase=%p sp=%#" PRIx64
-                " lr=%#" PRIx64 " x22=%#" PRIx64 " tpidr=%#" PRIx64 " host_tpidr=%#" PRIx64 "\n",
-                my_idx, sig, si->si_code, pc, si->si_addr, st->in_guest,
-                (long)syscall(SYS_gettid), st->vcpu, (void *)st, st->altbase,
-                (uint64_t)uc->uc_mcontext.sp, (uint64_t)uc->uc_mcontext.regs[30],
-                (uint64_t)uc->uc_mcontext.regs[22], tp, st->host_tpidr);
+        stub_diag_host_signal(st, sig, si, uc, tp, room);
         signal(sig, SIG_DFL);           /* re-executes and dies with a tombstone */
+        st->hdepth--;
         write_tpidr(tp);
         return;
     }
@@ -2328,6 +2654,7 @@ static STUB_HANDLER void stub_trap_handler(int sig, siginfo_t *si, void *uc_)
      */
     if (sig == SIGILL && pac_off && in_window(pc) && qatomic_read(&shm->pacga_local)) {
         volatile uint32_t w = 0;
+        st->probe_depth = st->hdepth;
         st->probing = 1;
         barrier();
         if (sigsetjmp(st->probe, 0) == 0) {
@@ -2346,6 +2673,7 @@ static STUB_HANDLER void stub_trap_handler(int sig, siginfo_t *si, void *uc_)
             qatomic_inc(&my_ctl->pacga_emul);
             /* x18 and the rest come back from the frame; TPIDR_EL0 is not in it */
             qatomic_set(&slot->phase, phase_before);
+            st->hdepth--;
             write_tpidr(tp);
             return;
         }
@@ -2371,6 +2699,9 @@ static STUB_HANDLER void stub_trap_handler(int sig, siginfo_t *si, void *uc_)
     memcpy(&slot->uc, uc, sizeof(ucontext_t));
     qatomic_set(&slot->phase, PH_REPORTED);
     stub_report(st, status);
+    /* the loop runs outside any handler: every level ends here */
+    st->hdepth = 0;
+    st->diag_len = 0;
     siglongjmp(st->loop, 1);
 }
 
@@ -2383,10 +2714,12 @@ static STUB_HANDLER void stub_inval_handler(int sig, siginfo_t *si, void *uc_)
         return;                     /* not one of the vCPU threads */
     }
     load_host_regs(st);
+    stub_h_enter(st, sig, si, uc_, __builtin_frame_address(0));
     uint32_t before = qatomic_read(&st->slot->phase);
     qatomic_set(&st->slot->phase, PH_INVAL);
     apply_pending(st);
     qatomic_set(&st->slot->phase, before);
+    st->hdepth--;
     write_tpidr(tp);
 }
 
@@ -2491,6 +2824,10 @@ static void *stub_thread_main(void *arg)
     }
     st->host_tpidr = read_tpidr();
     __asm__ volatile("mov %0, x18" : "=r"(st->host_x18));
+    /* handler statistics from this thread's start on (a respawned stub starts over) */
+    st->hroom_min = INT32_MAX;
+    qatomic_set(&slot->hroom_min_kib, INT32_MAX);
+    qatomic_set(&slot->hdepth_max, 0);
     threads_by_vcpu[st->vcpu] = st;
     smp_wmb();
     tids_by_vcpu[st->vcpu] = (uint32_t)syscall(SYS_gettid);
