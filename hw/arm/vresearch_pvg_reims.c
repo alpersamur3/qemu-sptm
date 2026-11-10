@@ -83,6 +83,9 @@ struct VResearchPVGReimsState {
 
     uint32_t width, height;     /* the display's one mode */
     uint32_t ppi;               /* its pixel density; 0: an iPhone's size */
+    uint32_t hz;                /* its refresh rate */
+    uint32_t max_fps;           /* at most so many of the guest's frames a second (0: all) */
+    int64_t paced;              /* the frame thread: the last paced commit */
 
     Notifier init_done;
 
@@ -355,6 +358,24 @@ static void frame_read_back(VResearchPVGReimsState *s)
     if (st != RVG_OK || !frame) {
         frame_error(s, "encode refused", st);
         return;
+    }
+    if (s->max_fps) {
+        /*
+         * max-fps=N. The encoded frame is in flight until it completes, and the
+         * guest's next present waits for frames in flight (up to 2 s) before the
+         * guest hears that it was presented: held here until its turn, it sets
+         * the pace of a guest that presents every refresh whether anything
+         * changed or not (visionOS: 60 a second with nothing moving, whatever
+         * rate the mode says).
+         */
+        int64_t due = s->paced + NANOSECONDS_PER_SECOND / s->max_fps;
+        int64_t now = get_clock();
+
+        if (now < due) {
+            g_usleep((due - now) / 1000);
+            now = get_clock();
+        }
+        s->paced = now;
     }
     st = rvg_frame_commit(frame);
     if (st == RVG_OK) {
@@ -665,7 +686,12 @@ static void pvg_reims_machine_done(Notifier *notifier, void *data)
         .callbacks = &dcb,
         .window = NULL,
     };
-    RvgDisplayMode mode = { s->width, s->height, 0, 60.0 };
+    /*
+     * hz=N: the mode's refresh rate, as the guest reads it (its display's
+     * vertical sync rate). It does not set the pace of visionOS's compositor,
+     * which presents 60 times a second at hz=30 too: max-fps does.
+     */
+    RvgDisplayMode mode = { s->width, s->height, 0, s->hz ? s->hz : 60.0 };
     /* BGRA8, unconverted: the bytes of the console's x8r8g8b8 surface */
     RvgFrameTargetConfig tcfg = {
         .struct_size = sizeof(tcfg),
@@ -872,6 +898,8 @@ static const Property pvg_reims_properties[] = {
     DEFINE_PROP_UINT32("width", VResearchPVGReimsState, width, 1179),
     DEFINE_PROP_UINT32("height", VResearchPVGReimsState, height, 2556),
     DEFINE_PROP_UINT32("ppi", VResearchPVGReimsState, ppi, 0),
+    DEFINE_PROP_UINT32("hz", VResearchPVGReimsState, hz, 60),
+    DEFINE_PROP_UINT32("max-fps", VResearchPVGReimsState, max_fps, 0),
 };
 
 /* --- save state: the reims device suspends to a blob and resumes from it --- */

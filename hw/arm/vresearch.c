@@ -184,6 +184,8 @@ struct VResearchState {
     GMappedFile           *bootkc_m, *dtree_m, *sptm_m, *txm_m, *tc_m, *ramdisk_m;
     char                  *fb;
     uint32_t               ppi;
+    uint32_t               hz;
+    uint32_t               max_fps;
     bool                   unauth_root;
     VResearchPVGMode       pvg;
     bool                   sep;
@@ -229,6 +231,30 @@ static void ppi_set(Object *obj, Visitor *v, const char *name, void *opaque,
                     Error **errp)
 {
     visit_type_uint32(v, name, &VRESEARCH_MACHINE(obj)->ppi, errp);
+}
+
+static void hz_get(Object *obj, Visitor *v, const char *name, void *opaque,
+                   Error **errp)
+{
+    visit_type_uint32(v, name, &VRESEARCH_MACHINE(obj)->hz, errp);
+}
+
+static void hz_set(Object *obj, Visitor *v, const char *name, void *opaque,
+                   Error **errp)
+{
+    visit_type_uint32(v, name, &VRESEARCH_MACHINE(obj)->hz, errp);
+}
+
+static void max_fps_get(Object *obj, Visitor *v, const char *name, void *opaque,
+                        Error **errp)
+{
+    visit_type_uint32(v, name, &VRESEARCH_MACHINE(obj)->max_fps, errp);
+}
+
+static void max_fps_set(Object *obj, Visitor *v, const char *name, void *opaque,
+                        Error **errp)
+{
+    visit_type_uint32(v, name, &VRESEARCH_MACHINE(obj)->max_fps, errp);
 }
 
 static void fb_set(Object *obj, const char *val, Error **errp)
@@ -686,6 +712,12 @@ static void create_pvg(VResearchState *s)
     if (s->ppi && s->pvg == VR_PVG_REIMS) {
         qdev_prop_set_uint32(dev, "ppi", s->ppi);
     }
+    if (s->hz && s->pvg == VR_PVG_REIMS) {
+        qdev_prop_set_uint32(dev, "hz", s->hz);
+    }
+    if (s->max_fps && s->pvg == VR_PVG_REIMS) {
+        qdev_prop_set_uint32(dev, "max-fps", s->max_fps);
+    }
     sysbus_realize_and_unref(sbd, &error_fatal);
     sysbus_mmio_map(sbd, 0, memmap[VR_APV_GFX].base);
     sysbus_mmio_map(sbd, 1, memmap[VR_APV_IOSFC].base);
@@ -1029,6 +1061,15 @@ static void vresearch_machine_class_init(ObjectClass *oc, const void *data)
     object_class_property_set_description(oc, "ppi",
         "pvg=reims: the display's pixel density, which sets the physical size "
         "the guest reads (a 41 mm Apple Watch: 326); default an iPhone's size");
+    object_class_property_add(oc, "hz", "uint32", hz_get, hz_set, NULL, NULL);
+    object_class_property_set_description(oc, "hz",
+        "pvg=reims: the refresh rate of the display's mode, as the guest "
+        "reads it (default 60); max-fps sets the pace of its presents");
+    object_class_property_add(oc, "max-fps", "uint32", max_fps_get, max_fps_set, NULL, NULL);
+    object_class_property_set_description(oc, "max-fps",
+        "pvg=reims: at most so many of the guest's frames a second (default 0: "
+        "all); sets the pace of a guest that presents every refresh, as "
+        "visionOS does");
     object_class_property_set_description(oc, "fb",
         "Boot framebuffer WxH (boot_args.Video, /vram), or off (default)");
     object_class_property_add_str(oc, "pvg", pvg_get, pvg_set);
