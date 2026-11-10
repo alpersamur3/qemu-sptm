@@ -691,6 +691,21 @@ static void pvg_reims_machine_done(Notifier *notifier, void *data)
         error_report("vresearch-pvg-reims: no RAM for the GPU's memory map");
         exit(1);
     }
+#ifdef _WIN32
+    /*
+     * Guest RAM without a section: Windows had no commit for one when the
+     * machine was made, and the plain allocation that took its place cannot
+     * be mapped a second time. The library would still make its devices, and
+     * the guest would then find no Metal device and stay black: said here.
+     */
+    if (b.without_file) {
+        error_report("vresearch-pvg-reims: Windows had no room for the guest's "
+                     "RAM as shareable memory, which the guest's GPU needs "
+                     "(free memory and pagefile are too low). Close other "
+                     "programs, or give the guest less RAM, and start again");
+        exit(1);
+    }
+#endif
     map.ranges = (const RvgMemoryRange *)b.ranges->data;
     map.range_count = b.ranges->len;
     cfg.memory_map = &map;

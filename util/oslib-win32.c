@@ -60,6 +60,8 @@ typedef PVOID (WINAPI *MapViewOfFile3Fn)(HANDLE, HANDLE, PVOID, ULONG64, SIZE_T,
                                           ULONG);
 
 #define WIN_RAM_LOWEST_ADDRESS 0x100000000ULL
+/* blocks from this size on are asked for again where Windows lacks the room */
+#define WIN_RAM_PATIENT_SIZE (256u << 20)
 
 typedef struct WinRamSection {
     void *base;
@@ -115,7 +117,10 @@ static void *win_ram_section_alloc(size_t size)
     view = map_view3(section, GetCurrentProcess(), NULL, 0, size, 0,
                      PAGE_READWRITE, &ep, 1);
     if (!view) {
+        DWORD error = GetLastError();
+
         CloseHandle(section);
+        SetLastError(error);
         return NULL;
     }
     if (win_ram_count == win_ram_capacity) {
@@ -171,6 +176,8 @@ void *qemu_anon_ram_alloc(size_t size, uint64_t *align, bool shared,
                           bool noreserve)
 {
     void *ptr;
+    DWORD error;
+    int tries;
 
     if (noreserve) {
         /*
@@ -183,7 +190,23 @@ void *qemu_anon_ram_alloc(size_t size, uint64_t *align, bool shared,
 
     AcquireSRWLockExclusive(&win_ram_lock);
     ptr = win_ram_section_alloc(size);
+    error = ptr ? 0 : GetLastError();
     ReleaseSRWLockExclusive(&win_ram_lock);
+    /*
+     * A section Windows has no commit for: it grows its pagefile behind the
+     * refusal, so the same request can pass a moment later. Guest RAM is
+     * worth that wait (the plain allocation below cannot be mapped a second
+     * time, which leaves the GPU library without the guest's pages).
+     */
+    for (tries = 0; !ptr && size >= WIN_RAM_PATIENT_SIZE && tries < 8 &&
+         (error == ERROR_COMMITMENT_LIMIT || error == ERROR_NOT_ENOUGH_MEMORY);
+         tries++) {
+        Sleep(500);
+        AcquireSRWLockExclusive(&win_ram_lock);
+        ptr = win_ram_section_alloc(size);
+        error = ptr ? 0 : GetLastError();
+        ReleaseSRWLockExclusive(&win_ram_lock);
+    }
     if (!ptr) {
         ptr = VirtualAlloc(NULL, size, MEM_COMMIT, PAGE_READWRITE);
     }
