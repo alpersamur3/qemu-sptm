@@ -4585,11 +4585,36 @@ static void gd_menu_zoom_fit(GtkMenuItem *item, void *opaque)
     gd_update_full_redraw(vc);
 }
 
+/*
+ * The window a grab sends the events to. A GtkGLArea (gl=on) has no window of its own: it draws into its parent's
+ * and takes its events through an input-only window of its own. A grab on the parent's window (owner_events off)
+ * sent every event to the parent widget, so gd_motion_event / gd_button_event / gd_key_event got none while it
+ * held: walk mode (the grab) could not end, by the middle button or by letting the right one go.
+ */
+static GdkWindow *gd_grab_window(GtkWidget *area)
+{
+    GdkWindow *window = gtk_widget_get_window(area);
+    GList *l;
+
+    if (!window || gtk_widget_get_has_window(area)) {
+        return window;
+    }
+    for (l = gdk_window_peek_children(window); l; l = l->next) {
+        gpointer owner = NULL;
+
+        gdk_window_get_user_data(l->data, &owner);
+        if (owner == (gpointer)area) {
+            return l->data;
+        }
+    }
+    return window;
+}
+
 static void gd_grab_update(VirtualConsole *vc, bool kbd, bool ptr)
 {
     GdkDisplay *display = gtk_widget_get_display(vc->gfx.drawing_area);
     GdkSeat *seat = gdk_display_get_default_seat(display);
-    GdkWindow *window = gtk_widget_get_window(vc->gfx.drawing_area);
+    GdkWindow *window = gd_grab_window(vc->gfx.drawing_area);
     GdkSeatCapabilities caps = 0;
     GdkCursor *cursor = NULL;
 
