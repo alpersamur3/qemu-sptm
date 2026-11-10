@@ -39,6 +39,7 @@
 #include "hw/core/qdev-properties.h"
 #include "hw/core/sysbus.h"
 #include "hw/char/pl011.h"
+#include "chardev/char.h"
 #include "hw/intc/arm_gicv3_common.h"
 #include "hw/misc/pvpanic.h"
 #include "hw/misc/unimp.h"
@@ -186,6 +187,10 @@ struct VResearchState {
     uint32_t               ppi;
     uint32_t               hz;
     uint32_t               max_fps;
+    bool                   loadvm_date;
+    QEMUTimer             *date_timer;
+    char                   date_text[64];
+    int                    date_len, date_pos, date_waits;
     bool                   unauth_root;
     VResearchPVGMode       pvg;
     bool                   sep;
@@ -540,6 +545,16 @@ static void pvg_set(Object *obj, const char *val, Error **errp)
     } else {
         error_setg(errp, "pvg=%s: expected off, on or reims", val);
     }
+}
+
+static bool loadvm_date_get(Object *obj, Error **errp)
+{
+    return VRESEARCH_MACHINE(obj)->loadvm_date;
+}
+
+static void loadvm_date_set(Object *obj, bool value, Error **errp)
+{
+    VRESEARCH_MACHINE(obj)->loadvm_date = value;
 }
 
 static bool sep_get(Object *obj, Error **errp)
@@ -1018,10 +1033,81 @@ static GlobalProperty vresearch_compat_defaults[] = {
  * Move the virtual clock on by the ticks @away_ns makes at CNTFRQ, so the
  * guest's clock gains @away_ns, not 1.6% more.
  */
+/*
+ * loadvm-date=on: the clock of a loaded snapshot is set the way a person at
+ * the console would set it, and the virtual clock stays where it was saved.
+ * Moving the virtual clock on moves the guest's monotonic time with its
+ * calendar: every timeout that was running when the machine was saved has
+ * then run for as long as the machine was away. visionOS draws all the time,
+ * so a snapshot of it always has command buffers on their way, and loaded
+ * ten minutes or more after its save its compositor found them late and
+ * aborted (backboardd, RealitySimulation, from a Metal completion handler):
+ * every open app gone and two minutes of starting again. Half a second of
+ * guest time after the load, "date -u -s @<the time now>" is typed on the
+ * serial console, where our guests have a root shell: the calendar alone
+ * moves, as it does when a clock is set.
+ */
+static void vresearch_date_feed(void *opaque)
+{
+    VResearchState *s = opaque;
+    Chardev *chr = serial_hd(0);
+
+    if (!chr) {
+        return;
+    }
+    if (!s->date_len) {
+        int64_t us = g_get_real_time();
+
+        /*
+         * (Ctrl-C first: the console is as the snapshot has it, which may be in
+         * the middle of a line or a here-document whose other end, a tool of
+         * the host's that was typing then, is gone; iOS 26 saved while its
+         * start script was sending the region settings took the date as text)
+         */
+        s->date_len = snprintf(s->date_text, sizeof(s->date_text),
+                               "\003\ndate -u -s @%" PRId64 ".%03d\n",
+                               us / G_USEC_PER_SEC,
+                               (int)(us % G_USEC_PER_SEC / 1000));
+        s->date_pos = 0;
+    }
+    while (s->date_pos < s->date_len) {
+        int n = qemu_chr_be_can_write(chr);
+
+        if (n <= 0) {
+            break;
+        }
+        n = MIN(n, s->date_len - s->date_pos);
+        qemu_chr_be_write(chr, (const uint8_t *)s->date_text + s->date_pos, n);
+        s->date_pos += n;
+    }
+    if (s->date_pos < s->date_len && ++s->date_waits < 3000) {
+        /*
+         * The UART's FIFO is full: the rest once the guest has read it (a
+         * guest that reads nothing in 30 s keeps the clock it was saved with).
+         */
+        timer_mod(s->date_timer,
+                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 10 * SCALE_MS);
+    } else {
+        s->date_len = 0;
+    }
+}
+
 static int64_t vresearch_loadvm_catch_up_ns(MachineState *ms, int64_t away_ns)
 {
     ARMCPU *cpu = ARM_CPU(first_cpu);
+    VResearchState *s = VRESEARCH_MACHINE(ms);
 
+    if (s->loadvm_date) {
+        if (!s->date_timer) {
+            s->date_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
+                                         vresearch_date_feed, s);
+        }
+        s->date_len = 0;
+        s->date_waits = 0;
+        timer_mod(s->date_timer,
+                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 500 * SCALE_MS);
+        return 0;
+    }
     return muldiv64(away_ns, cpu->gt_cntfrq_hz * gt_cntfrq_period_ns(cpu),
                     NANOSECONDS_PER_SECOND);
 }
@@ -1077,6 +1163,11 @@ static void vresearch_machine_class_init(ObjectClass *oc, const void *data)
         "The paravirtual GPU: on models its display (presents, no GPU work), "
         "reims runs its FIFOs on the host GPU through the reims-vgpu library; "
         "default off: an unimplemented device the guest driver gives up on");
+    object_class_property_add_bool(oc, "loadvm-date", loadvm_date_get, loadvm_date_set);
+    object_class_property_set_description(oc, "loadvm-date",
+        "Set on to set a loaded snapshot's clock by typing date on the serial "
+        "console's root shell, where loadvm-catch-up moves the virtual clock "
+        "on (and every running timeout with it)");
     object_class_property_add_bool(oc, "sep", sep_get, sep_set);
     object_class_property_set_description(oc, "sep",
         "Model the SEP mailbox (/arm-io/sep) so the kernel sees the SEP boot; "

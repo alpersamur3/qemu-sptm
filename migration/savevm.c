@@ -3508,6 +3508,13 @@ static void load_snapshot_catch_up(const QEMUSnapshotInfo *sn)
     int64_t away = g_get_real_time() * SCALE_US - saved;
     int64_t delta = away;
     MachineClass *mc;
+    /* (a test's stand-in for a snapshot loaded long after its save: so many seconds more away) */
+    const char *more = getenv("ASOFT_LOADVM_AWAY_TEST_S");
+
+    if (more) {
+        away += g_ascii_strtoll(more, NULL, 10) * NANOSECONDS_PER_SECOND;
+        delta = away;
+    }
 
     if (!current_machine || !current_machine->loadvm_catch_up ||
         icount_enabled() || replay_mode != REPLAY_MODE_NONE || !sn->date_sec) {
