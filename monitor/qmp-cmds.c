@@ -32,6 +32,7 @@
 #include "hw/mem/memory-device.h"
 #include "hw/intc/intc.h"
 #include "migration/misc.h"
+#include "migration/snapshot.h"
 
 NameInfo *qmp_query_name(Error **errp)
 {
@@ -86,6 +87,12 @@ void qmp_cont(Error **errp)
         return;
     } else if (runstate_check(RUN_STATE_COLO)) {
         error_setg(errp, "COLO checkpoint in progress");
+        return;
+    }
+
+    if (snapshot_guest_ram_released()) {
+        error_setg(errp, "The guest's RAM was released by a save with "
+                   "release-ram: load a snapshot or quit");
         return;
     }
 
