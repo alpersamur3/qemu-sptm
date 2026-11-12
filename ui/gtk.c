@@ -274,6 +274,7 @@ static void gd_update_caption(GtkDisplayState *s)
 }
 
 static void gd_visor_size_request(GtkDisplayState *s, int w, int h);
+static void gd_remote_size_request(GtkDisplayState *s, int w, int h);
 
 static void gd_update_geometry_hints(VirtualConsole *vc)
 {
@@ -297,6 +298,10 @@ static void gd_update_geometry_hints(VirtualConsole *vc)
         if (s->visor && !vc->window) {
             /* the picture is not the window's content: the drawn headset is around it */
             gd_visor_size_request(s, geo.min_width, geo.min_height);
+        }
+        if (s->remote && !vc->window) {
+            /* nor here: the TV's bezel is around it, the drawn remote beside it */
+            gd_remote_size_request(s, geo.min_width, geo.min_height);
         }
 
 #if defined(CONFIG_VTE)
@@ -357,6 +362,7 @@ static void gd_update_geometry_hints(VirtualConsole *vc)
 #define WATCH_TOP 72        /* the upper strap, from the window's top edge to the case */
 #define WATCH_BOTTOM 130    /* the lower strap dangling below the case */
 #include "gtk-visor.c.inc"   /* the drawn headset around a headset guest's screen (gd_create_visor) */
+#include "gtk-remote.c.inc"  /* the TV and the drawn Siri Remote beside a TV guest's screen (gd_create_remote) */
 #define WATCH_NOTCH 16.0    /* pixels of drag per crown notch */
 #define WATCH_HOLD_MS 550
 
@@ -368,7 +374,7 @@ static void gd_fit_window(VirtualConsole *vc)
     GdkMonitor *monitor;
     GdkRectangle area, frame;
     int width, height, menu = 0, bar = 0, x, y;
-    double scale, grow_w = 0, grow_h = 0;
+    double scale, grow_w = 0, grow_h = 0, remote = 0, column = 0;
 
     if (!gdk_window || !vc->gfx.ds) {
         return;
@@ -402,12 +408,18 @@ static void gd_fit_window(VirtualConsole *vc)
         grow_h -= VISOR_LEGEND;
         menu += VISOR_LEGEND;
     }
+    if (!vc->window && s->remote && !s->remote_off) {
+        /* the TV and the remote's column beside it: the column is the remote's (it grows) or the legend's */
+        remote_room(height, &grow_w, &grow_h, &remote);
+        column = REMOTE_COLUMN;
+    }
     scale = MIN((area.height * WINDOW_FIT_SHARE - frame.height - menu) / (height + grow_h),
-                (area.width * WINDOW_FIT_SHARE - frame.width - bar) / (width + grow_w));
+                (area.width * WINDOW_FIT_SHARE - frame.width - bar - column) / (width + grow_w));
+    scale = MIN(scale, (area.width * WINDOW_FIT_SHARE - frame.width - bar) / (width + grow_w + remote));
     if (scale <= VC_SCALE_MIN) {
         return;
     }
-    width = ceil((width + grow_w) * scale) + bar;
+    width = ceil((width + grow_w) * scale) + bar + ceil(MAX(column, remote * scale));
     height = ceil((height + grow_h) * scale) + menu;
     gtk_window_resize(window, width, height);
 
@@ -425,6 +437,9 @@ void gd_update_windowsize(VirtualConsole *vc)
     gd_update_geometry_hints(vc);
     if (s->visor) {
         gtk_widget_queue_resize(s->visor);
+    }
+    if (s->remote) {
+        gtk_widget_queue_resize(s->remote);
     }
 
     if (vc->type == GD_VC_GFX && !s->full_screen && !s->free_scale) {
@@ -930,6 +945,8 @@ static void gd_powerdown(GtkDisplayState *s)
  * A guest whose machine has a usb-consumer (the iOS 26 research VM) takes the
  * phone's buttons from it as Consumer usages: F1 Home, F2 the side button
  * (Power), F3/F4 Volume down/up. The device releases the button itself.
+ * A TV guest's (usb-consumer tv-remote=on) has a Siri Remote's buttons too:
+ * F5 Play/Pause, F6 Mute, F7 Siri; for any other guest F5-F7 stay keys.
  */
 static const struct {
     unsigned int key;
@@ -939,7 +956,24 @@ static const struct {
     { KEY_F2, "power" },
     { KEY_F3, "voldown" },
     { KEY_F4, "volup" },
+    { KEY_F5, "playpause" },    /* tv-remote=on only, from here on */
+    { KEY_F6, "mute" },
+    { KEY_F7, "siri" },
 };
+#define GD_CONSUMER_PHONE 4     /* the buttons every usb-consumer has */
+
+static Object *gd_consumer(void)
+{
+    return object_resolve_path_type("", "usb-consumer", NULL);
+}
+
+/* The machine's usb-consumer is a TV remote's (tv-remote=on) */
+static bool gd_consumer_tv(void)
+{
+    Object *consumer = gd_consumer();
+
+    return consumer && object_property_get_bool(consumer, "tv-remote", NULL);
+}
 
 static int gd_consumer_button(unsigned int key)
 {
@@ -947,15 +981,10 @@ static int gd_consumer_button(unsigned int key)
 
     for (i = 0; i < ARRAY_SIZE(gd_consumer_buttons); i++) {
         if (gd_consumer_buttons[i].key == key) {
-            return i;
+            return i < GD_CONSUMER_PHONE || gd_consumer_tv() ? i : -1;
         }
     }
     return -1;
-}
-
-static Object *gd_consumer(void)
-{
-    return object_resolve_path_type("", "usb-consumer", NULL);
 }
 
 /*
@@ -1106,8 +1135,8 @@ static gboolean gd_guest_display_update(void *opaque)
         return G_SOURCE_REMOVE;
     }
     gtk_widget_set_visible(s->screen_off, cover);
-    if (s->watch) {
-        gd_sidebar_set_label(s->sidebar_lock, "Side button");
+    if (s->watch || s->tv) {
+        gd_sidebar_set_label(s->sidebar_lock, s->tv ? "Power" : "Side button");
         return G_SOURCE_REMOVE;
     }
     gd_sidebar_set_label(s->sidebar_lock, cover ? "Wake" : "Lock");
@@ -1139,8 +1168,8 @@ static gboolean gd_screen_off_clicked(GtkWidget *widget, GdkEventButton *event,
 {
     GtkDisplayState *s = opaque;
 
-    /* a watch wakes on the crown; its side button opens Control Center */
-    gd_sidebar_press(s->watch ? KEY_F1 : KEY_F2);
+    /* a watch wakes on the crown, its side button opens Control Center; a TV wakes on its remote's TV button */
+    gd_sidebar_press(s->watch || s->tv ? KEY_F1 : KEY_F2);
     return TRUE;
 }
 
@@ -3057,6 +3086,413 @@ static void gd_visor_mode_changed(GtkDisplayState *s)
     }
 }
 
+/*
+ * A TV guest's picture as a TV's screen with a drawn Siri Remote beside it (ASoftware tvOS: the machine's
+ * usb-consumer has tv-remote=on), the headset's sibling; the drawing is ui/gtk-remote.c.inc. The picture
+ * (s->overlay) gets the guest's shape, as large as the window lets it be beside the remote's column. The TV, the
+ * remote and its legend are one layer, painted once per size and mode and kept: a part hovered or held paints only
+ * its rows of the layer again, and only the remote's side of the window is drawn again, never the picture. The
+ * drawn keys are real: the clickpad's ring, its centre and Back hold the arrow keys, Return and Esc as long as the
+ * mouse button is down; the TV button, power, the volume, Play/Pause, Mute and Siri are the usb-consumer's (F1-F7):
+ * a click presses one, held past GD_HOLD_MS it stays down (the TV button held: Control Center). A key pressed on
+ * the keyboard lights its part and its key in the legend. F9 (the side bar's row, or ASOFT_FRAME=0 from the
+ * start) takes the TV and the remote away: the picture alone, as for the headset.
+ */
+
+/* The key a part is: the keyboard's (the clickpad, Back) or a usb-consumer button's (gd_consumer_buttons) */
+static unsigned int gd_remote_part_key(int part)
+{
+    static const unsigned int keys[REMOTE_PARTS] = {
+        [REMOTE_UP] = KEY_UP, [REMOTE_DOWN] = KEY_DOWN, [REMOTE_LEFT] = KEY_LEFT, [REMOTE_RIGHT] = KEY_RIGHT,
+        [REMOTE_SELECT] = KEY_ENTER, [REMOTE_BACK] = KEY_ESC, [REMOTE_TV] = KEY_F1, [REMOTE_POWER] = KEY_F2,
+        [REMOTE_VOLDOWN] = KEY_F3, [REMOTE_VOLUP] = KEY_F4, [REMOTE_PLAY] = KEY_F5, [REMOTE_MUTE] = KEY_F6,
+        [REMOTE_SIRI] = KEY_F7,
+    };
+
+    return part > REMOTE_NONE && part < REMOTE_PARTS ? keys[part] : 0;
+}
+
+/* The part a key of the keyboard is, or REMOTE_NONE */
+static int gd_remote_key_part(unsigned int lnx)
+{
+    int part;
+
+    if (lnx == KEY_KPENTER) {
+        return REMOTE_SELECT;
+    }
+    for (part = REMOTE_UP; part < REMOTE_PARTS; part++) {
+        if (gd_remote_part_key(part) == lnx) {
+            return part;
+        }
+    }
+    return REMOTE_NONE;
+}
+
+static void gd_remote_geometry(GtkDisplayState *s, RemoteGeometry *g)
+{
+    GtkAllocation o, w;
+
+    gtk_widget_get_allocation(s->overlay, &o);
+    gtk_widget_get_allocation(s->remote, &w);
+    remote_geometry(o.x - w.x, o.y - w.y, o.width, o.height, w.height, s->full_screen, g);
+}
+
+static void gd_remote_look(GtkDisplayState *s, RemoteLook *l)
+{
+    l->hover = s->remote_hover;
+    l->lit = s->remote_keys | (s->remote_target ? REMOTE_BIT(s->remote_target) : 0);
+    l->full_screen = s->full_screen;
+}
+
+/*
+ * The layer for the look and the size of the moment: a new size or mode paints it all again (on the same surface
+ * when its size stayed), a part's hover or hold only the rows it shows in
+ */
+static void gd_remote_layer(GtkDisplayState *s, cairo_t *like)
+{
+    PangoContext *pc = gtk_widget_get_pango_context(s->remote);
+    int scale = gtk_widget_get_scale_factor(s->remote);
+    RemoteGeometry g;
+    RemoteLook l, was;
+    GtkAllocation w;
+    cairo_t *cr;
+
+    gd_remote_geometry(s, &g);
+    gd_remote_look(s, &l);
+    gtk_widget_get_allocation(s->remote, &w);
+    {
+        const double key[G_N_ELEMENTS(s->remote_key)] = {
+            w.width, w.height, g.sx, g.sy, g.sw, g.sh, scale, l.full_screen,
+        };
+
+        if (s->remote_layer && !memcmp(key, s->remote_key, sizeof(key))) {
+            was = l;
+            was.lit = s->remote_lit;
+            was.hover = s->remote_hovered;
+            remote_paint_parts(s->remote_layer, w.width, &g, &was, &l, pc);
+            s->remote_lit = l.lit;
+            s->remote_hovered = l.hover;
+            return;
+        }
+        if (!s->remote_layer || key[0] != s->remote_key[0] || key[1] != s->remote_key[1] ||
+            key[6] != s->remote_key[6]) {
+            g_clear_pointer(&s->remote_layer, cairo_surface_destroy);
+            s->remote_layer = cairo_surface_create_similar(cairo_get_target(like), CAIRO_CONTENT_COLOR,
+                                                           MAX(1, w.width), MAX(1, w.height));
+        }
+        memcpy(s->remote_key, key, sizeof(key));
+        s->remote_lit = l.lit;
+        s->remote_hovered = l.hover;
+    }
+    cr = cairo_create(s->remote_layer);
+    remote_paint(cr, &g, &l, pc);
+    cairo_destroy(cr);
+}
+
+/* Under the screen: the TV, the remote and the wall, or black around the picture alone */
+static gboolean gd_remote_draw(GtkWidget *widget, cairo_t *cr, void *opaque)
+{
+    GtkDisplayState *s = opaque;
+
+    if (s->remote_off) {
+        cairo_set_source_rgb(cr, 0, 0, 0);
+        cairo_paint(cr);
+        return FALSE;
+    }
+    gd_remote_layer(s, cr);
+    cairo_set_source_surface(cr, s->remote_layer, 0, 0);
+    cairo_paint(cr);
+    return FALSE;       /* then the screen */
+}
+
+/* @parts look different now: the remote's side of the window is drawn again where they show (not the picture) */
+static void gd_remote_refresh(GtkDisplayState *s, unsigned int parts)
+{
+    RemoteGeometry g;
+    GtkAllocation w;
+    double rows[2][2], x;
+    int part, n, i;
+
+    if (s->remote_off || !parts || !gtk_widget_get_realized(s->remote)) {
+        return;
+    }
+    gd_remote_geometry(s, &g);
+    gtk_widget_get_allocation(s->remote, &w);
+    x = MAX(0, remote_tv_right(&g));
+    for (part = REMOTE_UP; part < REMOTE_PARTS; part++) {
+        if (parts & REMOTE_BIT(part)) {
+            n = remote_part_rows(&g, part, rows);
+            for (i = 0; i < n; i++) {
+                gtk_widget_queue_draw_area(s->remote, (int)x, (int)rows[i][0], MAX(1, w.width - (int)x),
+                                           (int)(rows[i][1] - rows[i][0]));
+            }
+        }
+    }
+}
+
+/* The remote's area was laid out: the picture gets the guest's shape in it, as large as the remote lets it */
+static void gd_remote_allocated(GtkWidget *widget, GdkRectangle *area, void *opaque)
+{
+    GtkDisplayState *s = opaque;
+    VirtualConsole *vc = gd_vc_find_current(s);
+    GtkAllocation picture;
+    double aspect = 16.0 / 9;
+
+    if (vc && vc->type == GD_VC_GFX && vc->gfx.ds && surface_height(vc->gfx.ds) > 0) {
+        aspect = (double)surface_width(vc->gfx.ds) / surface_height(vc->gfx.ds);
+    }
+    if (s->remote_off) {
+        /* the picture alone: as large as the area lets its shape be, in the middle */
+        picture.width = MAX(1, (int)MIN(area->width, floor(area->height * aspect)));
+        picture.height = MAX(1, (int)MIN(area->height, lround(picture.width / aspect)));
+        picture.x = (area->width - picture.width) / 2;
+        picture.y = (area->height - picture.height) / 2;
+    } else {
+        remote_layout(area->width, area->height, aspect, &picture.x, &picture.y, &picture.width, &picture.height);
+    }
+    picture.x += area->x;
+    picture.y += area->y;
+    gd_ui_trace(s->remote_off ? "remote off, area" : "remote on, area", area->x, area->y, area->width,
+                area->height);
+    gd_ui_trace("picture", picture.x, picture.y, picture.width, picture.height);
+    gtk_widget_size_allocate(s->overlay, &picture);
+}
+
+/* What part is under the pointer (none while the remote is not drawn) */
+static int gd_remote_hit(GtkDisplayState *s, double x, double y)
+{
+    RemoteGeometry g;
+
+    if (s->remote_off) {
+        return REMOTE_NONE;
+    }
+    gd_remote_geometry(s, &g);
+    return remote_hit(&g, x, y);
+}
+
+/* A part goes down or up: the keyboard's key, held as long as the mouse button, or the usb-consumer's button */
+static void gd_remote_send(GtkDisplayState *s, int part, bool down)
+{
+    unsigned int lnx = gd_remote_part_key(part);
+    int button = gd_consumer_button(lnx);
+    VirtualConsole *vc;
+
+    if (!lnx) {
+        return;
+    }
+    if (button >= 0) {
+        gd_hold_key(lnx, button, down);     /* a click presses it, held it stays down */
+        return;
+    }
+    vc = gd_vc_find_current(s);
+    if (vc && vc->type == GD_VC_GFX && vc->gfx.kbd) {
+        qkbd_state_key_event(vc->gfx.kbd, lnx, down);
+    } else {
+        qemu_input_event_send_key_linux(NULL, lnx, down);
+    }
+}
+
+static gboolean gd_remote_button_press(GtkWidget *widget, GdkEventButton *e, void *opaque)
+{
+    GtkDisplayState *s = opaque;
+    int part;
+
+    if (e->button != 1 || e->type != GDK_BUTTON_PRESS || s->remote_target) {
+        return FALSE;
+    }
+    part = gd_remote_hit(s, e->x, e->y);
+    if (!part) {
+        return FALSE;
+    }
+    s->remote_target = part;
+    gd_remote_send(s, part, true);
+    gd_remote_refresh(s, REMOTE_BIT(part));
+    return TRUE;
+}
+
+static gboolean gd_remote_button_release(GtkWidget *widget, GdkEventButton *e, void *opaque)
+{
+    GtkDisplayState *s = opaque;
+    int part = s->remote_target;
+
+    if (e->button != 1 || !part) {
+        return FALSE;
+    }
+    s->remote_target = REMOTE_NONE;
+    gd_remote_send(s, part, false);
+    gd_remote_refresh(s, REMOTE_BIT(part));
+    return TRUE;
+}
+
+/* The pointer's part: lit a little, and the hand pointer over it */
+static void gd_remote_set_hover(GtkDisplayState *s, int hover)
+{
+    GdkWindow *window = gtk_widget_get_window(s->remote);
+    GdkCursor *cursor;
+    int was = s->remote_hover;
+
+    if (hover == was) {
+        return;
+    }
+    s->remote_hover = hover;
+    if (window && (!hover || !was)) {
+        cursor = hover ? gdk_cursor_new_from_name(gtk_widget_get_display(s->remote), "pointer") : NULL;
+        gdk_window_set_cursor(window, cursor);
+        g_clear_object(&cursor);
+    }
+    gd_remote_refresh(s, REMOTE_BIT(was) | REMOTE_BIT(hover));
+}
+
+static gboolean gd_remote_motion(GtkWidget *widget, GdkEventMotion *e, void *opaque)
+{
+    gd_remote_set_hover(opaque, gd_remote_hit(opaque, e->x, e->y));
+    return FALSE;
+}
+
+static gboolean gd_remote_leave(GtkWidget *widget, GdkEventCrossing *e, void *opaque)
+{
+    gd_remote_set_hover(opaque, REMOTE_NONE);
+    return FALSE;
+}
+
+/* A word about the part under the pointer, only while it is on one */
+static gboolean gd_remote_tooltip(GtkWidget *widget, int x, int y, gboolean keyboard, GtkTooltip *tip,
+                                  void *opaque)
+{
+    static const char *const say[REMOTE_PARTS] = {
+        [REMOTE_UP] = "Clickpad: up (\xe2\x86\x91)",
+        [REMOTE_DOWN] = "Clickpad: down (\xe2\x86\x93)",
+        [REMOTE_LEFT] = "Clickpad: left (\xe2\x86\x90)",
+        [REMOTE_RIGHT] = "Clickpad: right (\xe2\x86\x92)",
+        [REMOTE_SELECT] = "Clickpad: select (Return); hold it for more",
+        [REMOTE_BACK] = "Back (Esc)",
+        [REMOTE_TV] = "TV button (F1): Home, or the TV app; hold it for Control Center",
+        [REMOTE_PLAY] = "Play/Pause (F5)",
+        [REMOTE_MUTE] = "Mute (F6)",
+        [REMOTE_VOLUP] = "Volume up (F4)",
+        [REMOTE_VOLDOWN] = "Volume down (F3)",
+        [REMOTE_POWER] = "Power (F2)",
+        [REMOTE_SIRI] = "Siri button, on the remote's side (F7): hold it while you speak",
+    };
+    int hit = keyboard ? REMOTE_NONE : gd_remote_hit(opaque, x, y);
+
+    if (!hit) {
+        return FALSE;
+    }
+    gtk_tooltip_set_text(tip, say[hit]);
+    return TRUE;
+}
+
+/* A key went down or up on the keyboard: the part it is lights while it is down */
+static void gd_remote_key(GtkDisplayState *s, unsigned int lnx, bool down)
+{
+    int part = gd_remote_key_part(lnx);
+    unsigned int was = s->remote_keys;
+
+    if (!part) {
+        return;
+    }
+    if (down) {
+        s->remote_keys |= REMOTE_BIT(part);
+    } else {
+        s->remote_keys &= ~REMOTE_BIT(part);
+    }
+    if (s->remote_keys != was) {
+        gd_remote_refresh(s, REMOTE_BIT(part));
+    }
+}
+
+/* The window lost the keyboard: what QEMU lets go of in the guest goes dark on the remote too */
+static void gd_remote_keys_lost(GtkDisplayState *s)
+{
+    unsigned int was = s->remote_keys;
+
+    s->remote_keys = 0;
+    gd_remote_refresh(s, was);
+}
+
+static void gd_create_remote(GtkDisplayState *s)
+{
+    s->remote = gtk_event_box_new();
+    gtk_event_box_set_visible_window(GTK_EVENT_BOX(s->remote), FALSE);
+    gtk_widget_set_app_paintable(s->remote, TRUE);
+    gtk_widget_add_events(s->remote, GDK_BUTTON_PRESS_MASK | GDK_BUTTON_RELEASE_MASK |
+                          GDK_POINTER_MOTION_MASK | GDK_LEAVE_NOTIFY_MASK);
+    gtk_widget_set_has_tooltip(s->remote, TRUE);
+    gtk_container_add(GTK_CONTAINER(s->remote), s->overlay);
+    g_signal_connect(s->remote, "draw", G_CALLBACK(gd_remote_draw), s);
+    g_signal_connect(s->remote, "size-allocate", G_CALLBACK(gd_remote_allocated), s);
+    g_signal_connect(s->remote, "query-tooltip", G_CALLBACK(gd_remote_tooltip), s);
+    g_signal_connect(s->remote, "button-press-event", G_CALLBACK(gd_remote_button_press), s);
+    g_signal_connect(s->remote, "button-release-event", G_CALLBACK(gd_remote_button_release), s);
+    g_signal_connect(s->remote, "motion-notify-event", G_CALLBACK(gd_remote_motion), s);
+    g_signal_connect(s->remote, "leave-notify-event", G_CALLBACK(gd_remote_leave), s);
+    gtk_box_pack_start(GTK_BOX(s->hbox), s->remote, TRUE, TRUE, 0);
+}
+
+/*
+ * The remote's area's smallest size for the picture's smallest (@w x @h): the TV's and the remote's room beside
+ * it; no more than the picture's while the remote is off or the window full screen
+ */
+static void gd_remote_size_request(GtkDisplayState *s, int w, int h)
+{
+    double wide, high, remote;
+
+    if (s->remote_off || s->full_screen) {
+        gtk_widget_set_size_request(s->remote, -1, -1);
+        return;
+    }
+    remote_room(h, &wide, &high, &remote);
+    gtk_widget_set_size_request(s->remote, w + (int)ceil(wide + MAX(remote, REMOTE_COLUMN)) + 2,
+                                h + (int)ceil(high) + 2);
+}
+
+/*
+ * The TV and the remote drawn or not (F9, the side bar's row). Off, nothing of them is there to point at or hold:
+ * a part held by the mouse lets go, and the layer goes. The window is fitted again as at the start; full screen or
+ * maximized, the picture is only laid out again.
+ */
+static void gd_remote_set_off(GtkDisplayState *s, bool off)
+{
+    VirtualConsole *vc = gd_vc_find_current(s);
+    GdkWindow *window = gtk_widget_get_window(s->remote);
+    bool gfx = vc && vc->type == GD_VC_GFX && !vc->window;
+
+    s->remote_off = off;
+    if (s->remote_row) {
+        gd_sidebar_set_label(s->remote_row, off ? "Remote: off" : "Remote: on");
+    }
+    if (off) {
+        if (s->remote_target) {
+            int part = s->remote_target;
+
+            s->remote_target = REMOTE_NONE;
+            gd_remote_send(s, part, false);
+        }
+        if (s->remote_hover && window) {
+            gdk_window_set_cursor(window, NULL);
+        }
+        s->remote_hover = REMOTE_NONE;
+        g_clear_pointer(&s->remote_layer, cairo_surface_destroy);
+    }
+    if (gfx && !s->full_screen && !gtk_window_is_maximized(GTK_WINDOW(s->window))) {
+        gd_update_windowsize(vc);
+    } else {
+        if (gfx && !s->full_screen) {
+            gd_update_geometry_hints(vc);   /* the smallest size, for when it is no longer maximized */
+        }
+        gtk_widget_queue_resize(s->remote);
+    }
+    gtk_widget_queue_draw(s->remote);
+}
+
+static void gd_sidebar_remote(GtkButton *button, void *opaque)
+{
+    GtkDisplayState *s = opaque;
+
+    gd_remote_set_off(s, !s->remote_off);
+}
+
 static void gd_create_sidebar(GtkDisplayState *s)
 {
     const char *shots = g_getenv("ASOFT_SHOTS_DIR");
@@ -3129,6 +3565,17 @@ static void gd_create_sidebar(GtkDisplayState *s)
                           G_CALLBACK(gd_sidebar_keys), 0);
         goto screen;
     }
+    if (s->tv) {
+        /* the drawn remote has every button; these few are here for when it is hidden (F9) */
+        gd_sidebar_button(s, group, "TV button", "F1",
+                          "The Siri Remote's TV button (F1): Home, or the TV app. Hold F1 for Control Center",
+                          G_CALLBACK(gd_sidebar_key), KEY_F1);
+        gd_sidebar_button(s, group, "Back", "Esc", "Back (Esc)", G_CALLBACK(gd_sidebar_key), KEY_ESC);
+        gd_sidebar_button(s, group, "Play/Pause", "F5", "Play/Pause (F5)", G_CALLBACK(gd_sidebar_key), KEY_F5);
+        s->sidebar_lock = gd_sidebar_button(s, group, "Power", "F2", "Power (F2)",
+                                            G_CALLBACK(gd_sidebar_key), KEY_F2);
+        goto screen;
+    }
     if (s->watch) {
         gd_sidebar_button(s, group, "Crown", "F1",
                           "Press the Digital Crown (F1): the clock face, the apps",
@@ -3177,6 +3624,12 @@ screen:
                                          "alone, as large as the window lets it be",
                                          G_CALLBACK(gd_sidebar_visor), 0);
     }
+    if (s->tv) {
+        s->remote_row = gd_sidebar_button(s, group, s->remote_off ? "Remote: off" : "Remote: on", "F9",
+                                          "Draw the TV and the Siri Remote beside the screen (F9). Off: the "
+                                          "screen alone, as large as the window lets it be",
+                                          G_CALLBACK(gd_sidebar_remote), 0);
+    }
     s->sharp = g_strcmp0(g_getenv("ASOFT_SHARP"), "0") != 0;
     gd_sidebar_button(s, group, s->sharp ? "Sharpness: on" : "Sharpness: off", NULL,
                       "Scale the screen with a sharper filter (off: the plain "
@@ -3186,8 +3639,8 @@ screen:
                       "Open the folder the screenshots go to",
                       G_CALLBACK(gd_sidebar_open_shots), 0);
 
-    group = gd_sidebar_group(s, s->watch || s->vision ? "TEXT" : "APPS AND TEXT");
-    if (s->watch || s->vision) {
+    group = gd_sidebar_group(s, s->watch || s->vision || s->tv ? "TEXT" : "APPS AND TEXT");
+    if (s->watch || s->vision || s->tv) {
         goto text;
     }
     install = gd_sidebar_button(s, group, "Install .ipa…", NULL,
@@ -4089,8 +4542,8 @@ static void gd_keys_create(GtkWidget *overlay)
  * Digital Crown held recentres the view).
  */
 #define GD_HOLD_MS 500
-static guint gd_hold_timer[4];
-static bool gd_hold_down[4];
+static guint gd_hold_timer[ARRAY_SIZE(gd_consumer_buttons)];
+static bool gd_hold_down[ARRAY_SIZE(gd_consumer_buttons)];
 
 static gboolean gd_hold_fire(gpointer opaque)
 {
@@ -4169,10 +4622,19 @@ static gboolean gd_key_event(GtkWidget *widget, GdkEventKey *key, void *opaque)
         return TRUE;
     }
 
-    /* F9 draws the headset or not, full screen too (no side bar there); in other windows the guest gets it */
+    /*
+     * F9 draws the headset (or the TV's remote) or not, full screen too (no side bar there); in other windows the
+     * guest gets it
+     */
     if (key->keyval == GDK_KEY_F9 && vc->s->visor) {
         if (key->type == GDK_KEY_PRESS) {
             gd_visor_set_off(vc->s, !vc->s->visor_off);
+        }
+        return TRUE;
+    }
+    if (key->keyval == GDK_KEY_F9 && vc->s->remote) {
+        if (key->type == GDK_KEY_PRESS) {
+            gd_remote_set_off(vc->s, !vc->s->remote_off);
         }
         return TRUE;
     }
@@ -4203,7 +4665,12 @@ static gboolean gd_key_event(GtkWidget *widget, GdkEventKey *key, void *opaque)
     trace_gd_key_event(vc->label, keycode, lnx,
                        (key->type == GDK_KEY_PRESS) ? "down" : "up");
 
-    /* F1-F4 are the phone's buttons on a guest with a usb-consumer: one press each */
+    /* a TV guest: the drawn remote's part for the key lights while the key is down */
+    if (vc->s->remote) {
+        gd_remote_key(vc->s, lnx, key->type == GDK_KEY_PRESS);
+    }
+
+    /* F1-F4 are the phone's buttons on a guest with a usb-consumer: one press each (a TV remote's: F1-F7) */
     button = gd_consumer_button(lnx);
     if (button >= 0 && gd_consumer()) {
         if (key->type == GDK_KEY_PRESS &&
@@ -4499,6 +4966,9 @@ static void gd_menu_full_screen(GtkMenuItem *item, void *opaque)
         if (s->visor) {
             gtk_widget_set_size_request(s->visor, -1, -1);
         }
+        if (s->remote) {
+            gtk_widget_set_size_request(s->remote, -1, -1);
+        }
         gtk_window_fullscreen(GTK_WINDOW(s->window));
         s->full_screen = TRUE;
 #ifdef G_OS_WIN32
@@ -4527,6 +4997,9 @@ static void gd_menu_full_screen(GtkMenuItem *item, void *opaque)
     }
     if (s->visor) {
         gtk_widget_queue_draw(s->visor);    /* the legend says how to leave full screen, or not */
+    }
+    if (s->remote) {
+        gtk_widget_queue_draw(s->remote);   /* so does the remote's */
     }
 
     gd_update_cursor(vc);
@@ -4815,6 +5288,9 @@ static gboolean gd_focus_out_event(GtkWidget *widget,
 
     win32_kbd_set_window(NULL);
     gtk_release_modifiers(s);
+    if (s->remote) {
+        gd_remote_keys_lost(s);
+    }
     return TRUE;
 }
 
@@ -5721,7 +6197,9 @@ static void gtk_display_init(DisplayState *ds, DisplayOptions *opts)
     if (opts->u.gtk.has_sidebar && opts->u.gtk.sidebar) {
         s->watch = gd_watch_guest();
         s->vision = !s->watch && gd_walk_touch() != NULL;
+        s->tv = !s->watch && !s->vision && gd_consumer_tv();
         s->visor_off = s->vision && g_strcmp0(g_getenv("ASOFT_FRAME"), "0") == 0;
+        s->remote_off = s->tv && g_strcmp0(g_getenv("ASOFT_FRAME"), "0") == 0;
         gd_create_sidebar(s);
         gd_create_screen_off(s);
         gd_create_busy(s);
@@ -5733,6 +6211,8 @@ static void gtk_display_init(DisplayState *ds, DisplayOptions *opts)
             gd_create_watch_case(s);
         } else if (s->vision) {
             gd_create_visor(s);
+        } else if (s->tv) {
+            gd_create_remote(s);
         } else {
             gtk_box_pack_start(GTK_BOX(s->hbox), s->overlay, TRUE, TRUE, 0);
         }

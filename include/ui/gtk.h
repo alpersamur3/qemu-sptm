@@ -133,7 +133,7 @@ struct GtkDisplayState {
     GtkWidget *sidebar;
     GtkWidget *sidebar_status;
     GtkWidget *sidebar_lock;
-    unsigned int consumer_keys_down;  /* F1-F4 held, as usb-consumer buttons */
+    unsigned int consumer_keys_down;  /* F1-F4 (a TV remote's F1-F7) held, as usb-consumer buttons */
     GtkWidget *sidebar_power;
     bool sharp;                 /* gl=on: scale the picture with the sharper filter */
     /* a watch guest (usb-crown): the crown, a case around the screen */
@@ -160,6 +160,18 @@ struct GtkDisplayState {
     double visor_phase;         /* the crown's knurling, moved by the wheel */
     double visor_turn;          /* wheel notches not yet a step of the volume */
     GtkWidget *sidebar_walk;    /* the side bar's walk mode row */
+    /* a TV guest (usb-consumer tv-remote=on): the picture as a TV's screen, a drawn Siri Remote beside it */
+    bool tv;
+    GtkWidget *remote;          /* the overlay beside the drawn remote: the TV, the remote, its legend */
+    bool remote_off;            /* the remote is not drawn: the picture alone (F9, ASOFT_FRAME=0) */
+    GtkWidget *remote_row;      /* the side bar's row that says so */
+    cairo_surface_t *remote_layer;  /* the TV, the remote and the wall as last painted, and what for: */
+    double remote_key[8];       /* the size and the mode (a change paints it all again) */
+    unsigned int remote_lit;    /* the parts painted held, and the part painted hovered */
+    int remote_hovered;         /* (a change of either paints the rows of the parts it changes again) */
+    int remote_target;          /* the part the mouse button went down on, 0 none */
+    int remote_hover;           /* the part under the pointer, 0 none */
+    unsigned int remote_keys;   /* the parts whose keys are down on the keyboard */
     /* the watch hangs from the window's top edge and swings when the window is moved */
     double swing_angle, swing_vel;  /* radians, radians/s, about the band's pivot */
     int swing_dx, swing_dy;         /* the screen's offset applied for the swing, pixels */
