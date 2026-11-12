@@ -1231,9 +1231,15 @@ static const TypeInfo usb_keyboard_info = {
  * A watch guest: power-usage=0x95 makes the second button Consumer Help, the
  * side button Carousel reads (watchOS takes Power 0x30 only as a display
  * sleep/wake). The crown's rotation is usb-crown's, below.
+ *
+ * A TV guest: tv-remote=on adds a Siri Remote's other buttons, playpause
+ * (Play/Pause 0xCD), mute (Mute 0xE2) and siri (Voice Command 0xCF), in a
+ * report descriptor of their own; without it the device is as before. The
+ * GTK window draws a Siri Remote for a machine with it.
  * ======================================================================= */
 
 #define USB_CONSUMER_QUEUE 16
+#define USB_CONSUMER_BUTTONS 7     /* with tv-remote=on; 4 without */
 
 struct USBConsumerState {
     USBDevice dev;
@@ -1247,7 +1253,9 @@ struct USBConsumerState {
     uint8_t armed;         /* of those, the ones the guest has read down */
     QEMUTimer *timer;
     uint8_t power_usage;   /* the second button's Consumer usage */
-    uint8_t rdesc[29];     /* this device's report descriptor */
+    bool tv_remote;        /* a TV remote's buttons too: Play/Pause, Mute, Voice Command */
+    uint8_t rdesc[35];     /* this device's report descriptor */
+    uint8_t rdesc_len;
     uint64_t keylog_queued, keylog_read;   /* reports queued and read, for the key overlay */
 };
 
@@ -1271,6 +1279,28 @@ static const uint8_t qemu_consumer_hid_report_descriptor[] = {
     0x81, 0x02,         /*   Input (Data, Variable, Absolute) */
     0x95, 0x04,         /*   Report Count (4) */
     0x81, 0x03,         /*   Input (Constant) -- 4-bit padding */
+    0xc0,               /* End Collection */
+};
+
+/* tv-remote=on: the same four buttons (the second at the same byte), then a Siri Remote's other three */
+static const uint8_t qemu_consumer_tv_hid_report_descriptor[] = {
+    0x05, 0x0c,         /* Usage Page (Consumer) */
+    0x09, 0x01,         /* Usage (Consumer Control) */
+    0xa1, 0x01,         /* Collection (Application) */
+    0x15, 0x00,         /*   Logical Minimum (0) */
+    0x25, 0x01,         /*   Logical Maximum (1) */
+    0x75, 0x01,         /*   Report Size (1) */
+    0x95, 0x07,         /*   Report Count (7) */
+    0x09, 0x40,         /*   Usage (Menu / Home): the TV button */
+    0x09, 0x30,         /*   Usage (Power) */
+    0x09, 0xe9,         /*   Usage (Volume Increment) */
+    0x09, 0xea,         /*   Usage (Volume Decrement) */
+    0x09, 0xcd,         /*   Usage (Play/Pause) */
+    0x09, 0xe2,         /*   Usage (Mute) */
+    0x09, 0xcf,         /*   Usage (Voice Command): Siri */
+    0x81, 0x02,         /*   Input (Data, Variable, Absolute) */
+    0x95, 0x01,         /*   Report Count (1) */
+    0x81, 0x03,         /*   Input (Constant) -- 1-bit padding */
     0xc0,               /* End Collection */
 };
 
@@ -1352,8 +1382,89 @@ static const USBDesc desc_consumer = {
     .msos = &desc_msos_suspend,
 };
 
+/* tv-remote=on: the same device but for its report descriptor's length */
+static const USBDescIface desc_iface_consumer_tv = {
+    .bInterfaceNumber              = 0,
+    .bNumEndpoints                 = 1,
+    .bInterfaceClass               = USB_CLASS_HID,
+    .bInterfaceProtocol            = 0x00,
+    .ndesc                         = 1,
+    .descs = (USBDescOther[]) {
+        {
+            .data = (uint8_t[]) {
+                0x09,          /*  u8  bLength */
+                USB_DT_HID,    /*  u8  bDescriptorType */
+                0x01, 0x00,    /*  u16 HID_class */
+                0x00,          /*  u8  country_code */
+                0x01,          /*  u8  num_descriptors */
+                USB_DT_REPORT, /*  u8  type: Report */
+                sizeof(qemu_consumer_tv_hid_report_descriptor), 0,  /*  u16 len */
+            },
+        },
+    },
+    .eps = (USBDescEndpoint[]) {
+        {
+            .bEndpointAddress      = USB_DIR_IN | 0x01,
+            .bmAttributes          = USB_ENDPOINT_XFER_INT,
+            .wMaxPacketSize        = 8,
+            .bInterval             = 0x0a,
+        },
+    },
+};
+
+static const USBDescDevice desc_device_consumer_tv = {
+    .bcdUSB                        = 0x0100,
+    .bMaxPacketSize0               = 8,
+    .bNumConfigurations            = 1,
+    .confs = (USBDescConfig[]) {
+        {
+            .bNumInterfaces        = 1,
+            .bConfigurationValue   = 1,
+            .iConfiguration        = STR_CONFIG_CONSUMER,
+            .bmAttributes          = USB_CFG_ATT_ONE | USB_CFG_ATT_WAKEUP,
+            .bMaxPower             = 50,
+            .nif = 1,
+            .ifs = &desc_iface_consumer_tv,
+        },
+    },
+};
+
+static const USBDescDevice desc_device_consumer2_tv = {
+    .bcdUSB                        = 0x0200,
+    .bMaxPacketSize0               = 64,
+    .bNumConfigurations            = 1,
+    .confs = (USBDescConfig[]) {
+        {
+            .bNumInterfaces        = 1,
+            .bConfigurationValue   = 1,
+            .iConfiguration        = STR_CONFIG_CONSUMER,
+            .bmAttributes          = USB_CFG_ATT_ONE | USB_CFG_ATT_WAKEUP,
+            .bMaxPower             = 50,
+            .nif = 1,
+            .ifs = &desc_iface_consumer_tv,
+        },
+    },
+};
+
+static const USBDesc desc_consumer_tv = {
+    .id = {
+        .idVendor          = 0x0627,
+        .idProduct         = 0x0001,
+        .bcdDevice         = 0,
+        .iManufacturer     = STR_MANUFACTURER,
+        .iProduct          = STR_PRODUCT_CONSUMER,
+        .iSerialNumber     = STR_SERIAL_CONSUMER,
+    },
+    .full = &desc_device_consumer_tv,
+    .high = &desc_device_consumer2_tv,
+    .str  = desc_strings,
+    .msos = &desc_msos_suspend,
+};
+
 /* The buttons become @report: queued for the guest, which is woken for it. */
-static const char *const usb_consumer_keylog_names[4] = { "Home", "Power", "Vol up", "Vol down" };
+static const char *const usb_consumer_keylog_names[USB_CONSUMER_BUTTONS] = {
+    "Home", "Power", "Vol up", "Vol down", "Play/Pause", "Mute", "Siri",
+};
 
 static void usb_consumer_set_report(USBConsumerState *us, uint8_t report)
 {
@@ -1373,7 +1484,7 @@ static void usb_consumer_set_report(USBConsumerState *us, uint8_t report)
     }
     trace_usb_consumer_queue(report, us->count);
     /* the key overlay (F12): a change is logged when queued, and read at the read of its report */
-    for (b = 0; b < 4; b++) {
+    for (b = 0; b < USB_CONSUMER_BUTTONS; b++) {
         if (changed & (1 << b)) {
             keylog_add(us, usb_consumer_keylog_names[b], report & (1 << b), KEYLOG_WAIT, us->keylog_queued);
         }
@@ -1417,8 +1528,8 @@ static void usb_consumer_handle_control(USBDevice *dev, USBPacket *p,
     switch (request) {
     case InterfaceRequest | USB_REQ_GET_DESCRIPTOR:
         if ((value >> 8) == 0x22) {
-            memcpy(data, us->rdesc, sizeof(us->rdesc));
-            p->actual_length = sizeof(us->rdesc);
+            memcpy(data, us->rdesc, us->rdesc_len);
+            p->actual_length = us->rdesc_len;
         } else {
             goto fail;
         }
@@ -1468,7 +1579,7 @@ static void usb_consumer_handle_data(USBDevice *dev, USBPacket *p)
     }
 }
 
-static uint8_t usb_consumer_bit(const char *value, Error **errp)
+static uint8_t usb_consumer_bit(USBConsumerState *us, const char *value, Error **errp)
 {
     if (!strcmp(value, "home") || !strcmp(value, "menu")) {
         return 0x01;
@@ -1478,9 +1589,15 @@ static uint8_t usb_consumer_bit(const char *value, Error **errp)
         return 0x04;
     } else if (!strcmp(value, "voldown")) {
         return 0x08;
+    } else if (us->tv_remote && !strcmp(value, "playpause")) {
+        return 0x10;
+    } else if (us->tv_remote && !strcmp(value, "mute")) {
+        return 0x20;
+    } else if (us->tv_remote && !strcmp(value, "siri")) {
+        return 0x40;
     }
-    error_setg(errp, "usb-consumer: unknown button '%s' "
-               "(home|power|volup|voldown)", value);
+    error_setg(errp, "usb-consumer: unknown button '%s' (home|power|volup|voldown%s)", value,
+               us->tv_remote ? "|playpause|mute|siri" : "; tv-remote=on adds playpause|mute|siri");
     return 0;
 }
 
@@ -1488,7 +1605,7 @@ static uint8_t usb_consumer_bit(const char *value, Error **errp)
 static void usb_consumer_set_press(Object *obj, const char *value, Error **errp)
 {
     USBConsumerState *us = USB_CONSUMER(obj);
-    uint8_t bit = usb_consumer_bit(value, errp);
+    uint8_t bit = usb_consumer_bit(us, value, errp);
 
     if (bit && !(us->report & bit)) {
         us->auto_release |= bit;
@@ -1501,7 +1618,7 @@ static void usb_consumer_set_press(Object *obj, const char *value, Error **errp)
 static void usb_consumer_set_down(Object *obj, const char *value, Error **errp)
 {
     USBConsumerState *us = USB_CONSUMER(obj);
-    uint8_t bit = usb_consumer_bit(value, errp);
+    uint8_t bit = usb_consumer_bit(us, value, errp);
 
     us->auto_release &= ~bit;
     us->armed &= ~bit;
@@ -1511,7 +1628,7 @@ static void usb_consumer_set_down(Object *obj, const char *value, Error **errp)
 static void usb_consumer_set_up(Object *obj, const char *value, Error **errp)
 {
     USBConsumerState *us = USB_CONSUMER(obj);
-    uint8_t bit = usb_consumer_bit(value, errp);
+    uint8_t bit = usb_consumer_bit(us, value, errp);
 
     us->auto_release &= ~bit;
     us->armed &= ~bit;
@@ -1527,11 +1644,19 @@ static void usb_consumer_realize(USBDevice *dev, Error **errp)
 {
     USBConsumerState *us = USB_CONSUMER(dev);
 
-    QEMU_BUILD_BUG_ON(sizeof(us->rdesc) !=
+    QEMU_BUILD_BUG_ON(sizeof(us->rdesc) <
                       sizeof(qemu_consumer_hid_report_descriptor));
-    memcpy(us->rdesc, qemu_consumer_hid_report_descriptor, sizeof(us->rdesc));
+    QEMU_BUILD_BUG_ON(sizeof(us->rdesc) !=
+                      sizeof(qemu_consumer_tv_hid_report_descriptor));
+    if (us->tv_remote) {
+        us->rdesc_len = sizeof(qemu_consumer_tv_hid_report_descriptor);
+        memcpy(us->rdesc, qemu_consumer_tv_hid_report_descriptor, us->rdesc_len);
+    } else {
+        us->rdesc_len = sizeof(qemu_consumer_hid_report_descriptor);
+        memcpy(us->rdesc, qemu_consumer_hid_report_descriptor, us->rdesc_len);
+    }
     us->rdesc[CONSUMER_RDESC_POWER] = us->power_usage;
-    dev->usb_desc = &desc_consumer;
+    dev->usb_desc = us->tv_remote ? &desc_consumer_tv : &desc_consumer;
     usb_desc_create_serial(dev);
     usb_desc_init(dev);
     us->intr = usb_ep_get(dev, USB_TOKEN_IN, 1);
@@ -1581,6 +1706,7 @@ static const Property usb_consumer_properties[] = {
     DEFINE_PROP_UINT32("usb_version", USBConsumerState, usb_version, 2),
     DEFINE_PROP_UINT32("hold-ms", USBConsumerState, hold_ms, 100),
     DEFINE_PROP_UINT8("power-usage", USBConsumerState, power_usage, 0x30),
+    DEFINE_PROP_BOOL("tv-remote", USBConsumerState, tv_remote, false),
 };
 
 static void usb_consumer_class_initfn(ObjectClass *klass, const void *data)
