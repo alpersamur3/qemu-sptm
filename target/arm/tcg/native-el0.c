@@ -51,6 +51,9 @@
  * tpro= (the TPRO pair rewrite in code pages filled from then on, see
  * patched_at()) needs ASOFT_NATIVE_EL0_TPRO_SSBS not 0 at start and SSBS in
  * AT_HWCAP (every core has it); otherwise it is ignored.
+ * ASOFT_NATIVE_EL0_NO_SSBS=1 (test): start as on a host without SSBS in AT_HWCAP
+ * (a phone with Cortex-A55 cores) though this host has it: no TPRO pair
+ * rewrite, the guest's own SSBS words neutralised, SSBS out of the PSTATE copy.
  * ASOFT_NATIVE_EL0_WFE=1 (stub mode): the spin before a futex wait (QEMU for a
  * report, a stub thread for a command) waits with WFE instead of YIELD, and
  * the side that stores what the other one waits for sends SEV after it.
@@ -1243,10 +1246,13 @@ static void __attribute__((constructor)) native_el0_setup(void)
      * reads would end up in TCG, which answers from the guest's own SSBS) and
      * the guest's own SSBS words must not depend on the core a thread is on.
      */
-    if (!(getauxval(AT_HWCAP) & HWCAP_SSBS)) {
+    e = getenv("ASOFT_NATIVE_EL0_NO_SSBS");
+    bool no_ssbs_env = e && *e && *e != '0';
+    if (no_ssbs_env || !(getauxval(AT_HWCAP) & HWCAP_SSBS)) {
         if (tpro_carry) {
-            fprintf(stderr, "native-el0: the host has no SSBS on every core (no ssbs in AT_HWCAP): "
-                    "the TPRO read rewrite is off, TPRO reads trap\n");
+            fprintf(stderr, "native-el0: %s: the TPRO read rewrite is off, TPRO reads trap\n",
+                    no_ssbs_env ? "ASOFT_NATIVE_EL0_NO_SSBS is set (a test: the host's SSBS is not used)"
+                                : "the host has no SSBS on every core (no ssbs in AT_HWCAP)");
         }
         tpro_carry = tpro_ssbs = false;
     } else {
