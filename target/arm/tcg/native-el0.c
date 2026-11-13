@@ -49,8 +49,8 @@
  * spin-spare=N|auto pacga-local=0|1" tokens in that file, deletes it and
  * prints one el-switch line; without ASOFT_EL_SAMPLER it is never read.
  * tpro= (the TPRO pair rewrite in code pages filled from then on, see
- * patched_at()) needs ASOFT_NATIVE_EL0_TPRO_SSBS not 0 at start; otherwise
- * it is ignored.
+ * patched_at()) needs ASOFT_NATIVE_EL0_TPRO_SSBS not 0 at start and SSBS in
+ * AT_HWCAP (every core has it); otherwise it is ignored.
  * ASOFT_NATIVE_EL0_WFE=1 (stub mode): the spin before a futex wait (QEMU for a
  * report, a stub thread for a command) waits with WFE instead of YIELD, and
  * the side that stores what the other one waits for sends SEV after it.
@@ -139,6 +139,7 @@ int native_el0_tlbi_scope(CPUState *cs, uint64_t va, uint16_t asid)
 #include <sys/mman.h>
 #include <sys/syscall.h>
 #include <sys/prctl.h>
+#include <sys/auxv.h>
 #include <sys/socket.h>
 #include <sys/uio.h>
 #include <sys/wait.h>
@@ -647,6 +648,10 @@ enum { MK_TPRO_W, MK_TPRO_R, MK_TPIDRRO, MK_CNT, MK_ACNT, MK_N };
 static uint64_t mrs_kind[MK_N];     /* emulated MRS/MSR by register */
 static bool tpro_carry = true;      /* PSTATE.SSBS carries the TPRO bit (fixed at start): see patched_at() */
 static bool tpro_ssbs = true;       /* new code pages get the TPRO pair rewritten (switch file: tpro=) */
+static bool ssbs_native;            /* the host has SSBS and the guest's own SSBS words run on it (fixed at start) */
+#ifndef HWCAP_SSBS
+#define HWCAP_SSBS (1UL << 28)
+#endif
 static uint64_t tpro_pairs, tpro_lone, ssbs_guest_words;    /* in new code cache pages */
 static uint64_t tpro_rewinds;       /* threads set back to the first word of a TPRO pair */
 static int tpro_log_left;
@@ -1232,6 +1237,21 @@ static void __attribute__((constructor)) native_el0_setup(void)
     perm_fallback = e && *e && *e != '0';
     e = getenv("ASOFT_NATIVE_EL0_TPRO_SSBS");
     tpro_carry = tpro_ssbs = !e || *e != '0';
+    /*
+     * No "ssbs" in AT_HWCAP means some core lacks FEAT_SSBS (Cortex-A55): there
+     * mrs Xt, SSBS is UNDEFINED, so the carry cannot work (the guest's TPRO
+     * reads would end up in TCG, which answers from the guest's own SSBS) and
+     * the guest's own SSBS words must not depend on the core a thread is on.
+     */
+    if (!(getauxval(AT_HWCAP) & HWCAP_SSBS)) {
+        if (tpro_carry) {
+            fprintf(stderr, "native-el0: the host has no SSBS on every core (no ssbs in AT_HWCAP): "
+                    "the TPRO read rewrite is off, TPRO reads trap\n");
+        }
+        tpro_carry = tpro_ssbs = false;
+    } else {
+        ssbs_native = !tpro_carry;
+    }
     e = getenv("ASOFT_NATIVE_EL0_TPRO_LOG");
     tpro_log_left = e ? atoi(e) : 0;
     e = getenv("ASOFT_NATIVE_EL0_PATCHLOG");
@@ -1612,7 +1632,7 @@ static inline uint32_t patched_at(uint32_t prev, uint32_t x, uint32_t next, uint
             return ((x ^ 0x01000000u) & 0x0107ffffu) | 0x36600000u;     /* the inverse branch on bit 12 */
         }
     }
-    if (tpro_carry) {
+    if (!ssbs_native) {
         if (is_ssbs_msr(x)) {
             return 0xd503201fu;                                 /* nop: the bit is not the guest's here */
         } else if (is_ssbs_mrs(x)) {
@@ -1755,9 +1775,9 @@ static int cc_scan(const uint32_t *w, uint16_t *idx)
     /* PACGA (is_pacga) only with EL0 PAC off; otherwise a mask that never matches */
     const uint32x4_t gmask = vdupq_n_u32(pac_off ? 0xffe0fc00u : 0u);
     const uint32x4_t gwant = vdupq_n_u32(pac_off ? 0x9ac03000u : 1u);
-    /* msr SSBS, #imm (is_ssbs_msr) only while SSBS carries the TPRO bit */
-    const uint32x4_t smask = vdupq_n_u32(tpro_carry ? 0xfffff0ffu : 0u);
-    const uint32x4_t swant = vdupq_n_u32(tpro_carry ? 0xd503403fu : 1u);
+    /* msr SSBS, #imm (is_ssbs_msr) unless the guest's SSBS words run natively */
+    const uint32x4_t smask = vdupq_n_u32(ssbs_native ? 0u : 0xfffff0ffu);
+    const uint32x4_t swant = vdupq_n_u32(ssbs_native ? 1u : 0xd503403fu);
     int n = 0, done = -1;
     for (unsigned i = 0; i < CC_WORDS; i += 4) {
         uint32x4_t v = vld1q_u32(w + i);
@@ -1862,7 +1882,7 @@ static int cc_fill(const void *hp, uint64_t off, uint64_t *slot_off)
                 }
                 fprintf(stderr, "\n");
             }
-        } else if (tpro_carry && (is_ssbs_msr(w[idx[k]]) || is_ssbs_mrs(w[idx[k]]))) {
+        } else if (!ssbs_native && (is_ssbs_msr(w[idx[k]]) || is_ssbs_mrs(w[idx[k]]))) {
             ssbs_guest_words++;
         }
     }
@@ -3826,7 +3846,8 @@ static void state_to_frame(NativeCtx *nc, ucontext_t *uc)
     }
     uc->uc_mcontext.sp = env->xregs[31];
     uc->uc_mcontext.pc = env->pc;
-    uc->uc_mcontext.pstate = pstate_read(env) & PSTATE_COPY;   /* EL0t */
+    /* a core without SSBS reads the bit as 0 and must not be given the guest's: it stays out of the copy */
+    uc->uc_mcontext.pstate = pstate_read(env) & (ssbs_native || tpro_carry ? PSTATE_COPY : PSTATE_COPY & ~PSTATE_SSBS);   /* EL0t */
     static int pstate_logged;
     if (unlikely(!pstate_logged) && !qatomic_xchg(&pstate_logged, 1)) {
         fprintf(stderr, "native-el0: the guest's EL0 PSTATE at the first native entry: %#x (SSBS %d, DIT %d)\n",
@@ -3862,7 +3883,7 @@ static void frame_to_state(NativeCtx *nc, ucontext_t *uc, uint64_t guest_tpidr)
     }
     env->xregs[31] = uc->uc_mcontext.sp;
     env->pc = uc->uc_mcontext.pc;
-    uint32_t copy = tpro_carry ? (PSTATE_COPY & ~PSTATE_SSBS) : PSTATE_COPY;
+    uint32_t copy = ssbs_native ? PSTATE_COPY : (PSTATE_COPY & ~PSTATE_SSBS);   /* the guest's own SSBS stays in TCG's state */
     pstate_write(env, (pstate_read(env) & ~copy) | (uc->uc_mcontext.pstate & copy));
     struct fpsimd_context *f = find_fpsimd(uc);
     if (f) {
