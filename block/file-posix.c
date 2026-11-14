@@ -68,6 +68,7 @@
 #ifdef __linux__
 #include <sys/param.h>
 #include <sys/syscall.h>
+#include <sys/utsname.h>
 #include <sys/vfs.h>
 #if defined(CONFIG_BLKZONED)
 #include <linux/blkzoned.h>
@@ -414,6 +415,22 @@ static bool raw_is_io_aligned(int fd, void *buf, size_t len)
     return false;
 }
 
+#if defined(__linux__) && defined(STATX_DIOALIGN) && defined(__NR_statx)
+/*
+ * STATX_DIOALIGN exists from Linux 6.1: an older kernel would only answer without it. The
+ * check also keeps the call away from Android 10, whose app filter (seccomp) does not list
+ * statx (it is allowed from Android 11) and ends the process with SIGSYS.
+ */
+static bool kernel_has_dioalign(void)
+{
+    struct utsname u;
+    int major, minor;
+
+    return uname(&u) == 0 && sscanf(u.release, "%d.%d", &major, &minor) == 2 &&
+           (major > 6 || (major == 6 && minor >= 1));
+}
+#endif
+
 /*
  * The kernel's own O_DIRECT alignment for @fd (Linux 6.1+, STATX_DIOALIGN), through the
  * system call: Bionic has no statx() before API level 30.
@@ -423,6 +440,9 @@ static bool raw_probe_dioalign(int fd, uint32_t *mem_align, uint32_t *offset_ali
 #if defined(__linux__) && defined(STATX_DIOALIGN) && defined(__NR_statx)
     struct statx stx;
 
+    if (!kernel_has_dioalign()) {
+        return false;
+    }
     memset(&stx, 0, sizeof(stx));
     if (syscall(__NR_statx, fd, "", AT_EMPTY_PATH, STATX_DIOALIGN, &stx) == 0 &&
         (stx.stx_mask & STATX_DIOALIGN) &&
